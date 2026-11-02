@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">OlympQuant Terminal</string>
+    <string name="nav_terminal">Terminal</string>
+    <string name="nav_strategies">Strategies</string>
+    <string name="nav_hmm_audit">HMM &amp; Audit</string>
+    <string name="nav_journal">Journal</string>
+    <string name="nav_broker">Session</string>
+    <string name="auth_title">OlympQuant Vault</string>
+    <string name="auth_subtitle">Institutional Quantitative Trading Workstation</string>
+    <string name="login_button">Sign In to Workstation</string>
+    <string name="register_button">Create Quant Profile</string>
+    <string name="connect_broker_title">Olymp Trade WebSocket Session</string>
+    <string name="webview_auth_button">Sign In via Olymp Trade WebView</string>
+    <string name="connect_ws_button">Connect Live WebSocket</string>
+    <string name="disconnect_ws_button">Disconnect Session</string>
+    <string name="bot_start">START BOT</string>
+    <string name="bot_stop">STOP BOT</string>
+    <string name="super_boost">SUPERBOOST</string>
+    <string name="call_up">CALL UP</string>
+    <string name="put_down">PUT DOWN</string>
+    <string name="add_strategy">New Modular Strategy</string>
+    <string name="export_journal">Export JSON</string>
+</resources>

@@ -1,0 +1,15 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Runtime and credential files
+access_token.txt
+tick_data.csv
+trades_history.json
+cli_config.json
+

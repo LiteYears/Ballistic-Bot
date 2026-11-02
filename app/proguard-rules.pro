@@ -1,0 +1,3 @@
+-keepattributes *Annotation*,InnerClasses,Signature
+-keep class com.olympquant.terminal.data.** { *; }
+-keep class com.olympquant.terminal.engine.** { *; }

@@ -1,0 +1,8 @@
+{
+  "name": "OlympQuant Terminal",
+  "description": "Quantitative algorithmic trading workstation for Olymp Trade with real-time WebSocket execution, HMM regime detection, and modular strategy builder.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
