@@ -5,6 +5,7 @@ import androidx.compose.runtime.Immutable
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.doublePreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
@@ -20,12 +21,10 @@ import androidx.room.RoomDatabase
 import androidx.room.Update
 import com.olympquant.terminal.BuildConfig
 import com.olympquant.terminal.domain.HardLockedMandate
-import com.olympquant.terminal.domain.RiskConfig
 import com.olympquant.terminal.domain.StrategyConfig
 import com.olympquant.terminal.domain.TerminalDensityMode
-import com.olympquant.terminal.domain.TradeSettingsConfig
+import com.olympquant.terminal.domain.TradeTimeframe
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import java.security.MessageDigest
 
@@ -98,6 +97,27 @@ interface OlympQuantDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertUser(user: UserProfileEntity): Long
 
+    @Query("SELECT * FROM strategies ORDER BY id ASC")
+    fun observeStrategies(): Flow<List<StrategyEntity>>
+
+    @Query("SELECT * FROM strategies ORDER BY id ASC")
+    suspend fun getAllStrategies(): List<StrategyEntity>
+
+    @Query("SELECT * FROM strategies WHERE id = :id LIMIT 1")
+    suspend fun getStrategyById(id: Long): StrategyEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertStrategy(strategy: StrategyEntity): Long
+
+    @Update
+    suspend fun updateStrategy(strategy: StrategyEntity)
+
+    @Query("DELETE FROM strategies WHERE id = :id")
+    suspend fun deleteStrategyById(id: Long)
+
+    @Query("UPDATE strategies SET isEnabled = CASE WHEN id = :activeId THEN 1 ELSE 0 END")
+    suspend fun setExclusiveLoadedStrategy(activeId: Long)
+
     @Query("DELETE FROM strategies")
     suspend fun clearAllStrategies()
 
@@ -158,8 +178,8 @@ data class SessionPreferences(
     val tokenCapturedAtMs: Long = 0L,
     val lastSessionMode: String = "SYNTHETIC_FEED",
     val dailyPnlResetAtMs: Long = 0L,
-    val riskConfig: RiskConfig = RiskConfig(),
-    val tradeSettings: TradeSettingsConfig = TradeSettingsConfig()
+    val selectedTimeframeSec: Int = 5,
+    val autoPauseOnHvAvoid: Boolean = true
 ) {
     companion object {
         const val DEFAULT_WS_URI =
@@ -187,6 +207,8 @@ class OlympQuantRepository(
         val TOKEN_CAPTURED_AT_MS = longPreferencesKey("token_captured_at_ms")
         val LAST_SESSION_MODE = stringPreferencesKey("last_session_mode")
         val DAILY_PNL_RESET_AT_MS = longPreferencesKey("daily_pnl_reset_at_ms")
+        val SELECTED_TIMEFRAME_SEC = intPreferencesKey("selected_timeframe_sec")
+        val AUTO_PAUSE_ON_HV_AVOID = booleanPreferencesKey("auto_pause_on_hv_avoid")
     }
 
     val sessionFlow: Flow<SessionPreferences> = context.dataStore.data.map { prefs ->
@@ -194,6 +216,7 @@ class OlympQuantRepository(
             BuildConfig.OLYMP_DEFAULT_ACCESS_TOKEN.takeIf { it != "YOUR_OLYMP_ACCESS_TOKEN_HERE" } ?: ""
         }.getOrDefault("")
         val savedToken = prefs[Keys.ACCESS_TOKEN] ?: ""
+        val rawTf = prefs[Keys.SELECTED_TIMEFRAME_SEC] ?: 5
         SessionPreferences(
             loggedInEmail = prefs[Keys.LOGGED_IN_EMAIL] ?: "",
             loggedInUsername = prefs[Keys.LOGGED_IN_USERNAME] ?: "",
@@ -212,19 +235,214 @@ class OlympQuantRepository(
             tokenCapturedAtMs = prefs[Keys.TOKEN_CAPTURED_AT_MS] ?: 0L,
             lastSessionMode = prefs[Keys.LAST_SESSION_MODE] ?: "SYNTHETIC_FEED",
             dailyPnlResetAtMs = prefs[Keys.DAILY_PNL_RESET_AT_MS] ?: 0L,
-            riskConfig = RiskConfig(),
-            tradeSettings = TradeSettingsConfig()
+            selectedTimeframeSec = TradeTimeframe.fromSeconds(rawTf).seconds,
+            autoPauseOnHvAvoid = prefs[Keys.AUTO_PAUSE_ON_HV_AVOID] ?: true
         )
     }
 
-    // Hard-locked single strategy flow — immutable by design
-    val strategiesFlow: Flow<List<StrategyConfig>> = flowOf(listOf(HardLockedMandate.lockedStrategyConfig()))
+    val strategiesFlow: Flow<List<StrategyConfig>> = dao.observeStrategies().map { entities ->
+        if (entities.isEmpty()) {
+            listOf(
+                HardLockedMandate.fromScript(
+                    id = 1L,
+                    scriptCode = com.olympquant.terminal.engine.DefaultStrategyScripts.HIGH_VOLTAGE_OQS_SCRIPT,
+                    isPreset = true,
+                    isEnabled = true
+                ),
+                HardLockedMandate.fromScript(
+                    id = 2L,
+                    scriptCode = com.olympquant.terminal.engine.DefaultStrategyScripts.X13_TEMPORAL_OQS_SCRIPT,
+                    isPreset = true,
+                    isEnabled = false
+                ),
+                HardLockedMandate.lockedStrategyConfig().copy(id = 3L, isEnabled = false)
+            )
+        } else {
+            entities.map { entity ->
+                val script = entity.filtersJson.takeIf { it.contains("[META]") }
+                    ?: com.olympquant.terminal.engine.DefaultStrategyScripts.HIGH_VOLTAGE_OQS_SCRIPT
+                HardLockedMandate.fromScript(
+                    id = entity.id,
+                    scriptCode = script,
+                    isPreset = entity.isPreset,
+                    isEnabled = entity.isEnabled
+                )
+            }
+        }
+    }
 
     val tradeJournalFlow: Flow<List<TradeJournalEntity>> = dao.observeTradeJournal()
 
     suspend fun ensureSeeded() {
-        runCatching { dao.clearAllStrategies() }
+        runCatching {
+            val existing = dao.getAllStrategies()
+            val validOqs = existing.filter { it.filtersJson.contains("[META]") }
+            if (validOqs.isEmpty()) {
+                dao.clearAllStrategies()
+                val hvConfig = HardLockedMandate.fromScript(
+                    id = 1L,
+                    scriptCode = com.olympquant.terminal.engine.DefaultStrategyScripts.HIGH_VOLTAGE_OQS_SCRIPT,
+                    isPreset = true,
+                    isEnabled = true
+                )
+                val x13Config = HardLockedMandate.fromScript(
+                    id = 2L,
+                    scriptCode = com.olympquant.terminal.engine.DefaultStrategyScripts.X13_TEMPORAL_OQS_SCRIPT,
+                    isPreset = true,
+                    isEnabled = false
+                )
+                val legacyDefault = HardLockedMandate.lockedStrategyConfig().copy(id = 3L, isEnabled = false)
+                dao.insertStrategy(hvConfig.toEntity(id = 1L, isEnabled = true))
+                dao.insertStrategy(x13Config.toEntity(id = 2L, isEnabled = false))
+                dao.insertStrategy(legacyDefault.toEntity(id = 3L, isEnabled = false))
+            } else {
+                val hasHighVoltage = validOqs.any {
+                    it.name.equals(
+                        com.olympquant.terminal.engine.DefaultStrategyScripts.HIGH_VOLTAGE_STRATEGY_NAME,
+                        ignoreCase = true
+                    )
+                }
+                if (!hasHighVoltage) {
+                    val hvConfig = HardLockedMandate.fromScript(
+                        id = 0L,
+                        scriptCode = com.olympquant.terminal.engine.DefaultStrategyScripts.HIGH_VOLTAGE_OQS_SCRIPT,
+                        isPreset = true,
+                        isEnabled = true
+                    )
+                    val newId = dao.insertStrategy(hvConfig.toEntity(id = 0L, isEnabled = true))
+                    dao.setExclusiveLoadedStrategy(newId)
+                } else if (validOqs.none { it.isEnabled }) {
+                    dao.setExclusiveLoadedStrategy(validOqs.first().id)
+                }
+            }
+        }
     }
+
+    suspend fun createStrategyFromTemplate(customName: String, durationSec: Int = 5): StrategyConfig {
+        val script = com.olympquant.terminal.engine.DefaultStrategyScripts.buildNewStrategyTemplate(
+            customName = customName,
+            durationSec = TradeTimeframe.fromSeconds(durationSec).seconds
+        )
+        val parsed = HardLockedMandate.fromScript(
+            id = 0L,
+            scriptCode = script,
+            isPreset = false,
+            isEnabled = true
+        )
+        val newId = dao.insertStrategy(parsed.toEntity(id = 0L, isEnabled = true))
+        dao.setExclusiveLoadedStrategy(newId)
+        return parsed.copy(id = newId, isEnabled = true)
+    }
+
+    suspend fun saveAndLoadStrategyScript(strategyId: Long, scriptCode: String): Result<StrategyConfig> {
+        val compiled = com.olympquant.terminal.engine.StrategyScriptCompiler.compile(scriptCode)
+        if (!compiled.isValid || compiled.parsedScript == null) {
+            val err = compiled.errors.firstOrNull()
+            val msg = if (err != null) {
+                "Line ${err.line} [${err.section}]: ${err.message}"
+            } else {
+                "Invalid .oqs strategy script"
+            }
+            return Result.failure(IllegalArgumentException(msg))
+        }
+        val existing = dao.getStrategyById(strategyId)
+        val isPreset = existing?.isPreset ?: (strategyId == 1L)
+        val config = HardLockedMandate.fromScript(
+            id = if (strategyId > 0L) strategyId else 0L,
+            scriptCode = scriptCode,
+            isPreset = isPreset,
+            isEnabled = true
+        )
+        val savedId = dao.insertStrategy(config.toEntity(id = config.id, isEnabled = true))
+        dao.setExclusiveLoadedStrategy(savedId)
+        context.dataStore.edit { prefs ->
+            prefs[Keys.SELECTED_TIMEFRAME_SEC] = TradeTimeframe.fromSeconds(config.durationSeconds).seconds
+        }
+        return Result.success(config.copy(id = savedId, isEnabled = true))
+    }
+
+    suspend fun updateSelectedTimeframe(durationSec: Int) {
+        val validSec = TradeTimeframe.fromSeconds(durationSec).seconds
+        context.dataStore.edit { prefs ->
+            prefs[Keys.SELECTED_TIMEFRAME_SEC] = validSec
+        }
+        val all = dao.getAllStrategies()
+        val active = all.firstOrNull { it.isEnabled } ?: all.firstOrNull() ?: return
+        val updatedScript = com.olympquant.terminal.engine.DefaultStrategyScripts.withDurationSec(
+            scriptCode = active.filtersJson.ifBlank { com.olympquant.terminal.engine.DefaultStrategyScripts.HIGH_VOLTAGE_OQS_SCRIPT },
+            durationSec = validSec
+        )
+        val updatedConfig = HardLockedMandate.fromScript(
+            id = active.id,
+            scriptCode = updatedScript,
+            isPreset = active.isPreset,
+            isEnabled = true
+        )
+        dao.insertStrategy(updatedConfig.toEntity(id = active.id, isEnabled = true))
+    }
+
+    suspend fun updateAutoPauseOnHvAvoid(enabled: Boolean) {
+        context.dataStore.edit { prefs ->
+            prefs[Keys.AUTO_PAUSE_ON_HV_AVOID] = enabled
+        }
+    }
+
+    suspend fun loadStrategy(strategyId: Long) {
+        dao.setExclusiveLoadedStrategy(strategyId)
+        val loaded = dao.getStrategyById(strategyId)
+        if (loaded != null) {
+            context.dataStore.edit { prefs ->
+                prefs[Keys.SELECTED_TIMEFRAME_SEC] = TradeTimeframe.fromSeconds(loaded.durationSeconds).seconds
+            }
+        }
+    }
+
+    suspend fun deleteStrategy(strategyId: Long) {
+        val all = dao.getAllStrategies()
+        if (all.size <= 1) {
+            resetToDefaultStrategy()
+            return
+        }
+        dao.deleteStrategyById(strategyId)
+        val remaining = dao.getAllStrategies()
+        if (remaining.isNotEmpty() && remaining.none { it.isEnabled }) {
+            dao.setExclusiveLoadedStrategy(remaining.first().id)
+        }
+    }
+
+    suspend fun resetToDefaultStrategy(): StrategyConfig {
+        dao.clearAllStrategies()
+        val hvDefault = HardLockedMandate.highVoltageStrategyConfig(durationSec = 5)
+        val id = dao.insertStrategy(hvDefault.toEntity(id = 1L, isEnabled = true))
+        val x13Config = HardLockedMandate.fromScript(
+            id = 2L,
+            scriptCode = com.olympquant.terminal.engine.DefaultStrategyScripts.X13_TEMPORAL_OQS_SCRIPT,
+            isPreset = true,
+            isEnabled = false
+        )
+        dao.insertStrategy(x13Config.toEntity(id = 2L, isEnabled = false))
+        dao.setExclusiveLoadedStrategy(id)
+        context.dataStore.edit { prefs ->
+            prefs[Keys.SELECTED_TIMEFRAME_SEC] = 5
+        }
+        return hvDefault.copy(id = id, isEnabled = true)
+    }
+
+    private fun StrategyConfig.toEntity(id: Long, isEnabled: Boolean): StrategyEntity = StrategyEntity(
+        id = id,
+        name = this.name,
+        description = this.description,
+        isPreset = this.isPreset,
+        isEnabled = isEnabled,
+        durationSeconds = this.durationSeconds,
+        stakeAmount = this.stakeAmount,
+        cooldownMs = this.cooldownMs,
+        minConfidence = this.minConfidence,
+        triggerType = this.triggerType.name,
+        triggerThreshold = this.triggerThreshold,
+        regimeAdaptiveMode = this.regimeAdaptiveMode.name,
+        filtersJson = this.scriptCode
+    )
 
     suspend fun registerUser(username: String, email: String, passwordPlain: String): Result<UserProfileEntity> {
         val existing = dao.getUserByEmail(email.trim())
@@ -333,18 +551,20 @@ class OlympQuantRepository(
         )
     }
 
+    suspend fun resetDailyPnlTimestamp() {
+        context.dataStore.edit { prefs ->
+            prefs[Keys.DAILY_PNL_RESET_AT_MS] = System.currentTimeMillis()
+        }
+    }
+
     suspend fun clearJournal() {
         dao.clearTradeJournal()
+        resetDailyPnlTimestamp()
     }
 
     private fun hashPassword(plain: String): String {
         val digest = MessageDigest.getInstance("SHA-256")
         return digest.digest(plain.toByteArray()).joinToString("") { "%02x".format(it) }
     }
-
-    companion object {
-        fun defaultPresetStrategies(): List<StrategyConfig> = listOf(
-            HardLockedMandate.lockedStrategyConfig()
-        )
-    }
 }
+

@@ -1,23 +1,158 @@
 package com.olympquant.terminal.domain
 
 import androidx.compose.runtime.Immutable
+import com.olympquant.terminal.engine.DefaultStrategyScripts
+import com.olympquant.terminal.engine.StrategyScriptCompiler
 import kotlinx.serialization.Serializable
 import kotlin.math.roundToLong
 
 fun Double.finiteOr(default: Double = 0.0): Double = if (this.isFinite()) this else default
 fun Float.finiteOr(default: Float = 0f): Float = if (this.isFinite()) this else default
 
+@Serializable
+enum class TradeTimeframe(
+    val durationSec: Int,
+    val label: String,
+    val displayTitle: String
+) {
+    TF_5S(5, "5s", "5 Seconds"),
+    TF_15S(15, "15s", "15 Seconds"),
+    TF_30S(30, "30s", "30 Seconds"),
+    TF_45S(45, "45s", "45 Seconds"),
+    TF_1M(60, "1m", "1 Minute");
+
+    val seconds: Int get() = durationSec
+    val title: String get() = displayTitle
+
+    companion object {
+        fun fromDurationSec(sec: Int): TradeTimeframe {
+            return entries.firstOrNull { it.durationSec == sec }
+                ?: entries.minByOrNull { kotlin.math.abs(it.durationSec - sec) }
+                ?: TF_5S
+        }
+
+        fun fromSeconds(sec: Int): TradeTimeframe = fromDurationSec(sec)
+    }
+}
+
+@Serializable
+enum class HvWindowState(
+    val badgeText: String,
+    val scoreRangeLabel: String,
+    val marketCondition: String,
+    val actionText: String
+) {
+    EXCELLENT(
+        badgeText = "EXCELLENT",
+        scoreRangeLabel = "≥75%",
+        marketCondition = "Clean, fast, directional trend. Solid bodies, small wicks, aligned across 15s–60s.",
+        actionText = "Active Trading Zone. Launch the bot."
+    ),
+    MODERATE(
+        badgeText = "MODERATE",
+        scoreRangeLabel = "50% - 74%",
+        marketCondition = "Trending market with minor pullbacks or slight deceleration. Spreading S/R corridors.",
+        actionText = "Standby / Caution. Safe to run, selective entries."
+    ),
+    AVOID(
+        badgeText = "AVOID",
+        scoreRangeLabel = "<50%",
+        marketCondition = "Stuck in tight flat range (TIGHT_CHOP) or Crazy Market whipsaw collapse wicks (>55%).",
+        actionText = "Off-limits. Turn the bot OFF immediately."
+    );
+
+    val label: String get() = badgeText
+}
+
+@Serializable
+enum class HvMarketTrap(val label: String, val summary: String) {
+    NONE("CLEAN MOMENTUM", "Solid directional candles • No whipsaw or flat chop"),
+    TIGHT_CHOP("TIGHT_CHOP", "15s/30s/45s/60s anchor range < 0.20 pts — Flat range trap"),
+    CRAZY_WHIPSAW("CRAZY MARKET WHIPSAW", "Candles running & collapsing with wicks > 55%")
+}
+
+@Immutable
+@Serializable
+data class HvWindowSnapshot(
+    val score: Double = 60.0,
+    val rawScore: Double = 60.0,
+    val state: HvWindowState = HvWindowState.MODERATE,
+    val activeTrap: HvMarketTrap = HvMarketTrap.NONE,
+    val tightChopDetected: Boolean = false,
+    val crazyWhipsawDetected: Boolean = false,
+    val wickCollapseRatioPercent: Double = 20.0,
+    val solidBodyRatioPercent: Double = 65.0,
+    val anchorRange60s: Double = 0.45,
+    val tightChopThreshold: Double = 0.20,
+    val delta5s: Double = 0.0,
+    val delta15s: Double = 0.0,
+    val delta30s: Double = 0.0,
+    val delta45s: Double = 0.0,
+    val delta60s: Double = 0.0,
+    val mtfAlignedCount: Int = 0,
+    val stabilitySeconds: Double = 0.0,
+    val engineBooted: Boolean = true,
+    val botLaunchReady: Boolean = false,
+    val pauseImmediately: Boolean = false,
+    val stepGuideHint: String = "Wait for HV Window to hold ≥72% for 15–20s before launching bot."
+) {
+    val stabilityReady: Boolean get() = botLaunchReady
+    val recommendation: String get() = stepGuideHint
+}
+
+@Immutable
+@Serializable
+data class HighVoltageFilterStatus(
+    val zlemaTrend: SignalDirection = SignalDirection.NONE,
+    val zlemaSpread: Double = 0.0,
+    val trendFilterPassed: Boolean = false,
+    val velocityTps: Double = 0.0,
+    val minVelocityRequired: Double = 1.5,
+    val velocityFilterPassed: Boolean = false,
+    val relPos50: Double = 50.0,
+    val breakoutUpperPct: Double = 80.0,
+    val breakoutLowerPct: Double = 20.0,
+    val positionBreakoutPassed: Boolean = false,
+    val netDelta5: Double = 0.0,
+    val activeMomentumPassed: Boolean = false,
+    val srClearanceAhead: Double = 999.0,
+    val srMinClearanceRequired: Double = 0.25,
+    val srObstaclePassed: Boolean = true,
+    val currentCandleRange: Double = 0.0,
+    val avg10CandleRange: Double = 0.0,
+    val candleRangeRatio: Double = 1.0,
+    val isCompressed: Boolean = false,
+    val isExhausted: Boolean = false,
+    val volatilityFilterPassed: Boolean = true,
+    val hvWindowPassed: Boolean = true,
+    val allSixFiltersPassed: Boolean = false
+) {
+    val trendDirection: SignalDirection get() = zlemaTrend
+    val zFast: Double get() = zlemaSpread
+    val zSlow: Double get() = 0.0
+    val tickVelocity: Double get() = velocityTps
+    val breakoutFilterPassed: Boolean get() = positionBreakoutPassed
+    val momentumFilterPassed: Boolean get() = activeMomentumPassed
+    val passedFilterCount: Int
+        get() = listOf(
+            trendFilterPassed,
+            velocityFilterPassed,
+            positionBreakoutPassed,
+            activeMomentumPassed,
+            srObstaclePassed,
+            volatilityFilterPassed
+        ).count { it }
+}
+
 /**
- * Immutable, hard-locked execution & risk mandate enforced across the entire engine.
- * - Stake: 5% of entire balance, minimum $1.00, maximum $4,000.00 per trade
- * - Daily Cap: Maximum 10 trades per day (Hard Stop)
- * - Loss Streak Guard: Hard Stop on 3 consecutive losses
- * - Strategy: Single proprietary Hawkes-Laminar Ballistic Impulse Continuation (5s)
+ * Default Strategy & Safety Bounds for the OlympQuant Strategy Script (.oqs) Engine.
+ * - Supports `HighVoltage5s_HVWindow.oqs`, `X13_Temporal_Intelligence_5s.oqs`, and `TickRush5s_FTRL_Default.oqs`
+ * - Supports expanded trade timeframes: 5s, 15s, 30s, 45s, 1m (60s).
  */
 object HardLockedMandate {
-    const val STRATEGY_NAME = "BallisticApex5s (Hawkes-Laminar Impulse)"
+    const val STRATEGY_NAME = DefaultStrategyScripts.DEFAULT_STRATEGY_NAME
     const val STRATEGY_DESCRIPTION =
-        "Novel HFT impulse continuation engine: captures self-exciting Hawkes tick-arrival compression, laminar Kaufman fractal efficiency (>=64%), convex 2nd-derivative acceleration, and unexhausted ballistic corridor headroom to ride 5s burst continuation."
+        "HighVoltage micro-timeframe breakout strategy (6 strict mathematical filters) with zero-lag EMA (α=0.08) HV Window co-pilot and 5s/15s/30s/45s/1m timeframe expansion."
     const val MIN_STAKE_USD = 1.0
     const val BALANCE_STAKE_PERCENT = 5.0
     const val MAX_STAKE_USD = 4000.0
@@ -26,36 +161,74 @@ object HardLockedMandate {
     const val LOCKED_DURATION_SEC = 5
     const val LOCKED_COOLDOWN_MS = 4000L
     const val MIN_PAYOUT_PERCENT = 75
-    const val MIN_CONFIDENCE_REQUIRED = 76.0
+    const val MIN_CONFIDENCE_REQUIRED = 62.0
 
-    fun computeLockedStake(balance: Double): Double {
+    fun computeLockedStake(balance: Double, activeStrategy: StrategyConfig? = null): Double {
+        if (activeStrategy != null) {
+            return activeStrategy.computeEffectiveStake(balance)
+        }
         val safeBalance = balance.finiteOr(0.0).coerceAtLeast(0.0)
         val fivePercent = safeBalance * (BALANCE_STAKE_PERCENT / 100.0)
         val clamped = fivePercent.coerceIn(MIN_STAKE_USD, MAX_STAKE_USD)
         return ((clamped * 100.0).roundToLong() / 100.0)
     }
 
-    fun lockedStrategyConfig(): StrategyConfig = StrategyConfig(
+    fun lockedStrategyConfig(): StrategyConfig = fromScript(
         id = 1L,
-        name = STRATEGY_NAME,
-        description = STRATEGY_DESCRIPTION,
+        scriptCode = DefaultStrategyScripts.DEFAULT_OQS_SCRIPT,
         isPreset = true,
-        isEnabled = true,
-        durationSeconds = LOCKED_DURATION_SEC,
-        stakeAmount = MIN_STAKE_USD,
-        cooldownMs = LOCKED_COOLDOWN_MS,
-        minConfidence = MIN_CONFIDENCE_REQUIRED,
-        triggerType = TriggerType.HAWKES_BALLISTIC_IMPULSE,
-        triggerThreshold = 68.0,
-        regimeAdaptiveMode = RegimeAdaptiveMode.SKIP_BAD,
-        filters = listOf(
-            StrategyFilterRule(FilterType.HAWKES_ARRIVAL_INTENSITY, true, 18.0),
-            StrategyFilterRule(FilterType.LAMINAR_EFFICIENCY_GATE, true, 64.0),
-            StrategyFilterRule(FilterType.CONVEX_ACCELERATION_GATE, true, 0.30),
-            StrategyFilterRule(FilterType.BALLISTIC_HEADROOM_CORRIDOR, true, 93.5),
-            StrategyFilterRule(FilterType.ZLEMA_HMM_COHERENCE, true, 140.0)
-        )
+        isEnabled = true
     )
+
+    fun highVoltageStrategyConfig(durationSec: Int = LOCKED_DURATION_SEC): StrategyConfig = fromScript(
+        id = 1L,
+        scriptCode = DefaultStrategyScripts.withDurationSec(
+            DefaultStrategyScripts.HIGH_VOLTAGE_OQS_SCRIPT,
+            durationSec
+        ),
+        isPreset = true,
+        isEnabled = true
+    )
+
+    fun fromScript(
+        id: Long,
+        scriptCode: String,
+        isPreset: Boolean = false,
+        isEnabled: Boolean = true
+    ): StrategyConfig {
+        val compiled = StrategyScriptCompiler.compile(scriptCode)
+        val parsed = compiled.parsedScript
+        val exec = parsed?.execution
+        return StrategyConfig(
+            id = id,
+            name = parsed?.name ?: STRATEGY_NAME,
+            description = parsed?.description ?: STRATEGY_DESCRIPTION,
+            isPreset = isPreset,
+            isEnabled = isEnabled,
+            durationSeconds = exec?.durationSec ?: LOCKED_DURATION_SEC,
+            stakeAmount = exec?.minStakeUsd ?: MIN_STAKE_USD,
+            cooldownMs = exec?.cooldownMs ?: LOCKED_COOLDOWN_MS,
+            minConfidence = exec?.minConfidence ?: MIN_CONFIDENCE_REQUIRED,
+            triggerType = TriggerType.RAW_TICK_RUSH_5S,
+            triggerThreshold = 1.35,
+            regimeAdaptiveMode = RegimeAdaptiveMode.OFF,
+            filters = listOf(
+                StrategyFilterRule(FilterType.TICK_RUSH_SNR_GATE, true, 1.35),
+                StrategyFilterRule(FilterType.TICK_DIRECTIONAL_PURITY, true, 72.0),
+                StrategyFilterRule(FilterType.TICK_SPEED_AND_FRESHNESS, true, 1.15),
+                StrategyFilterRule(FilterType.ANTI_SPIKE_DOMINANCE_GATE, true, 62.0),
+                StrategyFilterRule(FilterType.FTRL_ML_META_LABEL_GATE, true, 62.0)
+            ),
+            scriptCode = scriptCode,
+            stakeMode = exec?.stakeMode ?: "PERCENT_BALANCE",
+            stakeValue = exec?.stakeValue ?: BALANCE_STAKE_PERCENT,
+            minStakeUsd = exec?.minStakeUsd ?: MIN_STAKE_USD,
+            maxStakeUsd = exec?.maxStakeUsd ?: MAX_STAKE_USD,
+            minPayoutPercent = exec?.minPayoutPct ?: MIN_PAYOUT_PERCENT,
+            maxDailyTrades = exec?.maxDailyTrades ?: MAX_TRADES_PER_DAY,
+            maxConsecutiveLosses = exec?.maxConsecutiveLosses ?: MAX_CONSECUTIVE_LOSSES
+        )
+    }
 }
 
 @Immutable
@@ -153,37 +326,6 @@ enum class MarketPhase { MOMENTUM, EXPANSION, PRESSURE_BUILD, LEVEL_TEST, EXHAUS
 @Serializable
 enum class LandmarkType { SWING_HIGH, SWING_LOW, ROUND_LEVEL, FIB_618, REVERSAL_POINT, NONE }
 
-@Serializable
-enum class MoneyManagementMode(val displayName: String) {
-    DYNAMIC_COMPOUND("Locked 5% Balance ($1–$4000)");
-
-    val label: String get() = displayName
-}
-
-@Immutable
-@Serializable
-data class TradeSettingsConfig(
-    val defaultStake: Double = HardLockedMandate.MIN_STAKE_USD,
-    val defaultDurationSeconds: Int = HardLockedMandate.LOCKED_DURATION_SEC,
-    val globalCooldownSeconds: Int = 4,
-    val minPayoutPercent: Int = HardLockedMandate.MIN_PAYOUT_PERCENT,
-    val moneyManagementMode: MoneyManagementMode = MoneyManagementMode.DYNAMIC_COMPOUND,
-    val martingaleMultiplier: Double = 1.0,
-    val maxMartingaleSteps: Int = 0,
-    val overrideStrategyStakeAndDuration: Boolean = true
-)
-
-@Immutable
-@Serializable
-data class RiskConfig(
-    val maxDailyLossLimit: Double = 0.0,
-    val maxDailyLossPercent: Double = 15.0,
-    val dailyProfitTarget: Double = 0.0,
-    val maxConsecutiveLosses: Int = HardLockedMandate.MAX_CONSECUTIVE_LOSSES,
-    val dynamicCompoundPercent: Double = HardLockedMandate.BALANCE_STAKE_PERCENT,
-    val autoStopOnDailyLoss: Boolean = true
-)
-
 @Immutable
 @Serializable
 data class MicrostructureSnapshot(
@@ -246,9 +388,9 @@ data class RegimeOutput(
 
 @Serializable
 enum class TriggerType(val displayName: String, val description: String) {
-    HAWKES_BALLISTIC_IMPULSE(
-        "Hawkes-Laminar Ballistic Impulse",
-        "Captures self-exciting tick-arrival compression, convex 2nd-derivative acceleration, and laminar efficiency before impulse exhaustion."
+    RAW_TICK_RUSH_5S(
+        "Raw Tick-Stream Rush (5s)",
+        "Measures tick-by-tick displacement directly from the raw tick stream and enters for 5s when directional speed & purity break out above baseline noise oscillation."
     )
 }
 
@@ -260,11 +402,11 @@ enum class FilterType(
     val minRange: Double,
     val maxRange: Double
 ) {
-    HAWKES_ARRIVAL_INTENSITY("Hawkes Arrival & Order-Flow Gate", "OFI%", 18.0, 10.0, 60.0),
-    LAMINAR_EFFICIENCY_GATE("Laminar Fractal Efficiency (ER10)", "%", 64.0, 50.0, 95.0),
-    CONVEX_ACCELERATION_GATE("Convex 2nd-Derivative Acceleration", "T/s²", 0.30, 0.10, 3.0),
-    BALLISTIC_HEADROOM_CORRIDOR("Ballistic Headroom (Anti-Climax)", "relPos%", 93.5, 80.0, 96.0),
-    ZLEMA_HMM_COHERENCE("ZLEMA Phase-Lead & Latency Guard", "ms", 140.0, 50.0, 250.0)
+    TICK_RUSH_SNR_GATE("Tick Rush Signal-to-Noise Ratio", "x", 1.35, 1.1, 3.0),
+    TICK_DIRECTIONAL_PURITY("4-Tick One-Way Purity & Tip", "%", 72.0, 55.0, 95.0),
+    TICK_SPEED_AND_FRESHNESS("Tick Speed & Fresh Window (2-6t)", "T/s", 1.15, 0.8, 4.0),
+    ANTI_SPIKE_DOMINANCE_GATE("Anti-Spike Dominance & Convexity", "%", 62.0, 40.0, 80.0),
+    FTRL_ML_META_LABEL_GATE("Online FTRL-Proximal P(Win 5s)", "%", 62.0, 52.0, 85.0)
 }
 
 @Immutable
@@ -290,7 +432,69 @@ data class StrategyConfig(
     val triggerType: TriggerType,
     val triggerThreshold: Double,
     val regimeAdaptiveMode: RegimeAdaptiveMode,
-    val filters: List<StrategyFilterRule>
+    val filters: List<StrategyFilterRule>,
+    val scriptCode: String = DefaultStrategyScripts.DEFAULT_OQS_SCRIPT,
+    val stakeMode: String = "PERCENT_BALANCE",
+    val stakeValue: Double = HardLockedMandate.BALANCE_STAKE_PERCENT,
+    val minStakeUsd: Double = HardLockedMandate.MIN_STAKE_USD,
+    val maxStakeUsd: Double = HardLockedMandate.MAX_STAKE_USD,
+    val minPayoutPercent: Int = HardLockedMandate.MIN_PAYOUT_PERCENT,
+    val maxDailyTrades: Int = HardLockedMandate.MAX_TRADES_PER_DAY,
+    val maxConsecutiveLosses: Int = HardLockedMandate.MAX_CONSECUTIVE_LOSSES
+) {
+    fun computeEffectiveStake(balance: Double): Double {
+        val safeBalance = balance.finiteOr(0.0).coerceAtLeast(0.0)
+        val raw = if (stakeMode.equals("FIXED_USD", ignoreCase = true)) {
+            stakeValue.finiteOr(minStakeUsd)
+        } else {
+            safeBalance * (stakeValue.finiteOr(5.0).coerceIn(0.1, 100.0) / 100.0)
+        }
+        val lo = minStakeUsd.finiteOr(1.0).coerceAtLeast(1.0)
+        val hi = maxStakeUsd.finiteOr(4000.0).coerceIn(lo, 4000.0)
+        val clamped = raw.coerceIn(lo, hi)
+        return ((clamped * 100.0).roundToLong() / 100.0)
+    }
+}
+
+@Serializable
+enum class TemporalRegimeType(val displayName: String) {
+    CONSOLIDATION("Consolidation"),
+    TREND("Trend"),
+    EXPANSION_IMPULSE("Expansion Impulse"),
+    TRANSITION_UNCERTAIN("Transition (Hold)")
+}
+
+@Immutable
+@Serializable
+data class TemporalTelemetrySnapshot(
+    val snapshotSynchronized: Boolean = true,
+    val tickAgeMs: Long = 0L,
+    val regimeType: TemporalRegimeType = TemporalRegimeType.CONSOLIDATION,
+    val regimeTransitionStable: Boolean = true,
+    val eligibilityLayerPassed: Boolean = true,
+    val signalLayerScore: Double = 0.0,
+    val validationLayerScore: Double = 0.0,
+    val calibratedWinProbPercent: Double = 50.0,
+    val rollingSnrMean: Double = 0.0,
+    val rollingPurityMean: Double = 0.0,
+    val rollingOfiMedian: Double = 0.0,
+    val rollingImpulseMean: Double = 0.0,
+    val momentumHysteresisActive: Boolean = false,
+    val purityHysteresisActive: Boolean = false,
+    val snrHysteresisActive: Boolean = false,
+    val persistenceCount5: Int = 0,
+    val noiseClean: Boolean = true,
+    val upWinRatePercent: Double = 66.0,
+    val downWinRatePercent: Double = 66.0,
+    val regimeWinRatePercent: Double = 66.0,
+    val regimeSnrThreshold: Double = 1.32,
+    val regimePurityThreshold: Double = 70.0,
+    val gateStabilityPercent: Double = 92.5,
+    val falsePositiveRatePercent: Double = 6.8,
+    val impulseDetectionRatePercent: Double = 84.0,
+    val signalLatencyMs: Long = 165L,
+    val calibrationAccuracyPercent: Double = 83.2,
+    val oosExpectancyPercent: Double = 18.4
 )
 
 @Immutable
@@ -300,7 +504,8 @@ data class FilterDiagnostic(
     val passed: Boolean,
     val actualValueFormatted: String,
     val thresholdFormatted: String,
-    val reason: String
+    val reason: String,
+    val gateTitle: String = filterType.displayName
 )
 
 @Immutable
@@ -316,7 +521,8 @@ data class StrategyEvaluation(
     val filterDiagnostics: List<FilterDiagnostic>,
     val contextBlockReasons: List<String>,
     val regimeAdjustmentNote: String,
-    val readyToExecute: Boolean
+    val readyToExecute: Boolean,
+    val temporalTelemetry: TemporalTelemetrySnapshot = TemporalTelemetrySnapshot()
 )
 
 @Immutable
@@ -368,5 +574,12 @@ data class MarketTelemetryState(
     val consecutiveLosses: Int = 0,
     val currentMartingaleStep: Int = 0,
     val nextEffectiveStake: Double = 1.0,
-    val hardStopReason: String? = null
+    val hardStopReason: String? = null,
+    val tickRateTps: Double = 0.0,
+    val wsSynchronized: Boolean = true,
+    val temporalTelemetry: TemporalTelemetrySnapshot = TemporalTelemetrySnapshot(),
+    val hvWindow: HvWindowSnapshot = HvWindowSnapshot(),
+    val highVoltageStatus: HighVoltageFilterStatus = HighVoltageFilterStatus(),
+    val selectedTimeframeSec: Int = 5
 )
+

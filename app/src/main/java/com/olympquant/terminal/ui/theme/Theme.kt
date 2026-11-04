@@ -1,6 +1,8 @@
 package com.olympquant.terminal.ui.theme
 
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Shapes
 import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
@@ -10,6 +12,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.olympquant.terminal.R
 
@@ -29,6 +32,8 @@ val NeonViolet = Color(0xFF2979FF)
 val AmberGold = Color(0xFF94A3B8)
 val BullishGreen = Color(0xFF00E676)
 val BullishGreenDim = Color(0xFF002914)
+val WarningAmber = Color(0xFFFFB300)
+val WarningAmberDim = Color(0xFF332400)
 val BearishCrimson = Color(0xFFFF1744)
 val BearishCrimsonDim = Color(0xFF33050E)
 
@@ -81,8 +86,17 @@ private val QuantDarkColorScheme = darkColorScheme(
     surfaceVariant = SlateSurfaceVariant,
     onSurfaceVariant = TextSecondary,
     outline = SlateBorder,
+    outlineVariant = SlateBorderBright,
     error = BearishCrimson,
     onError = Color.White
+)
+
+val QuantShapes = Shapes(
+    extraSmall = RoundedCornerShape(6.dp),
+    small = RoundedCornerShape(8.dp),
+    medium = RoundedCornerShape(12.dp),
+    large = RoundedCornerShape(16.dp),
+    extraLarge = RoundedCornerShape(20.dp)
 )
 
 val QuantTypography = Typography(
@@ -91,27 +105,46 @@ val QuantTypography = Typography(
         fontWeight = FontWeight.Bold,
         fontSize = 32.sp,
         lineHeight = 38.sp,
-        letterSpacing = (-0.5).sp
+        letterSpacing = (-0.5).sp,
+        fontFeatureSettings = "tnum"
     ),
     headlineMedium = TextStyle(
         fontFamily = JetBrainsMonoFamily,
         fontWeight = FontWeight.Bold,
         fontSize = 24.sp,
         lineHeight = 30.sp,
-        letterSpacing = (-0.5).sp
+        letterSpacing = (-0.5).sp,
+        fontFeatureSettings = "tnum"
+    ),
+    headlineSmall = TextStyle(
+        fontFamily = JetBrainsMonoFamily,
+        fontWeight = FontWeight.Bold,
+        fontSize = 20.sp,
+        lineHeight = 26.sp,
+        letterSpacing = (-0.3).sp,
+        fontFeatureSettings = "tnum"
     ),
     titleLarge = TextStyle(
         fontFamily = SpaceGroteskFamily,
         fontWeight = FontWeight.Bold,
         fontSize = 18.sp,
         lineHeight = 24.sp,
-        letterSpacing = 0.2.sp
+        letterSpacing = 0.2.sp,
+        fontFeatureSettings = "tnum"
     ),
     titleMedium = TextStyle(
         fontFamily = SpaceGroteskFamily,
         fontWeight = FontWeight.Bold,
         fontSize = 15.sp,
-        lineHeight = 20.sp
+        lineHeight = 20.sp,
+        fontFeatureSettings = "tnum"
+    ),
+    titleSmall = TextStyle(
+        fontFamily = SpaceGroteskFamily,
+        fontWeight = FontWeight.Medium,
+        fontSize = 13.sp,
+        lineHeight = 18.sp,
+        fontFeatureSettings = "tnum"
     ),
     bodyLarge = TextStyle(
         fontFamily = SpaceGroteskFamily,
@@ -125,24 +158,33 @@ val QuantTypography = Typography(
         fontSize = 13.sp,
         lineHeight = 18.sp
     ),
+    bodySmall = TextStyle(
+        fontFamily = SpaceGroteskFamily,
+        fontWeight = FontWeight.Normal,
+        fontSize = 12.sp,
+        lineHeight = 16.sp
+    ),
     labelLarge = TextStyle(
         fontFamily = JetBrainsMonoFamily,
         fontWeight = FontWeight.Bold,
         fontSize = 12.sp,
         lineHeight = 16.sp,
-        letterSpacing = 0.3.sp
+        letterSpacing = 0.3.sp,
+        fontFeatureSettings = "tnum"
     ),
     labelMedium = TextStyle(
         fontFamily = JetBrainsMonoFamily,
         fontWeight = FontWeight.Medium,
         fontSize = 11.sp,
-        lineHeight = 15.sp
+        lineHeight = 15.sp,
+        fontFeatureSettings = "tnum"
     ),
     labelSmall = TextStyle(
         fontFamily = JetBrainsMonoFamily,
         fontWeight = FontWeight.Normal,
         fontSize = 10.sp,
-        lineHeight = 13.sp
+        lineHeight = 13.sp,
+        fontFeatureSettings = "tnum"
     )
 )
 
@@ -151,6 +193,8 @@ fun OlympQuantTheme(content: @Composable () -> Unit) {
     MaterialTheme(
         colorScheme = QuantDarkColorScheme,
         typography = QuantTypography,
+        shapes = QuantShapes,
         content = content
     )
 }
+

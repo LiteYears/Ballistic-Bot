@@ -1,8 +1,12 @@
 package com.olympquant.terminal.ui.screens
 
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -12,6 +16,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -52,6 +57,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.olympquant.terminal.data.TradeJournalEntity
 import com.olympquant.terminal.domain.MarketTelemetryState
@@ -96,7 +102,13 @@ fun SafeQuantProgressBar(
     trackColor: Color,
     modifier: Modifier = Modifier
 ) {
-    val safeProgress = progress.finiteOr(0f).coerceIn(0f, 1f)
+    val targetProgress = progress.finiteOr(0f).coerceIn(0f, 1f)
+    val animatedProgress by animateFloatAsState(
+        targetValue = targetProgress,
+        animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
+        label = "quant_progress"
+    )
+    val safeProgress = animatedProgress.finiteOr(targetProgress).coerceIn(0f, 1f)
     Canvas(modifier = modifier) {
         val w = size.width
         val h = size.height
@@ -178,15 +190,19 @@ fun HmmAndAuditScreen(telemetry: MarketTelemetryState) {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = "WEBSOCKET STREAM DECISION TELEMETRY",
+                            text = "WEBSOCKET STREAM TELEMETRY",
                             style = MaterialTheme.typography.labelLarge,
-                            color = ElectricCyan
+                            color = ElectricCyan,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f).padding(end = 8.dp)
                         )
                         Text(
-                            text = if (telemetry.assetLocked) "⚠️ ASSET LOCKED" else "✅ TRADABLE (+${telemetry.assetPayoutPercent}%)",
+                            text = if (telemetry.assetLocked) "⚠️ LOCKED" else "✅ +${telemetry.assetPayoutPercent}%",
                             style = MaterialTheme.typography.labelSmall,
                             color = if (telemetry.assetLocked) BearishCrimson else BullishGreen,
-                            fontWeight = FontWeight.Bold
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1
                         )
                     }
 
@@ -195,29 +211,34 @@ fun HmmAndAuditScreen(telemetry: MarketTelemetryState) {
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         AuditPill("ORDER FLOW", "${"%+.1f".format(ofi)}%", ofiColor, Modifier.weight(1f))
-                        AuditPill("TICK INTENSITY", "${"%.2f".format(intensity)}x", AmberGold, Modifier.weight(1f))
+                        AuditPill("INTENSITY", "${"%.2f".format(intensity)}x", AmberGold, Modifier.weight(1f))
                         AuditPill("SENTIMENT", "${telemetry.bullishSentimentPercent}% BULL", BullishGreen, Modifier.weight(1f))
                     }
 
-                    Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
                                 text = "SELL PRESSURE",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = BearishCrimson
+                                color = BearishCrimson,
+                                maxLines = 1
                             )
                             Text(
-                                text = "STREAM ORDER-FLOW IMBALANCE (${"%+.1f".format(ofi)}%)",
+                                text = "OFI ${"%+.1f".format(ofi)}%",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = ofiColor
+                                color = ofiColor,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1
                             )
                             Text(
                                 text = "BUY PRESSURE",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = BullishGreen
+                                color = BullishGreen,
+                                maxLines = 1
                             )
                         }
                         SafeQuantProgressBar(
@@ -232,9 +253,11 @@ fun HmmAndAuditScreen(telemetry: MarketTelemetryState) {
                     }
 
                     Text(
-                        text = "Sub-second e:1 Clock Δ: ${telemetry.serverClockOffsetMs}ms | Effective Next Stake: $${"%.2f".format(telemetry.nextEffectiveStake.finiteOr(10.0))} | Daily P&L: $${"%+.2f".format(telemetry.dailyNetPnl.finiteOr(0.0))}",
+                        text = "Clock Δ: ${telemetry.serverClockOffsetMs}ms • Next Stake: $${"%.2f".format(telemetry.nextEffectiveStake.finiteOr(10.0))} • Today P&L: $${"%+.2f".format(telemetry.dailyNetPnl.finiteOr(0.0))}",
                         style = MaterialTheme.typography.labelSmall,
-                        color = TextSecondary
+                        color = TextSecondary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
             }
@@ -262,14 +285,19 @@ fun HmmAndAuditScreen(telemetry: MarketTelemetryState) {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = "FORWARD POSTERIOR PROBABILITIES (α_t)",
+                            text = "FORWARD POSTERIORS (α_t)",
                             style = MaterialTheme.typography.labelLarge,
-                            color = ElectricCyan
+                            color = ElectricCyan,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f).padding(end = 8.dp)
                         )
                         Text(
-                            text = if (hmm != null) "Active: S${hmm.state} (${hmm.regimeName}) | ${hmm.duration}t" else "Warmup (<25 ticks)",
+                            text = if (hmm != null) "S${hmm.state} ${hmm.regimeName} (${hmm.duration}t)" else "Warmup (<25t)",
                             style = MaterialTheme.typography.labelSmall,
-                            color = AmberGold
+                            color = AmberGold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                         )
                     }
 
@@ -341,17 +369,22 @@ fun HmmAndAuditScreen(telemetry: MarketTelemetryState) {
                                 Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                                     Row(
                                         modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.SpaceBetween
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
                                     ) {
                                         Text(
                                             text = name,
                                             style = MaterialTheme.typography.labelSmall,
-                                            color = if (isDominant) BullishGreen else TextSecondary
+                                            color = if (isDominant) BullishGreen else TextSecondary,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.weight(1f).padding(end = 6.dp)
                                         )
                                         Text(
                                             text = "${"%.1f".format(p * 100f)}%",
                                             style = MaterialTheme.typography.labelSmall,
-                                            color = if (isDominant) BullishGreen else TextPrimary
+                                            color = if (isDominant) BullishGreen else TextPrimary,
+                                            maxLines = 1
                                         )
                                     }
                                     SafeQuantProgressBar(
@@ -568,14 +601,25 @@ fun HmmAndAuditScreen(telemetry: MarketTelemetryState) {
                                         modifier = Modifier.weight(1f)
                                     ) {
                                         Row(
-                                            modifier = Modifier.padding(8.dp),
-                                            horizontalArrangement = Arrangement.SpaceBetween
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(horizontal = 10.dp, vertical = 8.dp),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
                                         ) {
-                                            Text(text = k, style = MaterialTheme.typography.labelSmall, color = TextSecondary)
+                                            Text(
+                                                text = k,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = TextSecondary,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                                modifier = Modifier.weight(1f).padding(end = 6.dp)
+                                            )
                                             Text(
                                                 text = "%+.2fσ".format(v),
                                                 style = MaterialTheme.typography.labelSmall,
-                                                color = if (abs(v) > 2.0) AmberGold else TextPrimary
+                                                color = if (abs(v) > 2.0) AmberGold else TextPrimary,
+                                                maxLines = 1
                                             )
                                         }
                                     }
@@ -601,9 +645,22 @@ private fun AuditPill(
         shape = RoundedCornerShape(10.dp),
         color = SlateSurfaceVariant
     ) {
-        Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)) {
-            Text(text = label, style = MaterialTheme.typography.labelSmall, color = TextMuted)
-            Text(text = value, style = MaterialTheme.typography.labelLarge, color = color)
+        Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp)) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall,
+                color = TextMuted,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Spacer(Modifier.height(2.dp))
+            Text(
+                text = value,
+                style = MaterialTheme.typography.labelLarge,
+                color = color,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
         }
     }
 }
@@ -672,33 +729,39 @@ fun TradeJournalScreen(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Column(modifier = Modifier.weight(1f)) {
+            Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
                 Text(
-                    text = "QUANTITATIVE TRADING JOURNAL",
+                    text = "QUANT TRADING JOURNAL",
                     style = MaterialTheme.typography.titleLarge,
-                    color = TextPrimary
+                    color = TextPrimary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
                 Text(
-                    text = "Full telemetry snapshot at entry + live cumulative equity curve",
+                    text = "Entry telemetry snapshot & cumulative equity curve",
                     style = MaterialTheme.typography.labelSmall,
-                    color = TextSecondary
+                    color = TextSecondary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
             }
 
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 OutlinedButton(
                     onClick = { exportedJsonDialog = onExportJson() },
-                    modifier = Modifier.testTag("export_journal_button")
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                    modifier = Modifier.heightIn(min = 40.dp).testTag("export_journal_button")
                 ) {
-                    Icon(Icons.Default.Share, contentDescription = "Export JSON")
+                    Icon(Icons.Default.Share, contentDescription = "Export JSON", modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(4.dp))
-                    Text("JSON")
+                    Text("JSON", style = MaterialTheme.typography.labelSmall, maxLines = 1)
                 }
                 OutlinedButton(
                     onClick = onClearJournal,
-                    modifier = Modifier.testTag("clear_journal_button")
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                    modifier = Modifier.heightIn(min = 40.dp).testTag("clear_journal_button")
                 ) {
-                    Icon(Icons.Default.DeleteSweep, contentDescription = "Clear Journal", tint = BearishCrimson)
+                    Icon(Icons.Default.DeleteSweep, contentDescription = "Clear Journal", tint = BearishCrimson, modifier = Modifier.size(18.dp))
                 }
             }
         }
@@ -861,10 +924,23 @@ private fun JournalKpiCard(
         shape = RoundedCornerShape(12.dp),
         color = SlateSurface
     ) {
-        Column(modifier = Modifier.padding(10.dp)) {
-            Text(text = label, style = MaterialTheme.typography.labelSmall, color = TextMuted)
+        Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 9.dp)) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall,
+                color = TextMuted,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
             Spacer(Modifier.height(4.dp))
-            Text(text = value, style = MaterialTheme.typography.labelLarge, color = color, fontWeight = FontWeight.Bold)
+            Text(
+                text = value,
+                style = MaterialTheme.typography.labelLarge,
+                color = color,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
         }
     }
 }
@@ -897,17 +973,23 @@ private fun TradeJournalRowCard(trade: TradeJournalEntity) {
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.weight(1f).padding(end = 8.dp)
+                ) {
                     Text(
                         text = "${trade.pair} • ${trade.direction}",
                         style = MaterialTheme.typography.titleMedium,
-                        color = if (trade.direction == "UP") BullishGreen else BearishCrimson
+                        color = if (trade.direction == "UP") BullishGreen else BearishCrimson,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                     Spacer(Modifier.width(8.dp))
                     Text(
                         text = "$${"%.0f".format(trade.stake.finiteOr(10.0))} (${trade.durationSeconds}s)",
                         style = MaterialTheme.typography.labelMedium,
-                        color = TextPrimary
+                        color = TextPrimary,
+                        maxLines = 1
                     )
                 }
 
@@ -919,19 +1001,24 @@ private fun TradeJournalRowCard(trade: TradeJournalEntity) {
                         text = "${trade.outcome} (${"%+.2f".format(trade.profitLoss.finiteOr(0.0))})",
                         style = MaterialTheme.typography.labelSmall,
                         color = badgeColor,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                        maxLines = 1,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
                     )
                 }
             }
 
             Text(
-                text = "Strategy: ${trade.strategyName} | Account: ${trade.accountGroup.uppercase()} | ${timeFmt.format(Date(trade.timestampMs))}",
+                text = "Strategy: ${trade.strategyName} • ${trade.accountGroup.uppercase()} • ${timeFmt.format(Date(trade.timestampMs))}",
                 style = MaterialTheme.typography.labelSmall,
-                color = TextSecondary
+                color = TextSecondary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
 
             Row(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 TelemetryBadge("WS ${trade.wsLatencyMs}ms")
@@ -954,7 +1041,8 @@ private fun TelemetryBadge(text: String) {
             text = text,
             style = MaterialTheme.typography.labelSmall,
             color = ElectricCyan,
-            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+            maxLines = 1,
+            modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp)
         )
     }
 }

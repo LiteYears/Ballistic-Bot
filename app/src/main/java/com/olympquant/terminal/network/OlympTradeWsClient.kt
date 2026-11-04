@@ -6,6 +6,7 @@ import com.olympquant.terminal.domain.Tick
 import com.olympquant.terminal.domain.finiteOr
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
@@ -39,7 +40,6 @@ import javax.net.SocketFactory
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.sin
 import kotlin.random.Random
 
 enum class WsConnectionStatus {
@@ -103,17 +103,23 @@ private class TcpNoDelaySocketFactory : SocketFactory() {
 /**
  * Low-latency Olymp Trade WebSocket Client implementing:
  * - TCP_NODELAY low-latency socket tuning
- * - Event 98 startup subscriptions
- * - Event 90 keep-alive ping & round-trip latency guard
+ * - Single-threaded ordered frame parsing & deduplicated tick dispatch
+ * - Stale socket callback guards to prevent duplicate listeners & race conditions
+ * - Exponential-backoff reconnection with jitter & full subscription/snapshot restoration
+ * - Heartbeat ping-pong watchdog & stale-data detection
+ * - Event 98 startup subscriptions & Event 90 keep-alive RTT tracking
  * - Event 1068 / 1043 / 55 Demo & Real account discovery and live balance updates
  * - Event 182 / 183 / 80 / 700 / 75 live asset profitability %, trading lock status & schedule
  * - Event 73 live trader sentiment (bullish vs bearish order ratio)
  * - Event 10 / 1003 historical 5s candles & Event 2 / 280 / 282 / 11 live server-side 5s OHLC frames
- * - Event 1 sub-second floating-point tick timestamps + live Order-Flow Imbalance & Tick Arrival Intensity
+ * - Event 1 sub-second floating-point tick timestamps + live Order-Flow Imbalance & Tick Arrival Rate
  * - Event 23 pre-formatted order execution template + Event 21/22/26 trade settlement
  */
+@OptIn(ExperimentalCoroutinesApi::class)
 class OlympTradeWsClient {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    // Dedicated single-threaded dispatcher guarantees strict arrival order for WebSocket frames & ticks
+    private val frameDispatchScope = CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(1))
     private val json = Json { ignoreUnknownKeys = true }
 
     private val okHttpClient = OkHttpClient.Builder()
@@ -123,19 +129,30 @@ class OlympTradeWsClient {
         .pingInterval(20, TimeUnit.SECONDS)
         .build()
 
+    @Volatile
     private var webSocket: WebSocket? = null
     private var pingJob: Job? = null
     private var reconnectJob: Job? = null
     private var syntheticFeedJob: Job? = null
     private var reconnectAttempts = 0
+    @Volatile
     private var manualDisconnect = false
 
     private var currentUri: String = ""
     private var currentToken: String = ""
+    @Volatile
     private var currentPair: String = "LATAM_X"
+    @Volatile
     private var latestStreamPrice: Double = 4515.00
     private var lastTickPrice: Double = 0.0
     private var lastTickTimeMs: Long = 0L
+    private var syncedTickCountOnSession: Int = 0
+    private var hasSeededCandlesOnSession: Boolean = false
+
+    @Volatile
+    private var lastFrameReceivedAtMs: Long = 0L
+    @Volatile
+    private var lastTickReceivedAtMs: Long = 0L
 
     // Rolling micro-order-flow ring buffers (last 24 ticks)
     private val stepDeltasRing = DoubleArray(24)
@@ -158,6 +175,12 @@ class OlympTradeWsClient {
 
     private val _wsLatencyMs = MutableStateFlow(38L)
     val wsLatencyMs: StateFlow<Long> = _wsLatencyMs.asStateFlow()
+
+    private val _tickRateTps = MutableStateFlow(0.0)
+    val tickRateTps: StateFlow<Double> = _tickRateTps.asStateFlow()
+
+    private val _isStreamSynchronized = MutableStateFlow(false)
+    val isStreamSynchronized: StateFlow<Boolean> = _isStreamSynchronized.asStateFlow()
 
     private val _assetPayoutPercent = MutableStateFlow(85)
     val assetPayoutPercent: StateFlow<Int> = _assetPayoutPercent.asStateFlow()
@@ -198,22 +221,48 @@ class OlympTradeWsClient {
     private val _rawWireLog = MutableStateFlow<List<String>>(emptyList())
     val rawWireLog: StateFlow<List<String>> = _rawWireLog.asStateFlow()
 
+    companion object {
+        private const val HEARTBEAT_INTERVAL_MS = 12_000L
+        private const val WATCHDOG_CHECK_MS = 6_000L
+        private const val STALE_SOCKET_TIMEOUT_MS = 28_000L
+        private const val STALE_TICK_STREAM_MS = 10_000L
+        private const val MAX_BACKOFF_MS = 30_000L
+
+        internal fun computeReconnectBackoffMs(
+            attempt: Int,
+            jitterMs: Long = Random.nextLong(150L, 850L)
+        ): Long {
+            val safeAttempt = attempt.coerceAtLeast(1)
+            val expShift = (safeAttempt - 1).coerceIn(0, 5)
+            val baseDelay = min(MAX_BACKOFF_MS, 1000L * (1L shl expShift))
+            return baseDelay + jitterMs.coerceIn(0L, 1500L)
+        }
+    }
+
     fun connect(uri: String, accessToken: String, initialPair: String) {
         stopSyntheticFeedInternal()
         if (accessToken.isBlank()) {
             _connectionStatus.value = WsConnectionStatus.ERROR
+            _isStreamSynchronized.value = false
             _statusMessage.value = "Missing Olymp Trade access_token. Authenticate via WebView, paste token, or launch Live Impulse Feed."
             return
         }
         manualDisconnect = false
         reconnectJob?.cancel()
         reconnectJob = null
+        pingJob?.cancel()
+        pingJob = null
+
         currentUri = uri
         currentToken = accessToken.trim()
         currentPair = initialPair
         resetOrderFlowRing()
 
-        webSocket?.cancel()
+        // Detach and cancel any previous socket before opening a new one
+        val previousSocket = webSocket
+        webSocket = null
+        previousSocket?.cancel()
+
         _connectionStatus.value = WsConnectionStatus.CONNECTING
         _statusMessage.value = "Opening TCP_NODELAY WebSocket to ${uri.substringBefore("?")}..."
 
@@ -230,18 +279,40 @@ class OlympTradeWsClient {
         webSocket = okHttpClient.newWebSocket(request, SocketListener())
     }
 
-    private fun resetOrderFlowRing() {
+    @Synchronized
+    internal fun resetOrderFlowRing() {
         lastTickPrice = 0.0
         lastTickTimeMs = 0L
         ringWriteIdx = 0
         ringCount = 0
+        syncedTickCountOnSession = 0
+        hasSeededCandlesOnSession = false
+        pingTimestamps.clear()
         _orderFlowImbalance.value = 0.0
         _tickIntensityRatio.value = 1.0
+        _tickRateTps.value = 0.0
+        _isStreamSynchronized.value = false
         _assetLocked.value = false
     }
 
-    private fun recordTickOrderFlow(price: Double, timeMs: Long) {
+    /**
+     * Deduplicates incoming ticks, prevents out-of-order regression, updates micro-order-flow
+     * and live tick-rate telemetry, and marks snapshot synchronization once warm.
+     */
+    @Synchronized
+    internal fun acceptAndRecordTick(pair: String, price: Double, timeMs: Long): Boolean {
+        if (pair != currentPair || !price.isFinite() || price <= 0.0 || timeMs <= 0L) {
+            return false
+        }
+        // Reject exact duplicate ticks or regressive out-of-order timestamps after reconnect
+        if (lastTickTimeMs > 0L) {
+            if (timeMs < lastTickTimeMs) return false
+            if (timeMs == lastTickTimeMs && abs(price - lastTickPrice) < 1e-12) return false
+        }
+
         val localNow = System.currentTimeMillis()
+        lastFrameReceivedAtMs = localNow
+        lastTickReceivedAtMs = localNow
         _serverClockOffsetMs.value = (timeMs - localNow).coerceIn(-60_000L, 60_000L)
 
         if (lastTickPrice > 0.0 && lastTickTimeMs > 0L) {
@@ -263,7 +334,6 @@ class OlympTradeWsClient {
                     val idx = (ringWriteIdx - 1 - k + stepDeltasRing.size) % stepDeltasRing.size
                     val d = stepDeltasRing[idx]
                     val dt = stepDtMsRing[idx]
-                    // Aggressive ticks arriving with shorter dt carry higher order-flow weight
                     val speedWeight = 250.0 / max(40L, dt).toDouble()
                     val weightedMag = abs(d) * speedWeight
                     if (d > 0.0) buyFlow += weightedMag
@@ -289,15 +359,29 @@ class OlympTradeWsClient {
                     1.0
                 }
                 _tickIntensityRatio.value = intensity
+
+                val liveTps = if (avgRecentDt > 1.0) {
+                    (1000.0 / avgRecentDt).finiteOr(0.0).coerceIn(0.1, 30.0)
+                } else {
+                    0.0
+                }
+                _tickRateTps.value = liveTps
             }
         }
+
         lastTickPrice = price
         lastTickTimeMs = timeMs
+        latestStreamPrice = price
+        syncedTickCountOnSession++
+        if (hasSeededCandlesOnSession || syncedTickCountOnSession >= 6) {
+            _isStreamSynchronized.value = true
+        }
+        return true
     }
 
     /**
      * Starts a high-frequency realistic Olymp Trade tick & micro-impulse stream so operators can
-     * stress-test the MicroImpulse5s strategy and chart pipeline immediately on-device.
+     * stress-test strategies and the chart pipeline immediately on-device.
      */
     fun startLiveImpulseTestFeed(pair: String) {
         disconnect()
@@ -305,7 +389,7 @@ class OlympTradeWsClient {
         currentPair = pair
         resetOrderFlowRing()
         _connectionStatus.value = WsConnectionStatus.SYNTHETIC_FEED
-        _statusMessage.value = "High-Frequency Micro-Impulse Stream Active ($pair @ 4 ticks/s)"
+        _statusMessage.value = "High-Frequency Micro-Impulse Stream Active ($pair @ 4–6 ticks/s)"
         appendWireLog("⚡ STARTED High-Frequency Micro-Impulse Stream for $pair")
 
         syntheticFeedJob = scope.launch {
@@ -330,35 +414,47 @@ class OlympTradeWsClient {
                 basePrice = close
             }
             latestStreamPrice = basePrice
+            hasSeededCandlesOnSession = true
             _candlesSeedFlow.emit(seedCandles)
 
             var stepCounter = 0
             var impulsePhaseDir = 1
             var impulseTicksRemaining = 0
+            var noisePhaseCounter = 0
 
             while (isActive && _connectionStatus.value == WsConnectionStatus.SYNTHETIC_FEED) {
                 stepCounter++
-                if (impulseTicksRemaining <= 0 && stepCounter % 22 == 0) {
-                    impulsePhaseDir = if (Random.nextBoolean()) 1 else -1
-                    impulseTicksRemaining = Random.nextInt(6, 10)
+                if (impulseTicksRemaining <= 0) {
+                    noisePhaseCounter++
+                    if (noisePhaseCounter >= 24) {
+                        noisePhaseCounter = 0
+                        impulsePhaseDir = if (Random.nextBoolean()) 1 else -1
+                        impulseTicksRemaining = Random.nextInt(34, 43)
+                    }
                 }
 
                 val move = if (impulseTicksRemaining > 0) {
                     impulseTicksRemaining--
-                    impulsePhaseDir * tickStep * Random.nextDouble(1.1, 2.2)
+                    val rushMult = if (impulseTicksRemaining % 6 == 0) {
+                        Random.nextDouble(0.35, 0.85)
+                    } else {
+                        Random.nextDouble(1.15, 1.95)
+                    }
+                    impulsePhaseDir * tickStep * rushMult
                 } else {
-                    sin(stepCounter * 0.18) * tickStep * 0.4 + Random.nextDouble(-0.7, 0.7) * tickStep
+                    val alternatingSign = if (stepCounter % 2 == 0) 1.0 else -1.0
+                    (alternatingSign * 0.55 + Random.nextDouble(-0.35, 0.35)) * tickStep
                 }
 
                 basePrice = (basePrice + move).coerceAtLeast(0.0001)
-                latestStreamPrice = basePrice
                 val ts = System.currentTimeMillis()
-                _wsLatencyMs.value = Random.nextLong(24L, 48L)
+                _wsLatencyMs.value = Random.nextLong(22L, 46L)
                 _bullishSentimentPercent.value = (50 + (if (move >= 0) 12 else -12) + Random.nextInt(-5, 6)).coerceIn(15, 85)
-                recordTickOrderFlow(basePrice, ts)
-                _tickFlow.emit(Tick(pair = currentPair, price = basePrice, timeMs = ts))
+                if (acceptAndRecordTick(currentPair, basePrice, ts)) {
+                    _tickFlow.emit(Tick(pair = currentPair, price = basePrice, timeMs = ts))
+                }
 
-                val sleepMs = if (impulseTicksRemaining > 0) 170L else 280L
+                val sleepMs = if (impulseTicksRemaining > 0) 155L else 240L
                 delay(sleepMs)
             }
         }
@@ -377,8 +473,10 @@ class OlympTradeWsClient {
         pingJob?.cancel()
         pingJob = null
         clearPendingOrderLock()
-        webSocket?.close(1000, "Client requested disconnect")
+        val activeSocket = webSocket
         webSocket = null
+        activeSocket?.close(1000, "Client requested disconnect")
+        resetOrderFlowRing()
         _connectionStatus.value = WsConnectionStatus.DISCONNECTED
         _statusMessage.value = "Disconnected from Olymp Trade WebSocket"
     }
@@ -412,7 +510,8 @@ class OlympTradeWsClient {
         direction: SignalDirection,
         durationSec: Int,
         accountId: Long,
-        accountGroup: String
+        accountGroup: String,
+        clientOrderId: Long = System.currentTimeMillis() % 1_000_000L
     ): Boolean {
         val status = _connectionStatus.value
         if (status != WsConnectionStatus.AUTHENTICATED && status != WsConnectionStatus.SYNTHETIC_FEED) return false
@@ -430,7 +529,7 @@ class OlympTradeWsClient {
         }
 
         if (status == WsConnectionStatus.SYNTHETIC_FEED) {
-            val syntheticId = ts % 1_000_000L
+            val syntheticId = clientOrderId
             val entrySnapPrice = latestStreamPrice
             clearPendingOrderLock()
             appendWireLog("⚡ [IMPULSE FEED] ORDER ACCEPTED #$syntheticId ($pair ${dirStr.uppercase()} $$amount @ ${"%.4f".format(entrySnapPrice)})")
@@ -525,17 +624,45 @@ class OlympTradeWsClient {
         _statusMessage.value = "Live WebSocket stream active: $pair (TCP_NODELAY 5s OHLC + Tick Order-Flow)"
     }
 
-    private fun startPingLoop() {
+    private fun startPingLoop(activeSocket: WebSocket) {
         pingJob?.cancel()
         pingJob = scope.launch {
-            while (isActive && _connectionStatus.value == WsConnectionStatus.AUTHENTICATED) {
-                delay(12_000L)
-                sendPing()
+            var timeSinceLastPingMs = 0L
+            while (isActive && webSocket === activeSocket && _connectionStatus.value == WsConnectionStatus.AUTHENTICATED) {
+                delay(WATCHDOG_CHECK_MS)
+                if (webSocket !== activeSocket || _connectionStatus.value != WsConnectionStatus.AUTHENTICATED) break
+
+                val now = System.currentTimeMillis()
+                timeSinceLastPingMs += WATCHDOG_CHECK_MS
+
+                // Stale tick-stream detection: mark unsynchronized if no ticks arrive for > 10s
+                if (lastTickReceivedAtMs > 0L && now - lastTickReceivedAtMs > STALE_TICK_STREAM_MS) {
+                    _isStreamSynchronized.value = false
+                    _tickRateTps.value = 0.0
+                }
+
+                // Heartbeat timeout watchdog: reconnect if socket is silent for > 28s
+                if (lastFrameReceivedAtMs > 0L && now - lastFrameReceivedAtMs > STALE_SOCKET_TIMEOUT_MS) {
+                    appendWireLog("⚠️ WS Heartbeat Timeout (${(now - lastFrameReceivedAtMs) / 1000}s silent) — Reconnecting...")
+                    _isStreamSynchronized.value = false
+                    webSocket = null
+                    activeSocket.cancel()
+                    scheduleSingleFlightReconnect()
+                    break
+                }
+
+                if (timeSinceLastPingMs >= HEARTBEAT_INTERVAL_MS) {
+                    timeSinceLastPingMs = 0L
+                    sendPing()
+                }
             }
         }
     }
 
     private fun sendPing() {
+        if (pingTimestamps.size > 16) {
+            pingTimestamps.clear()
+        }
         val uuid = generateProtocolUuid()
         pingTimestamps[uuid] = System.currentTimeMillis()
         val msg = """[{"t":2,"e":90,"uuid":"$uuid","d":{}}]"""
@@ -564,13 +691,18 @@ class OlympTradeWsClient {
     private fun scheduleSingleFlightReconnect() {
         if (manualDisconnect || currentToken.isBlank()) return
         if (reconnectJob?.isActive == true) return
+        pingJob?.cancel()
+        pingJob = null
+        _isStreamSynchronized.value = false
+        _tickRateTps.value = 0.0
         reconnectAttempts++
-        val backoffMs = min(15_000L, 2500L * reconnectAttempts) + Random.nextLong(100L, 600L)
+        val backoffMs = computeReconnectBackoffMs(reconnectAttempts)
         _connectionStatus.value = WsConnectionStatus.RECONNECTING
-        _statusMessage.value = "Connection interrupted. Reconnecting in ${backoffMs / 1000}s (attempt #$reconnectAttempts)..."
+        _statusMessage.value =
+            "Connection interrupted. Exp-backoff reconnect in ${"%.1f".format(backoffMs / 1000.0)}s (attempt #$reconnectAttempts)..."
         reconnectJob = scope.launch {
             delay(backoffMs)
-            if (!manualDisconnect) {
+            if (!manualDisconnect && currentToken.isNotBlank()) {
                 connect(currentUri, currentToken, currentPair)
             }
         }
@@ -578,34 +710,57 @@ class OlympTradeWsClient {
 
     private fun appendWireLog(entry: String) {
         val current = _rawWireLog.value
-        _rawWireLog.value = (listOf(entry) + current).take(80)
+        val nextSize = min(80, current.size + 1)
+        val next = ArrayList<String>(nextSize)
+        next.add(entry)
+        for (i in 0 until nextSize - 1) {
+            next.add(current[i])
+        }
+        _rawWireLog.value = next
     }
 
     private inner class SocketListener : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
+            if (webSocket !== this@OlympTradeWsClient.webSocket) return
+            val now = System.currentTimeMillis()
+            lastFrameReceivedAtMs = now
+            lastTickReceivedAtMs = now
             reconnectAttempts = 0
+            _isStreamSynchronized.value = false
             _connectionStatus.value = WsConnectionStatus.AUTHENTICATED
-            _statusMessage.value = "Connected to Olymp Trade WebSocket (TCP_NODELAY). Synchronizing..."
-            appendWireLog("✅ WS OPEN (${response.code}) TCP_NODELAY=true")
+            _statusMessage.value = "Connected to Olymp Trade WebSocket (TCP_NODELAY). Synchronizing snapshot..."
+            appendWireLog("✅ WS OPEN (${response.code}) TCP_NODELAY=true • Restoring subscriptions")
             scope.launch {
-                runStartupHandshake()
-                startPingLoop()
+                if (webSocket === this@OlympTradeWsClient.webSocket) {
+                    runStartupHandshake()
+                    startPingLoop(webSocket)
+                }
             }
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
-            scope.launch {
-                parseAndDispatchFrame(text)
+            if (webSocket !== this@OlympTradeWsClient.webSocket) return
+            lastFrameReceivedAtMs = System.currentTimeMillis()
+            frameDispatchScope.launch {
+                if (webSocket === this@OlympTradeWsClient.webSocket) {
+                    parseAndDispatchFrame(text)
+                }
             }
         }
 
         override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+            if (webSocket !== this@OlympTradeWsClient.webSocket) return
             clearPendingOrderLock()
+            _isStreamSynchronized.value = false
             webSocket.close(code, reason)
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+            if (webSocket !== this@OlympTradeWsClient.webSocket) return
+            this@OlympTradeWsClient.webSocket = null
             clearPendingOrderLock()
+            _isStreamSynchronized.value = false
+            _tickRateTps.value = 0.0
             appendWireLog("🔌 WS CLOSED ($code: $reason)")
             if (!manualDisconnect) {
                 scheduleSingleFlightReconnect()
@@ -615,7 +770,11 @@ class OlympTradeWsClient {
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+            if (webSocket !== this@OlympTradeWsClient.webSocket) return
+            this@OlympTradeWsClient.webSocket = null
             clearPendingOrderLock()
+            _isStreamSynchronized.value = false
+            _tickRateTps.value = 0.0
             val codeInfo = response?.code?.let { " (HTTP $it)" } ?: ""
             appendWireLog("❌ WS ERROR$codeInfo: ${t.localizedMessage ?: "Socket failure"}")
             _statusMessage.value = "WebSocket error$codeInfo: ${t.localizedMessage ?: "Check token or use Live Impulse Feed"}"
@@ -684,9 +843,7 @@ class OlympTradeWsClient {
                 else -> rawTimeDouble.toLong()
             }
 
-            if (pair == currentPair && price.isFinite() && price > 0.0) {
-                latestStreamPrice = price
-                recordTickOrderFlow(price, timeMs)
+            if (acceptAndRecordTick(pair, price, timeMs)) {
                 _tickFlow.emit(Tick(pair = pair, price = price, timeMs = timeMs))
             }
         }
@@ -722,7 +879,9 @@ class OlympTradeWsClient {
             }
         }
         if (parsed.isNotEmpty()) {
-            appendWireLog("📥 Seeded ${parsed.size} historical 5s candles for $currentPair")
+            hasSeededCandlesOnSession = true
+            _isStreamSynchronized.value = true
+            appendWireLog("📥 Synchronized ${parsed.size} historical 5s candles for $currentPair")
             _candlesSeedFlow.emit(parsed)
         }
     }

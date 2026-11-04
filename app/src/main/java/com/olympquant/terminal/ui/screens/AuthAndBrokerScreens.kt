@@ -12,11 +12,13 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -64,12 +66,14 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.olympquant.terminal.data.SessionPreferences
 import com.olympquant.terminal.domain.HardLockedMandate
+import com.olympquant.terminal.domain.StrategyConfig
 import com.olympquant.terminal.domain.finiteOr
 import com.olympquant.terminal.network.WsConnectionStatus
 import com.olympquant.terminal.ui.theme.BearishCrimson
@@ -303,6 +307,7 @@ private fun TabPillButton(
 @Composable
 fun BrokerSessionScreen(
     sessionPrefs: SessionPreferences,
+    loadedStrategy: StrategyConfig = HardLockedMandate.lockedStrategyConfig(),
     connectionStatus: WsConnectionStatus,
     statusMessage: String,
     wsLatencyMs: Long,
@@ -315,6 +320,7 @@ fun BrokerSessionScreen(
     onStartImpulseStream: () -> Unit,
     onSetAutoReconnectSession: (Boolean) -> Unit,
     onRestoreSessionNow: () -> Unit,
+    onResetDailyCounters: () -> Unit = {},
     onDisconnect: () -> Unit,
     onLogoutApp: () -> Unit
 ) {
@@ -323,7 +329,9 @@ fun BrokerSessionScreen(
     var showWebViewAuth by remember { mutableStateOf(false) }
 
     val activeBalance = if (sessionPrefs.accountGroup == "real") sessionPrefs.realBalance else sessionPrefs.demoBalance
-    val lockedStake = HardLockedMandate.computeLockedStake(activeBalance)
+    val lockedStake = loadedStrategy.computeEffectiveStake(activeBalance)
+    val maxDailyTrades = loadedStrategy.maxDailyTrades.coerceAtLeast(1)
+    val maxLossStreak = loadedStrategy.maxConsecutiveLosses.coerceAtLeast(1)
     val dateFmt = remember { SimpleDateFormat("MMM dd, HH:mm:ss", Locale.US) }
 
     Column(
@@ -349,25 +357,30 @@ fun BrokerSessionScreen(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Column(modifier = Modifier.weight(1f)) {
+                Column(modifier = Modifier.weight(1f).padding(end = 10.dp)) {
                     Text(
                         text = "OPERATOR: ${sessionPrefs.loggedInUsername.ifBlank { "Quant" }.uppercase()}",
                         style = MaterialTheme.typography.titleMedium,
-                        color = ElectricCyan
+                        color = ElectricCyan,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                     Text(
                         text = sessionPrefs.loggedInEmail,
                         style = MaterialTheme.typography.bodyMedium,
-                        color = TextSecondary
+                        color = TextSecondary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
                 OutlinedButton(
                     onClick = onLogoutApp,
-                    modifier = Modifier.testTag("logout_workstation_button")
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+                    modifier = Modifier.heightIn(min = 40.dp).testTag("logout_workstation_button")
                 ) {
                     Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = "Lock Vault", modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(6.dp))
-                    Text("Lock Vault")
+                    Text("Lock Vault", maxLines = 1)
                 }
             }
         }
@@ -395,7 +408,10 @@ fun BrokerSessionScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.weight(1f).padding(end = 8.dp)
+                    ) {
                         Icon(
                             imageVector = Icons.Default.Shield,
                             contentDescription = "Hard Locked Mandate",
@@ -404,9 +420,11 @@ fun BrokerSessionScreen(
                         )
                         Spacer(Modifier.width(8.dp))
                         Text(
-                            text = "HARD-LOCKED EXECUTION & RISK MANDATE",
+                            text = "EXECUTION & RISK MANDATE",
                             style = MaterialTheme.typography.titleMedium,
-                            color = ElectricCyan
+                            color = ElectricCyan,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                         )
                     }
                     Surface(
@@ -419,15 +437,15 @@ fun BrokerSessionScreen(
                         ) {
                             Icon(Icons.Default.Lock, contentDescription = null, tint = TextSecondary, modifier = Modifier.size(12.dp))
                             Spacer(Modifier.width(4.dp))
-                            Text("LOCKED", style = MaterialTheme.typography.labelSmall, color = TextSecondary)
+                            Text("LOCKED", style = MaterialTheme.typography.labelSmall, color = TextSecondary, maxLines = 1)
                         }
                     }
                 }
 
                 // Live Daily Quota & Consecutive Loss Progress
-                val quotaRatio = (dailyTradesCount.toFloat() / HardLockedMandate.MAX_TRADES_PER_DAY.toFloat())
+                val quotaRatio = (dailyTradesCount.toFloat() / maxDailyTrades.toFloat())
                     .finiteOr(0f).coerceIn(0f, 1f)
-                val lossRatio = (consecutiveLosses.toFloat() / HardLockedMandate.MAX_CONSECUTIVE_LOSSES.toFloat())
+                val lossRatio = (consecutiveLosses.toFloat() / maxLossStreak.toFloat())
                     .finiteOr(0f).coerceIn(0f, 1f)
 
                 Surface(
@@ -443,69 +461,107 @@ fun BrokerSessionScreen(
                     ) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
-                                text = "5% Balance Stake: $${"%,.2f".format(lockedStake)}",
+                                text = "${loadedStrategy.name}: $${"%,.2f".format(lockedStake)}",
                                 style = MaterialTheme.typography.labelLarge,
-                                color = BullishGreen
+                                color = BullishGreen,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f).padding(end = 8.dp)
                             )
                             Text(
-                                text = "Min $1.00 • Max $4,000.00",
+                                text = "Min $${"%.0f".format(loadedStrategy.minStakeUsd)} • Max $${"%,.0f".format(loadedStrategy.maxStakeUsd)}",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = TextSecondary
+                                color = TextSecondary,
+                                maxLines = 1
                             )
                         }
 
                         Row(
                             modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
-                                text = "Daily Trades Quota: $dailyTradesCount / ${HardLockedMandate.MAX_TRADES_PER_DAY}",
+                                text = "Daily Trades Quota: $dailyTradesCount / $maxDailyTrades",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = if (dailyTradesCount >= HardLockedMandate.MAX_TRADES_PER_DAY) BearishCrimson else TextPrimary
+                                color = if (dailyTradesCount >= maxDailyTrades) BearishCrimson else TextPrimary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f).padding(end = 8.dp)
                             )
                             Text(
                                 text = "Today P&L: $${"%+.2f".format(dailyNetPnl.finiteOr(0.0))}",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = if (dailyNetPnl >= 0.0) BullishGreen else BearishCrimson
+                                color = if (dailyNetPnl >= 0.0) BullishGreen else BearishCrimson,
+                                maxLines = 1
                             )
                         }
                         SafeQuantProgressBar(
                             progress = quotaRatio,
-                            color = if (dailyTradesCount >= HardLockedMandate.MAX_TRADES_PER_DAY) BearishCrimson else ElectricCyan,
+                            color = if (dailyTradesCount >= maxDailyTrades) BearishCrimson else ElectricCyan,
                             trackColor = SlateSurfaceVariant,
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .height(4.dp)
-                                .clip(RoundedCornerShape(2.dp))
+                                .height(5.dp)
+                                .clip(RoundedCornerShape(3.dp))
                         )
 
                         Row(
                             modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
-                                text = "Consecutive Loss Hard Stop: $consecutiveLosses / ${HardLockedMandate.MAX_CONSECUTIVE_LOSSES}",
+                                text = "Loss Streak Guard: $consecutiveLosses / $maxLossStreak",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = if (consecutiveLosses >= HardLockedMandate.MAX_CONSECUTIVE_LOSSES) BearishCrimson else TextPrimary
+                                color = if (consecutiveLosses >= maxLossStreak) BearishCrimson else TextPrimary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f).padding(end = 8.dp)
                             )
                             Text(
                                 text = hardStopReason ?: "Circuit Breaker Armed",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = if (hardStopReason != null) BearishCrimson else BullishGreen
+                                color = if (hardStopReason != null) BearishCrimson else BullishGreen,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
                         }
                         SafeQuantProgressBar(
                             progress = lossRatio,
-                            color = if (consecutiveLosses >= 2) BearishCrimson else BullishGreen,
+                            color = if (consecutiveLosses >= maxLossStreak - 1) BearishCrimson else BullishGreen,
                             trackColor = SlateSurfaceVariant,
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .height(4.dp)
-                                .clip(RoundedCornerShape(2.dp))
+                                .height(5.dp)
+                                .clip(RoundedCornerShape(3.dp))
                         )
+
+                        if (dailyTradesCount > 0 || consecutiveLosses > 0 || hardStopReason != null) {
+                            OutlinedButton(
+                                onClick = onResetDailyCounters,
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(min = 40.dp)
+                                    .testTag("reset_daily_counters_button"),
+                                shape = RoundedCornerShape(8.dp)
+                            ) {
+                                Icon(Icons.Default.Refresh, contentDescription = null, tint = ElectricCyan, modifier = Modifier.size(14.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text(
+                                    text = "RESET DAILY QUOTA & HARD-STOP COUNTERS",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = ElectricCyan,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -530,11 +586,13 @@ fun BrokerSessionScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Column(modifier = Modifier.weight(1f)) {
+                    Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
                         Text(
-                            text = "PERSISTENT SESSION CAPTURE VAULT",
+                            text = "PERSISTENT SESSION VAULT",
                             style = MaterialTheme.typography.titleMedium,
-                            color = ElectricCyan
+                            color = ElectricCyan,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                         )
                         val captureStatus = if (sessionPrefs.accessToken.isNotBlank()) {
                             val timeStr = if (sessionPrefs.tokenCapturedAtMs > 0L) {
@@ -549,7 +607,9 @@ fun BrokerSessionScreen(
                         Text(
                             text = captureStatus,
                             style = MaterialTheme.typography.labelSmall,
-                            color = if (sessionPrefs.accessToken.isNotBlank()) BullishGreen else TextSecondary
+                            color = if (sessionPrefs.accessToken.isNotBlank()) BullishGreen else TextSecondary,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
                         )
                     }
                     StatusBadge(connectionStatus = connectionStatus, latencyMs = wsLatencyMs)
@@ -561,20 +621,24 @@ fun BrokerSessionScreen(
                         .clip(RoundedCornerShape(10.dp))
                         .background(ObsidianBackground)
                         .border(1.dp, SlateBorder, RoundedCornerShape(10.dp))
-                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Column(modifier = Modifier.weight(1f)) {
+                    Column(modifier = Modifier.weight(1f).padding(end = 10.dp)) {
                         Text(
                             text = "Auto-Reconnect Saved Session & Background Service",
                             style = MaterialTheme.typography.bodyMedium,
-                            color = TextPrimary
+                            color = TextPrimary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                         )
                         Text(
                             text = "Restores WebView cookie, WS stream, and background execution notification",
                             style = MaterialTheme.typography.labelSmall,
-                            color = TextSecondary
+                            color = TextSecondary,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
                         )
                     }
                     Switch(
@@ -597,50 +661,57 @@ fun BrokerSessionScreen(
                 ) {
                     OutlinedButton(
                         onClick = { showWebViewAuth = true },
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                         modifier = Modifier
                             .weight(1f)
-                            .height(48.dp)
+                            .heightIn(min = 48.dp)
                             .testTag("open_webview_auth_button"),
                         shape = RoundedCornerShape(10.dp)
                     ) {
-                        Icon(Icons.Default.Language, contentDescription = "Olymp Trade WebView", tint = ElectricCyan)
+                        Icon(Icons.Default.Language, contentDescription = "Olymp Trade WebView", tint = ElectricCyan, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.width(6.dp))
                         Text(
-                            text = "CAPTURE WEBVIEW SESSION",
+                            text = "CAPTURE WEBVIEW",
                             style = MaterialTheme.typography.labelSmall,
                             color = ElectricCyan,
-                            fontWeight = FontWeight.Bold
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                         )
                     }
 
                     OutlinedButton(
                         onClick = onRestoreSessionNow,
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                         modifier = Modifier
-                            .height(48.dp)
+                            .heightIn(min = 48.dp)
                             .testTag("restore_saved_session_button"),
                         shape = RoundedCornerShape(10.dp)
                     ) {
-                        Icon(Icons.Default.Refresh, contentDescription = "Restore Session", tint = BullishGreen)
+                        Icon(Icons.Default.Refresh, contentDescription = "Restore Session", tint = BullishGreen, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.width(4.dp))
-                        Text("RESTORE", style = MaterialTheme.typography.labelSmall, color = BullishGreen)
+                        Text("RESTORE", style = MaterialTheme.typography.labelSmall, color = BullishGreen, maxLines = 1)
                     }
                 }
 
                 Button(
                     onClick = onStartImpulseStream,
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(48.dp)
+                        .heightIn(min = 48.dp)
                         .testTag("start_impulse_stream_button"),
                     shape = RoundedCornerShape(10.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = SlateSurfaceVariant)
                 ) {
-                    Icon(Icons.Default.Bolt, contentDescription = "Impulse Stream", tint = ElectricCyan)
+                    Icon(Icons.Default.Bolt, contentDescription = "Impulse Stream", tint = ElectricCyan, modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(8.dp))
                     Text(
-                        text = "LAUNCH BALLISTIC IMPULSE STREAM (HFT FEED)",
+                        text = "LAUNCH BALLISTIC IMPULSE STREAM",
                         style = MaterialTheme.typography.labelMedium,
-                        color = ElectricCyan
+                        color = ElectricCyan,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
 
@@ -671,32 +742,36 @@ fun BrokerSessionScreen(
                 ) {
                     Button(
                         onClick = { onSaveAndConnect(tokenInput, uriInput) },
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                         modifier = Modifier
                             .weight(1f)
-                            .height(48.dp)
+                            .heightIn(min = 48.dp)
                             .testTag("connect_ws_button"),
                         colors = ButtonDefaults.buttonColors(containerColor = BullishGreen),
                         shape = RoundedCornerShape(10.dp)
                     ) {
-                        Icon(Icons.Default.CheckCircle, contentDescription = "Connect", tint = ObsidianBackground)
+                        Icon(Icons.Default.CheckCircle, contentDescription = "Connect", tint = ObsidianBackground, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.width(6.dp))
                         Text(
-                            text = "PERSIST & CONNECT WS",
+                            text = "PERSIST & CONNECT",
                             style = MaterialTheme.typography.labelLarge,
-                            color = ObsidianBackground
+                            color = ObsidianBackground,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                         )
                     }
 
                     OutlinedButton(
                         onClick = onDisconnect,
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                         modifier = Modifier
-                            .height(48.dp)
+                            .heightIn(min = 48.dp)
                             .testTag("disconnect_ws_button"),
                         shape = RoundedCornerShape(10.dp)
                     ) {
-                        Icon(Icons.Default.PowerSettingsNew, contentDescription = "Disconnect", tint = BearishCrimson)
+                        Icon(Icons.Default.PowerSettingsNew, contentDescription = "Disconnect", tint = BearishCrimson, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.width(4.dp))
-                        Text("DISCONNECT", color = BearishCrimson)
+                        Text("DISCONNECT", style = MaterialTheme.typography.labelSmall, color = BearishCrimson, maxLines = 1)
                     }
                 }
             }
@@ -720,9 +795,11 @@ fun BrokerSessionScreen(
                     Icon(Icons.Default.Terminal, contentDescription = "Wire Log", tint = ElectricCyan, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
                     Text(
-                        text = "PROTOCOL EVENT WIRE LOG (TCP_NODELAY | e:98 / e:90 / e:1 / e:2 / e:23 / e:26 / e:182)",
+                        text = "PROTOCOL EVENT WIRE LOG (TCP_NODELAY)",
                         style = MaterialTheme.typography.labelLarge,
-                        color = ElectricCyan
+                        color = ElectricCyan,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
                 Spacer(Modifier.height(8.dp))
@@ -807,6 +884,18 @@ fun OlympTradeWebViewAuthDialog(
     var detectedCookieStatus by remember {
         mutableStateOf("Sign in to Olymp Trade below — access_token cookie will be captured & persisted to Vault automatically.")
     }
+    var webViewInstance by remember { mutableStateOf<WebView?>(null) }
+
+    androidx.compose.runtime.DisposableEffect(Unit) {
+        onDispose {
+            webViewInstance?.apply {
+                stopLoading()
+                webViewClient = WebViewClient()
+                destroy()
+            }
+            webViewInstance = null
+        }
+    }
 
     Dialog(
         onDismissRequest = onDismiss,
@@ -849,6 +938,7 @@ fun OlympTradeWebViewAuthDialog(
                     modifier = Modifier.weight(1f).fillMaxWidth(),
                     factory = { context ->
                         WebView(context).apply {
+                            webViewInstance = this
                             settings.javaScriptEnabled = true
                             settings.domStorageEnabled = true
                             CookieManager.getInstance().setAcceptCookie(true)

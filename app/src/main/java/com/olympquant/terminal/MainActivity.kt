@@ -52,6 +52,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -63,7 +64,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -93,7 +96,7 @@ import com.olympquant.terminal.viewmodel.TerminalViewModel
 
 enum class WorkstationTab(val label: String, val icon: ImageVector, val testTag: String) {
     TERMINAL("Terminal", Icons.AutoMirrored.Filled.ShowChart, "nav_tab_terminal"),
-    STRATEGIES("Mandate", Icons.Default.Lock, "nav_tab_strategies"),
+    STRATEGIES("Strategy", Icons.Default.Lock, "nav_tab_strategies"),
     HMM_AUDIT("HMM Audit", Icons.Default.Analytics, "nav_tab_hmm"),
     JOURNAL("Journal", Icons.Default.History, "nav_tab_journal"),
     SESSION("Session", Icons.Default.Sensors, "nav_tab_session")
@@ -118,6 +121,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun OlympQuantRoot(vm: TerminalViewModel) {
     val sessionPrefs by vm.sessionPrefs.collectAsStateWithLifecycle()
+    val strategies by vm.strategies.collectAsStateWithLifecycle()
     val tradeJournal by vm.tradeJournal.collectAsStateWithLifecycle()
     val telemetry by vm.telemetry.collectAsStateWithLifecycle()
     val connectionStatus by vm.connectionStatus.collectAsStateWithLifecycle()
@@ -160,6 +164,22 @@ fun OlympQuantRoot(vm: TerminalViewModel) {
     var currentTab by rememberSaveable { mutableStateOf(WorkstationTab.TERMINAL) }
     val haptics = LocalHapticFeedback.current
     val activeBalance = if (sessionPrefs.accountGroup == "real") sessionPrefs.realBalance else sessionPrefs.demoBalance
+    val loadedStrategy = remember(strategies, sessionPrefs.selectedTimeframeSec) {
+        val base = strategies.firstOrNull { it.isEnabled }
+            ?: strategies.firstOrNull()
+            ?: HardLockedMandate.highVoltageStrategyConfig(durationSec = sessionPrefs.selectedTimeframeSec)
+        val tfSec = com.olympquant.terminal.domain.TradeTimeframe.fromSeconds(
+            sessionPrefs.selectedTimeframeSec.takeIf { it > 0 } ?: base.durationSeconds
+        ).seconds
+        if (base.durationSeconds != tfSec) {
+            base.copy(
+                durationSeconds = tfSec,
+                scriptCode = com.olympquant.terminal.engine.DefaultStrategyScripts.withDurationSec(base.scriptCode, tfSec)
+            )
+        } else {
+            base
+        }
+    }
 
     if (currentTab != WorkstationTab.TERMINAL) {
         BackHandler {
@@ -171,9 +191,8 @@ fun OlympQuantRoot(vm: TerminalViewModel) {
         val isWideScreen = maxWidth >= 600.dp
 
         Scaffold(
-            modifier = Modifier
-                .fillMaxSize()
-                .windowInsetsPadding(WindowInsets.safeDrawing),
+            modifier = Modifier.fillMaxSize(),
+            contentWindowInsets = WindowInsets.safeDrawing,
             containerColor = ObsidianBackground,
             bottomBar = {
                 if (!isWideScreen) {
@@ -189,8 +208,17 @@ fun OlympQuantRoot(vm: TerminalViewModel) {
                                     haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                     currentTab = tab
                                 },
-                                icon = { Icon(tab.icon, contentDescription = tab.label) },
-                                label = { Text(tab.label, style = MaterialTheme.typography.labelSmall) },
+                                icon = { Icon(tab.icon, contentDescription = tab.label, modifier = Modifier.size(20.dp)) },
+                                label = {
+                                    Text(
+                                        text = tab.label,
+                                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                        maxLines = 1,
+                                        softWrap = false,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                },
+                                alwaysShowLabel = true,
                                 colors = NavigationBarItemDefaults.colors(
                                     selectedIconColor = TextPrimary,
                                     selectedTextColor = ElectricCyan,
@@ -222,8 +250,16 @@ fun OlympQuantRoot(vm: TerminalViewModel) {
                                     haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                     currentTab = tab
                                 },
-                                icon = { Icon(tab.icon, contentDescription = tab.label) },
-                                label = { Text(tab.label, style = MaterialTheme.typography.labelSmall) },
+                                icon = { Icon(tab.icon, contentDescription = tab.label, modifier = Modifier.size(20.dp)) },
+                                label = {
+                                    Text(
+                                        text = tab.label,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        maxLines = 1,
+                                        softWrap = false,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                },
                                 colors = NavigationRailItemDefaults.colors(
                                     selectedIconColor = TextPrimary,
                                     selectedTextColor = ElectricCyan,
@@ -241,6 +277,7 @@ fun OlympQuantRoot(vm: TerminalViewModel) {
                     if (currentTab != WorkstationTab.TERMINAL) {
                         GlobalLiveMiniTickerBar(
                             telemetry = telemetry,
+                            maxDailyTrades = loadedStrategy.maxDailyTrades,
                             connectionStatus = connectionStatus,
                             wsLatencyMs = wsLatencyMs,
                             botRunning = botRunning,
@@ -254,12 +291,15 @@ fun OlympQuantRoot(vm: TerminalViewModel) {
                             WorkstationTab.TERMINAL -> TerminalWorkstationScreen(
                                 sessionPrefs = sessionPrefs,
                                 telemetry = telemetry,
+                                loadedStrategy = loadedStrategy,
                                 connectionStatus = connectionStatus,
                                 wsLatencyMs = wsLatencyMs,
                                 botRunning = botRunning,
                                 availablePairs = vm.availablePairs,
                                 lastExecutionBanner = lastExecutionBanner,
                                 onSelectPair = vm::selectAssetPair,
+                                onSelectTimeframe = vm::selectTradeTimeframe,
+                                onToggleAutoPauseOnAvoid = vm::setAutoPauseOnHvAvoid,
                                 onToggleBot = vm::toggleBotRunning,
                                 onSwitchAccountGroup = vm::switchAccountGroup,
                                 onSetDensityMode = vm::setDensityMode,
@@ -271,7 +311,16 @@ fun OlympQuantRoot(vm: TerminalViewModel) {
 
                             WorkstationTab.STRATEGIES -> ModularStrategyStudioScreen(
                                 telemetry = telemetry,
-                                activeBalance = activeBalance
+                                activeBalance = activeBalance,
+                                strategies = strategies,
+                                wsLatencyMs = wsLatencyMs,
+                                selectedTimeframeSec = sessionPrefs.selectedTimeframeSec,
+                                onSelectTimeframe = vm::selectTradeTimeframe,
+                                onCreateStrategyFromTemplate = vm::createNewStrategyFromTemplate,
+                                onSaveAndLoadStrategy = vm::saveAndLoadStrategyScript,
+                                onLoadStrategy = vm::loadStrategy,
+                                onDeleteStrategy = vm::deleteStrategy,
+                                onResetDefaultStrategy = vm::resetToDefaultStrategy
                             )
 
                             WorkstationTab.HMM_AUDIT -> HmmAndAuditScreen(
@@ -286,6 +335,7 @@ fun OlympQuantRoot(vm: TerminalViewModel) {
 
                             WorkstationTab.SESSION -> BrokerSessionScreen(
                                 sessionPrefs = sessionPrefs,
+                                loadedStrategy = loadedStrategy,
                                 connectionStatus = connectionStatus,
                                 statusMessage = wsStatusMessage,
                                 wsLatencyMs = wsLatencyMs,
@@ -298,6 +348,7 @@ fun OlympQuantRoot(vm: TerminalViewModel) {
                                 onStartImpulseStream = vm::startLiveImpulseTestFeed,
                                 onSetAutoReconnectSession = vm::setAutoReconnectSession,
                                 onRestoreSessionNow = vm::restoreSavedSessionNow,
+                                onResetDailyCounters = vm::resetDailyCounters,
                                 onDisconnect = vm::disconnectBroker,
                                 onLogoutApp = vm::logoutWorkstation
                             )
@@ -312,6 +363,7 @@ fun OlympQuantRoot(vm: TerminalViewModel) {
 @Composable
 private fun GlobalLiveMiniTickerBar(
     telemetry: MarketTelemetryState,
+    maxDailyTrades: Int = HardLockedMandate.MAX_TRADES_PER_DAY,
     connectionStatus: WsConnectionStatus,
     wsLatencyMs: Long,
     botRunning: Boolean,
@@ -324,19 +376,26 @@ private fun GlobalLiveMiniTickerBar(
             .background(SlateSurface)
             .border(1.dp, SlateBorder)
             .clickable { onJumpToTerminal() }
-            .padding(horizontal = 14.dp, vertical = 8.dp),
+            .padding(horizontal = 12.dp, vertical = 8.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        Row(
+            modifier = Modifier
+                .weight(1f)
+                .padding(end = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
             StatusBadge(connectionStatus = connectionStatus, latencyMs = wsLatencyMs)
-            Spacer(Modifier.width(10.dp))
+            Spacer(Modifier.width(8.dp))
             Text(
                 text = telemetry.pair,
                 style = MaterialTheme.typography.labelLarge,
-                color = ElectricCyan
+                color = ElectricCyan,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
-            Spacer(Modifier.width(8.dp))
+            Spacer(Modifier.width(6.dp))
             Text(
                 text = if (telemetry.latestPrice > 0) "%.4f".format(telemetry.latestPrice.finiteOr(0.0)) else "STANDBY",
                 style = MaterialTheme.typography.labelLarge,
@@ -344,11 +403,13 @@ private fun GlobalLiveMiniTickerBar(
                     SignalDirection.UP -> BullishGreen
                     SignalDirection.DOWN -> BearishCrimson
                     SignalDirection.NONE -> TextPrimary
-                }
+                },
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
         }
 
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             if (connectionStatus == WsConnectionStatus.DISCONNECTED) {
                 Surface(
                     onClick = onStartImpulseStream,
@@ -356,19 +417,27 @@ private fun GlobalLiveMiniTickerBar(
                     color = ElectricCyan.copy(alpha = 0.16f)
                 ) {
                     Row(
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Icon(Icons.Default.Bolt, contentDescription = null, tint = ElectricCyan, modifier = Modifier.size(12.dp))
                         Spacer(Modifier.width(3.dp))
-                        Text("STREAM", style = MaterialTheme.typography.labelSmall, color = ElectricCyan, fontWeight = FontWeight.Bold)
+                        Text(
+                            text = "STREAM",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = ElectricCyan,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1
+                        )
                     }
                 }
             } else {
                 Text(
-                    text = "${telemetry.dailyTradesCount}/${HardLockedMandate.MAX_TRADES_PER_DAY}T • OFI ${"%+.0f".format(telemetry.orderFlowImbalance.finiteOr(0.0))}%",
+                    text = "${telemetry.dailyTradesCount}/${maxDailyTrades}T • OFI ${"%+.0f".format(telemetry.orderFlowImbalance.finiteOr(0.0))}%",
                     style = MaterialTheme.typography.labelSmall,
-                    color = TextSecondary
+                    color = TextSecondary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
             }
 
@@ -376,7 +445,7 @@ private fun GlobalLiveMiniTickerBar(
                 modifier = Modifier
                     .clip(RoundedCornerShape(50))
                     .background(if (botRunning) BullishGreen.copy(alpha = 0.16f) else SlateSurfaceVariant)
-                    .padding(horizontal = 8.dp, vertical = 3.dp)
+                    .padding(horizontal = 8.dp, vertical = 4.dp)
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Box(
@@ -389,7 +458,8 @@ private fun GlobalLiveMiniTickerBar(
                     Text(
                         text = if (botRunning) "ARMED" else "STANDBY",
                         style = MaterialTheme.typography.labelSmall,
-                        color = if (botRunning) BullishGreen else TextSecondary
+                        color = if (botRunning) BullishGreen else TextSecondary,
+                        maxLines = 1
                     )
                 }
             }
