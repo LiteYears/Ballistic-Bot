@@ -300,6 +300,7 @@ fun OlympQuantRoot(vm: TerminalViewModel) {
                                 onSelectPair = vm::selectAssetPair,
                                 onSelectTimeframe = vm::selectTradeTimeframe,
                                 onToggleAutoPauseOnAvoid = vm::setAutoPauseOnHvAvoid,
+                                onToggleHourlySniper = vm::toggleHourlySniperMode,
                                 onToggleBot = vm::toggleBotRunning,
                                 onSwitchAccountGroup = vm::switchAccountGroup,
                                 onSetDensityMode = vm::setDensityMode,
@@ -441,10 +442,17 @@ private fun GlobalLiveMiniTickerBar(
                 )
             }
 
+            val badgeLabel = when {
+                telemetry.autopilotStandby -> "AUTO-HOLD (AVOID)"
+                telemetry.hourlySniperMode && botRunning -> "SNIPER 1/HR (${telemetry.hourlyTradesThisHour}/1)"
+                botRunning -> "ARMED"
+                else -> "STANDBY"
+            }
+            val badgeActive = botRunning || telemetry.autopilotStandby
             Box(
                 modifier = Modifier
                     .clip(RoundedCornerShape(50))
-                    .background(if (botRunning) BullishGreen.copy(alpha = 0.16f) else SlateSurfaceVariant)
+                    .background(if (badgeActive) BullishGreen.copy(alpha = 0.16f) else SlateSurfaceVariant)
                     .padding(horizontal = 8.dp, vertical = 4.dp)
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -452,13 +460,13 @@ private fun GlobalLiveMiniTickerBar(
                         modifier = Modifier
                             .size(6.dp)
                             .clip(CircleShape)
-                            .background(if (botRunning) BullishGreen else TextSecondary)
+                            .background(if (badgeActive) BullishGreen else TextSecondary)
                     )
                     Spacer(Modifier.width(4.dp))
                     Text(
-                        text = if (botRunning) "ARMED" else "STANDBY",
+                        text = badgeLabel,
                         style = MaterialTheme.typography.labelSmall,
-                        color = if (botRunning) BullishGreen else TextSecondary,
+                        color = if (badgeActive) BullishGreen else TextSecondary,
                         maxLines = 1
                     )
                 }

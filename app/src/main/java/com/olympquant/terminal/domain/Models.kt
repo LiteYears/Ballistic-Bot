@@ -45,20 +45,20 @@ enum class HvWindowState(
     EXCELLENT(
         badgeText = "EXCELLENT",
         scoreRangeLabel = "≥75%",
-        marketCondition = "Clean, fast, directional trend. Solid bodies, small wicks, aligned across 15s–60s.",
-        actionText = "Active Trading Zone. Launch the bot."
+        marketCondition = "Clean, high-velocity directional trend with solid candle bodies, low rejection wicks, and aligned 15s–60s anchors.",
+        actionText = "Optimal Execution Zone — Auto-Bot cleared to engage."
     ),
     MODERATE(
         badgeText = "MODERATE",
-        scoreRangeLabel = "50% - 74%",
-        marketCondition = "Trending market with minor pullbacks or slight deceleration. Spreading S/R corridors.",
-        actionText = "Standby / Caution. Safe to run, selective entries."
+        scoreRangeLabel = "50% – 74%",
+        marketCondition = "Developing trend with moderate pullbacks or transitional momentum across micro-anchors.",
+        actionText = "Selective Standby — Require all 6 breakout gates to align."
     ),
     AVOID(
         badgeText = "AVOID",
         scoreRangeLabel = "<50%",
-        marketCondition = "Stuck in tight flat range (TIGHT_CHOP) or Crazy Market whipsaw collapse wicks (>55%).",
-        actionText = "Off-limits. Turn the bot OFF immediately."
+        marketCondition = "Flat range compression (TIGHT_CHOP) or erratic whipsaw rejection wicks (>55%).",
+        actionText = "Stand Down — Execution paused until structure stabilizes."
     );
 
     val label: String get() = badgeText
@@ -66,9 +66,9 @@ enum class HvWindowState(
 
 @Serializable
 enum class HvMarketTrap(val label: String, val summary: String) {
-    NONE("CLEAN MOMENTUM", "Solid directional candles • No whipsaw or flat chop"),
-    TIGHT_CHOP("TIGHT_CHOP", "15s/30s/45s/60s anchor range < 0.20 pts — Flat range trap"),
-    CRAZY_WHIPSAW("CRAZY MARKET WHIPSAW", "Candles running & collapsing with wicks > 55%")
+    NONE("CLEAN MOMENTUM", "Directional candle structure • No chop or whipsaw detected"),
+    TIGHT_CHOP("TIGHT CHOP", "60s multi-timeframe anchor range compressed below scale floor"),
+    CRAZY_WHIPSAW("ERRATIC WHIPSAW", "Erratic candle reversals with dominant rejection wicks > 55%")
 }
 
 @Immutable
@@ -94,7 +94,7 @@ data class HvWindowSnapshot(
     val engineBooted: Boolean = true,
     val botLaunchReady: Boolean = false,
     val pauseImmediately: Boolean = false,
-    val stepGuideHint: String = "Wait for HV Window to hold ≥72% for 15–20s before launching bot."
+    val stepGuideHint: String = "Wait for HV Window score ≥ 72% for 15–20s before arming Auto-Bot."
 ) {
     val stabilityReady: Boolean get() = botLaunchReady
     val recommendation: String get() = stepGuideHint
@@ -105,6 +105,8 @@ data class HvWindowSnapshot(
 data class HighVoltageFilterStatus(
     val zlemaTrend: SignalDirection = SignalDirection.NONE,
     val zlemaSpread: Double = 0.0,
+    val zFastValue: Double = 0.0,
+    val zSlowValue: Double = 0.0,
     val trendFilterPassed: Boolean = false,
     val velocityTps: Double = 0.0,
     val minVelocityRequired: Double = 1.5,
@@ -125,23 +127,36 @@ data class HighVoltageFilterStatus(
     val isExhausted: Boolean = false,
     val volatilityFilterPassed: Boolean = true,
     val hvWindowPassed: Boolean = true,
-    val allSixFiltersPassed: Boolean = false
+    val allSixFiltersPassed: Boolean = false,
+    val activePlaybook: String = "SCANNING",
+    val opportunityDirection: SignalDirection = SignalDirection.NONE,
+    val continuationReady: Boolean = false,
+    val srBounceReady: Boolean = false,
+    val meanReversionReady: Boolean = false,
+    val opportunityScore: Double = 0.0,
+    val supportDistance: Double = 999.0,
+    val resistanceDistance: Double = 999.0
 ) {
-    val trendDirection: SignalDirection get() = zlemaTrend
-    val zFast: Double get() = zlemaSpread
-    val zSlow: Double get() = 0.0
+    val trendDirection: SignalDirection
+        get() = if (opportunityDirection != SignalDirection.NONE) opportunityDirection else zlemaTrend
+    val zFast: Double get() = if (zFastValue != 0.0 || zSlowValue != 0.0) zFastValue else zlemaSpread
+    val zSlow: Double get() = zSlowValue
     val tickVelocity: Double get() = velocityTps
     val breakoutFilterPassed: Boolean get() = positionBreakoutPassed
     val momentumFilterPassed: Boolean get() = activeMomentumPassed
     val passedFilterCount: Int
-        get() = listOf(
-            trendFilterPassed,
-            velocityFilterPassed,
-            positionBreakoutPassed,
-            activeMomentumPassed,
-            srObstaclePassed,
-            volatilityFilterPassed
-        ).count { it }
+        get() = if (srBounceReady || meanReversionReady) {
+            6
+        } else {
+            listOf(
+                trendFilterPassed,
+                velocityFilterPassed,
+                positionBreakoutPassed,
+                activeMomentumPassed,
+                srObstaclePassed,
+                volatilityFilterPassed
+            ).count { it }
+        }
 }
 
 /**
@@ -150,9 +165,9 @@ data class HighVoltageFilterStatus(
  * - Supports expanded trade timeframes: 5s, 15s, 30s, 45s, 1m (60s).
  */
 object HardLockedMandate {
-    const val STRATEGY_NAME = DefaultStrategyScripts.DEFAULT_STRATEGY_NAME
+    const val STRATEGY_NAME = DefaultStrategyScripts.SNIPER_M_STRATEGY_NAME
     const val STRATEGY_DESCRIPTION =
-        "HighVoltage micro-timeframe breakout strategy (6 strict mathematical filters) with zero-lag EMA (α=0.08) HV Window co-pilot and 5s/15s/30s/45s/1m timeframe expansion."
+        "Sniper M: Analyzes raw tick stream data, smooths the trajectory (Zero-Lag Fast vs Slow EMA), follows aligned momentum, and executes when a tick stream surge fires in the smoothed direction."
     const val MIN_STAKE_USD = 1.0
     const val BALANCE_STAKE_PERCENT = 5.0
     const val MAX_STAKE_USD = 4000.0
@@ -161,7 +176,7 @@ object HardLockedMandate {
     const val LOCKED_DURATION_SEC = 5
     const val LOCKED_COOLDOWN_MS = 4000L
     const val MIN_PAYOUT_PERCENT = 75
-    const val MIN_CONFIDENCE_REQUIRED = 62.0
+    const val MIN_CONFIDENCE_REQUIRED = 60.0
 
     fun computeLockedStake(balance: Double, activeStrategy: StrategyConfig? = null): Double {
         if (activeStrategy != null) {
@@ -175,7 +190,7 @@ object HardLockedMandate {
 
     fun lockedStrategyConfig(): StrategyConfig = fromScript(
         id = 1L,
-        scriptCode = DefaultStrategyScripts.DEFAULT_OQS_SCRIPT,
+        scriptCode = DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT,
         isPreset = true,
         isEnabled = true
     )
@@ -183,7 +198,7 @@ object HardLockedMandate {
     fun highVoltageStrategyConfig(durationSec: Int = LOCKED_DURATION_SEC): StrategyConfig = fromScript(
         id = 1L,
         scriptCode = DefaultStrategyScripts.withDurationSec(
-            DefaultStrategyScripts.HIGH_VOLTAGE_OQS_SCRIPT,
+            DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT,
             durationSec
         ),
         isPreset = true,
@@ -580,6 +595,13 @@ data class MarketTelemetryState(
     val temporalTelemetry: TemporalTelemetrySnapshot = TemporalTelemetrySnapshot(),
     val hvWindow: HvWindowSnapshot = HvWindowSnapshot(),
     val highVoltageStatus: HighVoltageFilterStatus = HighVoltageFilterStatus(),
-    val selectedTimeframeSec: Int = 5
+    val selectedTimeframeSec: Int = 5,
+    val autopilotArmed: Boolean = false,
+    val autopilotStandby: Boolean = false,
+    val hourlySniperMode: Boolean = false,
+    val hourlyTradesThisHour: Int = 0,
+    val nextHourlyResetMinutes: Int = 0,
+    val singleTradeLocked: Boolean = false
 )
+
 

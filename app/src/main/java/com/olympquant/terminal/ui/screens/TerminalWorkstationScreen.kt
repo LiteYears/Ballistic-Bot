@@ -139,6 +139,7 @@ fun TerminalWorkstationScreen(
     onSelectPair: (String) -> Unit,
     onSelectTimeframe: (Int) -> Unit = {},
     onToggleAutoPauseOnAvoid: (Boolean) -> Unit = {},
+    onToggleHourlySniper: () -> Unit = {},
     onToggleBot: () -> Unit,
     onSwitchAccountGroup: (String) -> Unit,
     onSetDensityMode: (TerminalDensityMode) -> Unit,
@@ -284,6 +285,10 @@ fun TerminalWorkstationScreen(
                 onSelectTimeframe = { sec ->
                     haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                     onSelectTimeframe(sec)
+                },
+                onToggleHourlySniper = {
+                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                    onToggleHourlySniper()
                 },
                 onToggleBot = {
                     haptics.performHapticFeedback(HapticFeedbackType.LongPress)
@@ -596,6 +601,7 @@ private fun ExecutionControlDeckCard(
     evaluation: StrategyEvaluation?,
     botRunning: Boolean,
     onSelectTimeframe: (Int) -> Unit = {},
+    onToggleHourlySniper: () -> Unit = {},
     onToggleBot: () -> Unit,
     onRequestAccountSwitch: (String) -> Unit,
     onManualOrder: (SignalDirection) -> Unit
@@ -607,7 +613,8 @@ private fun ExecutionControlDeckCard(
         sessionPrefs.selectedTimeframeSec.takeIf { it > 0 } ?: loadedStrategy.durationSeconds
     )
     val durationSec = selectedTf.seconds
-    val maxDailyTrades = loadedStrategy.maxDailyTrades
+    val sniperActive = sessionPrefs.hourlySniperMode || telemetry.hourlySniperMode
+    val maxDailyTrades = if (sniperActive) max(24, loadedStrategy.maxDailyTrades) else loadedStrategy.maxDailyTrades
     val maxLossStreak = loadedStrategy.maxConsecutiveLosses
     val zSpread = telemetry.zFast - telemetry.zSlow
     val t = evaluation?.temporalTelemetry ?: telemetry.temporalTelemetry
@@ -729,7 +736,7 @@ private fun ExecutionControlDeckCard(
                         )
                         Spacer(Modifier.width(6.dp))
                         Text(
-                            text = if (isReal) "REAL VAULT [D]" else "DEMO VAULT [D]",
+                            text = if (isReal) "REAL VAULT" else "DEMO VAULT",
                             style = MaterialTheme.typography.labelSmall,
                             color = if (isReal) BearishCrimson else ElectricCyan,
                             fontWeight = FontWeight.Bold,
@@ -894,28 +901,28 @@ private fun ExecutionControlDeckCard(
                         )
                     }
 
-                    // Compact HighVoltage + HV Window Status Pills
+                    // Compact Sniper M Status Pills
                     val hvStatus = telemetry.highVoltageStatus
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         X13LayerChip(
-                            title = "HV WINDOW",
-                            value = "${hvWin.state.label} (${"%.0f".format(hvWin.score)}%)",
-                            passed = hvWin.score >= 50.0 && !hvWin.tightChopDetected && !hvWin.crazyWhipsawDetected,
+                            title = "1. SMOOTH TICK",
+                            value = "${hvStatus.zlemaTrend.name} (${"%+.4f".format(hvStatus.zlemaSpread)})",
+                            passed = hvStatus.trendFilterPassed,
                             modifier = Modifier.weight(1f)
                         )
                         X13LayerChip(
-                            title = "HV 6-FILTERS",
-                            value = "${hvStatus.passedFilterCount}/6 PASS",
-                            passed = hvStatus.allSixFiltersPassed,
+                            title = "2. MOMENTUM",
+                            value = if (hvStatus.activeMomentumPassed) "ALIGNED" else "WAIT",
+                            passed = hvStatus.activeMomentumPassed,
                             modifier = Modifier.weight(1f)
                         )
                         X13LayerChip(
-                            title = "STABILITY HOLD",
-                            value = "${"%.0f".format(hvWin.stabilitySeconds)}s / 15s",
-                            passed = hvWin.stabilityReady,
+                            title = "3. TICK SURGE",
+                            value = "${"%.2f".format(hvStatus.velocityTps)} T/s",
+                            passed = hvStatus.velocityFilterPassed && hvStatus.positionBreakoutPassed,
                             modifier = Modifier.weight(1f)
                         )
                     }
@@ -952,7 +959,8 @@ private fun ExecutionControlDeckCard(
                 }
             }
 
-            // 3. Bot Arm/Standby Control & Daily Quota / Loss Streak Guard
+            // 3. Bot Arm/Standby Control, Autopilot Guard Status & Single-Trade Lock
+            val isArmedOrStandby = botRunning || telemetry.autopilotStandby
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -960,7 +968,7 @@ private fun ExecutionControlDeckCard(
             ) {
                 Button(
                     onClick = onToggleBot,
-                    enabled = telemetry.hardStopReason == null || botRunning,
+                    enabled = telemetry.hardStopReason == null || isArmedOrStandby,
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                     modifier = Modifier
                         .weight(1.15f)
@@ -968,19 +976,27 @@ private fun ExecutionControlDeckCard(
                         .testTag("toggle_bot_button"),
                     shape = RoundedCornerShape(10.dp),
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = if (botRunning) BearishCrimson else BullishGreen,
+                        containerColor = when {
+                            telemetry.autopilotStandby -> WarningAmber
+                            botRunning -> BearishCrimson
+                            else -> BullishGreen
+                        },
                         disabledContainerColor = SlateSurfaceVariant
                     )
                 ) {
                     Icon(
-                        imageVector = if (botRunning) Icons.Default.Stop else Icons.Default.PlayArrow,
-                        contentDescription = if (botRunning) "Stop Bot" else "Start Bot",
+                        imageVector = if (isArmedOrStandby) Icons.Default.Stop else Icons.Default.PlayArrow,
+                        contentDescription = if (isArmedOrStandby) "Stop Bot" else "Start Bot",
                         tint = ObsidianBackground,
                         modifier = Modifier.size(18.dp)
                     )
                     Spacer(Modifier.width(6.dp))
                     Text(
-                        text = if (botRunning) "STOP AUTO-BOT [S]" else "ARM AUTO-BOT [S]",
+                        text = when {
+                            telemetry.autopilotStandby -> "AUTO-HOLD (STOP)"
+                            botRunning -> "STOP AUTO-BOT"
+                            else -> "ARM AUTO-BOT"
+                        },
                         style = MaterialTheme.typography.labelMedium,
                         fontWeight = FontWeight.Bold,
                         color = ObsidianBackground,
@@ -998,7 +1014,11 @@ private fun ExecutionControlDeckCard(
                         .heightIn(min = 48.dp)
                         .border(
                             1.dp,
-                            if (quotaLocked) BearishCrimson else SlateBorder,
+                            when {
+                                quotaLocked -> BearishCrimson
+                                telemetry.singleTradeLocked -> WarningAmber
+                                else -> SlateBorder
+                            },
                             RoundedCornerShape(10.dp)
                         )
                         .testTag("daily_quota_loss_pill")
@@ -1011,9 +1031,13 @@ private fun ExecutionControlDeckCard(
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         Text(
-                            text = "TRADES: ${telemetry.dailyTradesCount}/$maxDailyTrades",
+                            text = if (telemetry.singleTradeLocked) {
+                                "1-TRADE LOCK: ACTIVE (1/1)"
+                            } else {
+                                "1-TRADE LOCK: READY • ${telemetry.dailyTradesCount}/$maxDailyTrades"
+                            },
                             style = MaterialTheme.typography.labelSmall,
-                            color = if (telemetry.dailyTradesCount >= maxDailyTrades) BearishCrimson else TextPrimary,
+                            color = if (telemetry.singleTradeLocked) WarningAmber else TextPrimary,
                             fontWeight = FontWeight.Bold,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
@@ -1024,6 +1048,95 @@ private fun ExecutionControlDeckCard(
                             color = if (telemetry.consecutiveLosses >= max(1, maxLossStreak - 1)) BearishCrimson else BullishGreen,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+
+            // 3B. Dedicated CHRONO SNIPER (1 TRADE / HOUR EVERY DAY) Mode Button
+            val sniperSlotLocked = sniperActive && telemetry.hourlyTradesThisHour >= 1
+            val sniperAccent = when {
+                !sniperActive -> ElectricCyan
+                sniperSlotLocked -> WarningAmber
+                else -> BullishGreen
+            }
+            Surface(
+                onClick = onToggleHourlySniper,
+                shape = RoundedCornerShape(10.dp),
+                color = if (sniperActive) sniperAccent.copy(alpha = 0.14f) else ObsidianBackground,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 50.dp)
+                    .border(
+                        width = 1.dp,
+                        color = if (sniperActive) sniperAccent.copy(alpha = 0.8f) else SlateBorder,
+                        shape = RoundedCornerShape(10.dp)
+                    )
+                    .testTag("toggle_hourly_sniper_button")
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(end = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Timer,
+                            contentDescription = "Chrono Sniper 1 Trade Per Hour Mode",
+                            tint = sniperAccent,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Column {
+                            Text(
+                                text = if (sniperActive) {
+                                    "CHRONO SNIPER (1/HR): ACTIVE"
+                                } else {
+                                    "ACTIVATE CHRONO SNIPER (1 TRADE / HR)"
+                                },
+                                style = MaterialTheme.typography.labelMedium,
+                                color = sniperAccent,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = if (sniperActive) {
+                                    if (sniperSlotLocked) {
+                                        "1/1 Trade Taken This Hour • Next Hourly Slot in ${telemetry.nextHourlyResetMinutes}m (24/7)"
+                                    } else {
+                                        "0/1 Trade This Hour • Hunting 1 Optimal Entry Each Hour Every Day"
+                                    }
+                                } else {
+                                    "Tap to enter 24/7 Hourly Sniper Mode (Strictly 1 trade each hour every day)"
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                                color = TextSecondary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+
+                    Surface(
+                        shape = RoundedCornerShape(6.dp),
+                        color = sniperAccent.copy(alpha = 0.18f),
+                        modifier = Modifier.border(1.dp, sniperAccent.copy(alpha = 0.5f), RoundedCornerShape(6.dp))
+                    ) {
+                        Text(
+                            text = if (sniperActive) "${telemetry.hourlyTradesThisHour}/1 HR" else "OFF",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = sniperAccent,
+                            fontFamily = JetBrainsMonoFamily,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
                         )
                     }
                 }
@@ -1190,7 +1303,7 @@ private fun HvWindowCoPilotCard(
                     }
                 }
 
-                // Auto-Pause on AVOID Co-Pilot Toggle
+                // Bidirectional Autopilot Guard Toggle (Stop on AVOID & Auto-Start on MODERATE/GOOD)
                 Surface(
                     onClick = { onToggleAutoPauseOnAvoid(!autoPauseOnAvoid) },
                     shape = RoundedCornerShape(8.dp),
@@ -1203,13 +1316,26 @@ private fun HvWindowCoPilotCard(
                         )
                         .testTag("hv_auto_pause_toggle")
                 ) {
-                    Text(
-                        text = if (autoPauseOnAvoid) "CO-PILOT GUARD: ON" else "CO-PILOT GUARD: OFF",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = if (autoPauseOnAvoid) BullishGreen else TextSecondary,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
-                    )
+                    Column(
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+                        horizontalAlignment = Alignment.End
+                    ) {
+                        Text(
+                            text = if (autoPauseOnAvoid) "AUTOPILOT GUARD: ON" else "AUTOPILOT GUARD: OFF",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (autoPauseOnAvoid) BullishGreen else TextSecondary,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = if (autoPauseOnAvoid) {
+                                if (telemetry.autopilotStandby) "PAUSED (AVOID) • AUTO-START READY" else "STOP AVOID • START MOD/GOOD"
+                            } else {
+                                "MANUAL BOT CONTROL"
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (telemetry.autopilotStandby) WarningAmber else TextMuted
+                        )
+                    }
                 }
             }
 
@@ -1373,13 +1499,13 @@ private fun HvWindowCoPilotCard(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = "HIGHVOLTAGE 6 STRICT MATHEMATICAL FILTERS",
+                            text = "SNIPER M — SMOOTHED TICK SURGE",
                             style = MaterialTheme.typography.labelSmall,
                             color = ElectricCyan,
                             fontWeight = FontWeight.Bold
                         )
                         Text(
-                            text = "${filters.passedFilterCount}/6 PASSED",
+                            text = if (filters.allSixFiltersPassed) "SURGE READY (${filters.zlemaTrend.name})" else "SCANNING STREAM",
                             style = MaterialTheme.typography.labelSmall,
                             color = if (filters.allSixFiltersPassed) BullishGreen else TextSecondary,
                             fontFamily = JetBrainsMonoFamily,
@@ -1391,44 +1517,21 @@ private fun HvWindowCoPilotCard(
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         X13LayerChip(
-                            title = "1. ZLEMA 10/30",
-                            value = "${filters.trendDirection.name} (${"%+.4f".format(filters.zFast - filters.zSlow)})",
+                            title = "1. SMOOTHED TICK DIR",
+                            value = "${filters.zlemaTrend.name} (${"%+.4f".format(filters.zFast - filters.zSlow)})",
                             passed = filters.trendFilterPassed,
                             modifier = Modifier.weight(1f)
                         )
                         X13LayerChip(
-                            title = "2. SPEED ≥1.5T/s",
-                            value = "${"%.2f".format(filters.tickVelocity)} T/s",
-                            passed = filters.velocityFilterPassed,
-                            modifier = Modifier.weight(1f)
-                        )
-                        X13LayerChip(
-                            title = "3. BREAKOUT 80/20",
-                            value = "RelPos ${"%.0f".format(filters.relPos50)}%",
-                            passed = filters.breakoutFilterPassed,
-                            modifier = Modifier.weight(1f)
-                        )
-                    }
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        X13LayerChip(
-                            title = "4. 6-TICK Δ5",
+                            title = "2. FOLLOW MOMENTUM",
                             value = "%+.4f".format(filters.netDelta5),
                             passed = filters.momentumFilterPassed,
                             modifier = Modifier.weight(1f)
                         )
                         X13LayerChip(
-                            title = "5. S/R WALL ≥0.25",
-                            value = if (filters.srClearanceAhead >= 900.0) "CLEAR" else "${"%.2f".format(filters.srClearanceAhead)} pt",
-                            passed = filters.srObstaclePassed,
-                            modifier = Modifier.weight(1f)
-                        )
-                        X13LayerChip(
-                            title = "6. VOL REGIME",
-                            value = "${"%.0f".format(filters.candleRangeRatio * 100.0)}% (40–265%)",
-                            passed = filters.volatilityFilterPassed,
+                            title = "3. TICK STREAM SURGE",
+                            value = "${"%.2f".format(filters.tickVelocity)} T/s",
+                            passed = filters.velocityFilterPassed && filters.breakoutFilterPassed,
                             modifier = Modifier.weight(1f)
                         )
                     }
@@ -2593,6 +2696,37 @@ private fun GatekeeperPipelineCard(evaluation: StrategyEvaluation) {
                             color = if (diag.passed) BullishGreen else BearishCrimson,
                             maxLines = 1
                         )
+                    }
+                }
+
+                if (evaluation.contextBlockReasons.isNotEmpty()) {
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .border(1.dp, BearishCrimson.copy(alpha = 0.45f), RoundedCornerShape(8.dp)),
+                        shape = RoundedCornerShape(8.dp),
+                        color = BearishCrimsonDim
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 10.dp, vertical = 7.dp),
+                            verticalArrangement = Arrangement.spacedBy(2.dp)
+                        ) {
+                            Text(
+                                text = "STRUCTURAL & ORDER-FLOW CONTEXT ALERTS",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = BearishCrimson,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = evaluation.contextBlockReasons.joinToString(" • "),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = TextPrimary,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
                     }
                 }
             }

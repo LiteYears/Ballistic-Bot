@@ -9,6 +9,7 @@ import com.olympquant.terminal.data.SessionPreferences
 import com.olympquant.terminal.data.TradeJournalEntity
 import com.olympquant.terminal.domain.ActiveOpenTrade
 import com.olympquant.terminal.domain.HardLockedMandate
+import com.olympquant.terminal.domain.HvWindowState
 import com.olympquant.terminal.domain.MarketTelemetryState
 import com.olympquant.terminal.domain.SignalDirection
 import com.olympquant.terminal.domain.StrategyConfig
@@ -34,6 +35,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -41,6 +43,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
@@ -73,8 +76,16 @@ class TerminalViewModel(
     private val activeOpenTrades = CopyOnWriteArrayList<ActiveOpenTrade>()
     private var lastTradeExecutionTimeMs: Long = 0L
     private var lastForegroundNotificationUpdateMs: Long = 0L
+
+    @Volatile
+    private var activeOrderExpiresAtMs: Long = 0L
+
+    @Volatile
+    private var lastHourlyTradeTimestampMs: Long = 0L
+
     @Volatile
     private var cachedDayStartMs: Long = 0L
+
     @Volatile
     private var nextDayRolloverMs: Long = 0L
 
@@ -95,6 +106,12 @@ class TerminalViewModel(
     private val _botRunning = MutableStateFlow(false)
     val botRunning: StateFlow<Boolean> = _botRunning.asStateFlow()
 
+    private val _autopilotArmed = MutableStateFlow(false)
+    val autopilotArmed: StateFlow<Boolean> = _autopilotArmed.asStateFlow()
+
+    private val _autopilotStandby = MutableStateFlow(false)
+    val autopilotStandby: StateFlow<Boolean> = _autopilotStandby.asStateFlow()
+
     private val _telemetry = MutableStateFlow(MarketTelemetryState())
     val telemetry: StateFlow<MarketTelemetryState> = _telemetry.asStateFlow()
 
@@ -111,19 +128,34 @@ class TerminalViewModel(
     init {
         BotExecutionForegroundService.onPauseBotRequested = {
             _botRunning.value = false
-            _lastExecutionBanner.value = "Auto-Bot paused from background notification."
+            _autopilotArmed.value = false
+            _autopilotStandby.value = false
+            _lastExecutionBanner.value = "Auto-Bot disarmed from background notification."
             pushForegroundNotification(force = true)
+        }
+
+        BotExecutionForegroundService.onResumeBotRequested = {
+            armBotWithAutopilotCheck(sourceLabel = "Notification Resume")
+        }
+
+        BotExecutionForegroundService.onToggleHourlySniperRequested = {
+            toggleHourlySniperMode()
         }
 
         backgroundEngineScope.launch(Dispatchers.IO) {
             repository.ensureSeeded()
             val initialPrefs = runCatching { repository.sessionFlow.first() }.getOrNull()
-            if (initialPrefs != null && initialPrefs.autoReconnectSession && wsClient.connectionStatus.value == WsConnectionStatus.DISCONNECTED) {
-                if (initialPrefs.accessToken.isNotBlank() && initialPrefs.lastSessionMode == "AUTHENTICATED") {
-                    wsClient.connect(initialPrefs.wsUri, initialPrefs.accessToken, initialPrefs.selectedPair)
-                    _lastExecutionBanner.value = "Persistent Session Restored (${initialPrefs.selectedPair})"
-                } else if (initialPrefs.lastSessionMode == "SYNTHETIC_FEED") {
-                    wsClient.startLiveImpulseTestFeed(initialPrefs.selectedPair)
+            if (initialPrefs != null) {
+                if (initialPrefs.hourlySniperMode) {
+                    _autopilotArmed.value = true
+                }
+                if (initialPrefs.autoReconnectSession && wsClient.connectionStatus.value == WsConnectionStatus.DISCONNECTED) {
+                    if (initialPrefs.accessToken.isNotBlank() && initialPrefs.lastSessionMode == "AUTHENTICATED") {
+                        wsClient.connect(initialPrefs.wsUri, initialPrefs.accessToken, initialPrefs.selectedPair)
+                        _lastExecutionBanner.value = "Persistent Session Restored (${initialPrefs.selectedPair})"
+                    } else if (initialPrefs.lastSessionMode == "SYNTHETIC_FEED" || initialPrefs.hourlySniperMode) {
+                        wsClient.startLiveImpulseTestFeed(initialPrefs.selectedPair)
+                    }
                 }
             }
         }
@@ -166,16 +198,25 @@ class TerminalViewModel(
                             )
                         }
                     }
+                    repository.updateAcceptedTrade(
+                        pair = accepted.pair,
+                        brokerTradeId = accepted.brokerTradeId,
+                        openPrice = accepted.openPrice
+                    )
                 }
             }
         }
         backgroundEngineScope.launch(Dispatchers.IO) {
             wsClient.orderSettledFlow.collect { settled ->
+                val nowMs = System.currentTimeMillis()
                 activeOpenTrades.removeAll {
                     it.brokerTradeId == settled.brokerTradeId ||
-                        (it.pair == settled.pair && System.currentTimeMillis() >= it.expiresAtMs - 1200L)
+                        (it.pair == settled.pair && nowMs >= it.expiresAtMs - 1200L)
                 }
-                repository.settleTrade(
+                if (activeOpenTrades.isEmpty()) {
+                    activeOrderExpiresAtMs = 0L
+                }
+                val freshJournal = repository.settleTradeAndGetJournal(
                     brokerTradeId = settled.brokerTradeId,
                     pair = settled.pair,
                     exitPrice = settled.closePrice,
@@ -200,14 +241,26 @@ class TerminalViewModel(
                         )
                     }
                 }
-                val updatedRisk = computeHardLockedDailyStats(sessionPrefs.value)
-                if (updatedRisk.hardStopReason != null && _botRunning.value) {
+                val updatedRisk = computeHardLockedDailyStats(sessionPrefs.value, nowMs, freshJournal)
+                if (updatedRisk.hardStopReason != null && (_botRunning.value || _autopilotArmed.value)) {
                     _botRunning.value = false
+                    _autopilotArmed.value = false
+                    _autopilotStandby.value = false
                     _lastExecutionBanner.value = "HARD STOP TRIGGERED: ${updatedRisk.hardStopReason}"
                 } else {
                     _lastExecutionBanner.value =
-                        "Trade #${settled.brokerTradeId} settled: ${settled.outcome} (${"%+.2f".format(settled.profitLoss)})"
+                        "Trade #${settled.brokerTradeId} settled: ${settled.outcome} (${"%+.2f".format(settled.profitLoss)}) • 1-Trade Lock Released"
                 }
+                _telemetry.value = _telemetry.value.copy(
+                    activeOpenTrades = activeOpenTrades.toList(),
+                    singleTradeLocked = hasActiveTradeInFlight(nowMs, freshJournal),
+                    dailyNetPnl = updatedRisk.dailyNetPnl,
+                    dailyTradesCount = updatedRisk.dailyTradesCount,
+                    consecutiveLosses = updatedRisk.consecutiveLosses,
+                    hourlyTradesThisHour = updatedRisk.hourlyTradesThisHour,
+                    nextHourlyResetMinutes = updatedRisk.nextHourlyResetMinutes,
+                    hardStopReason = updatedRisk.hardStopReason
+                )
                 pushForegroundNotification(force = true)
             }
         }
@@ -216,6 +269,108 @@ class TerminalViewModel(
                 processIncomingTick(tick)
             }
         }
+        // Background watchdog & 1-second timer to release expired 1-trade locks and keep 24/7 Chrono Sniper / Autopilot alive
+        backgroundEngineScope.launch {
+            while (isActive) {
+                delay(1000L)
+                val nowMs = System.currentTimeMillis()
+                val hadTrades = activeOpenTrades.isNotEmpty() || activeOrderExpiresAtMs > 0L
+                val stillLocked = hasActiveTradeInFlight(nowMs)
+                val prefs = sessionPrefs.value
+                val stats = computeHardLockedDailyStats(prefs, nowMs)
+                val cur = _telemetry.value
+                if (hadTrades != stillLocked ||
+                    cur.singleTradeLocked != stillLocked ||
+                    cur.hourlyTradesThisHour != stats.hourlyTradesThisHour ||
+                    cur.nextHourlyResetMinutes != stats.nextHourlyResetMinutes ||
+                    cur.hourlySniperMode != prefs.hourlySniperMode
+                ) {
+                    _telemetry.value = cur.copy(
+                        activeOpenTrades = activeOpenTrades.toList(),
+                        singleTradeLocked = stillLocked,
+                        hourlySniperMode = prefs.hourlySniperMode,
+                        hourlyTradesThisHour = stats.hourlyTradesThisHour,
+                        nextHourlyResetMinutes = stats.nextHourlyResetMinutes,
+                        autopilotArmed = _autopilotArmed.value,
+                        autopilotStandby = _autopilotStandby.value
+                    )
+                }
+                if ((_botRunning.value || _autopilotArmed.value || prefs.hourlySniperMode) &&
+                    wsClient.connectionStatus.value == WsConnectionStatus.DISCONNECTED &&
+                    prefs.autoReconnectSession
+                ) {
+                    if (prefs.accessToken.isNotBlank() && prefs.lastSessionMode == "AUTHENTICATED") {
+                        wsClient.connect(prefs.wsUri, prefs.accessToken, prefs.selectedPair)
+                    } else if (prefs.lastSessionMode == "SYNTHETIC_FEED" || prefs.hourlySniperMode) {
+                        wsClient.startLiveImpulseTestFeed(prefs.selectedPair)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun hasActiveTradeInFlight(
+        nowMs: Long = System.currentTimeMillis(),
+        journalSnapshot: List<TradeJournalEntity> = tradeJournal.value
+    ): Boolean {
+        activeOpenTrades.removeAll { nowMs >= it.expiresAtMs }
+        if (nowMs >= activeOrderExpiresAtMs && activeOpenTrades.isEmpty()) {
+            activeOrderExpiresAtMs = 0L
+        }
+        val pendingInJournal = journalSnapshot.any {
+            it.outcome == "PENDING" && nowMs < (it.timestampMs + it.durationSeconds * 1000L)
+        }
+        return activeOpenTrades.isNotEmpty() ||
+            nowMs < activeOrderExpiresAtMs ||
+            wsClient.pendingOrderCheck ||
+            pendingInJournal
+    }
+
+    private fun isHvWindowAvoid(hv: com.olympquant.terminal.domain.HvWindowSnapshot): Boolean {
+        return hv.state == HvWindowState.AVOID ||
+            hv.pauseImmediately ||
+            hv.tightChopDetected ||
+            hv.crazyWhipsawDetected ||
+            hv.score < 50.0
+    }
+
+    private fun isHvWindowModerateOrGood(hv: com.olympquant.terminal.domain.HvWindowSnapshot): Boolean {
+        return hv.engineBooted &&
+            !isHvWindowAvoid(hv) &&
+            (hv.state == HvWindowState.MODERATE || hv.state == HvWindowState.EXCELLENT) &&
+            hv.score >= 50.0
+    }
+
+    private fun armBotWithAutopilotCheck(sourceLabel: String = "Manual") {
+        val prefs = sessionPrefs.value
+        val activeStrategy = currentLoadedStrategy()
+        val stats = computeHardLockedDailyStats(prefs)
+        if (stats.hardStopReason != null) {
+            _botRunning.value = false
+            _autopilotArmed.value = false
+            _autopilotStandby.value = false
+            _lastExecutionBanner.value = "LOCKED HARD STOP: ${stats.hardStopReason}"
+            return
+        }
+        _autopilotArmed.value = true
+        val hv = _telemetry.value.hvWindow
+        if (prefs.autoPauseOnHvAvoid && isHvWindowAvoid(hv)) {
+            _botRunning.value = false
+            _autopilotStandby.value = true
+            _lastExecutionBanner.value =
+                "AUTOPILOT GUARD STANDBY ($sourceLabel): Market in AVOID (${"%.0f".format(hv.score)}%) — Auto-Trading Paused & Will Auto-Start on MODERATE/GOOD"
+        } else {
+            _botRunning.value = true
+            _autopilotStandby.value = false
+            val modeTag = if (prefs.hourlySniperMode) "CHRONO SNIPER 1/HR" else activeStrategy.name
+            _lastExecutionBanner.value =
+                "ARMED ($modeTag): Stake $${"%.2f".format(stats.lockedStakeUsd)} • 1-Trade Lock Active • HV ${hv.state.label} (${"%.0f".format(hv.score)}%)"
+        }
+        _telemetry.value = _telemetry.value.copy(
+            autopilotArmed = _autopilotArmed.value,
+            autopilotStandby = _autopilotStandby.value
+        )
+        pushForegroundNotification(force = true)
     }
 
     fun clearAuthError() {
@@ -252,6 +407,8 @@ class TerminalViewModel(
 
     fun logoutWorkstation() {
         _botRunning.value = false
+        _autopilotArmed.value = false
+        _autopilotStandby.value = false
         appContext?.let { BotExecutionForegroundService.stopService(it) }
         wsClient.disconnect()
         viewModelScope.launch {
@@ -305,6 +462,8 @@ class TerminalViewModel(
 
     fun disconnectBroker() {
         _botRunning.value = false
+        _autopilotArmed.value = false
+        _autopilotStandby.value = false
         appContext?.let { BotExecutionForegroundService.stopService(it) }
         viewModelScope.launch(Dispatchers.IO) {
             repository.updatePersistentSessionMeta(lastMode = "DISCONNECTED")
@@ -323,21 +482,64 @@ class TerminalViewModel(
     }
 
     fun toggleBotRunning() {
-        if (!_botRunning.value) {
-            val activeStrategy = currentLoadedStrategy()
-            val stats = computeHardLockedDailyStats(sessionPrefs.value)
-            if (stats.hardStopReason != null) {
-                _lastExecutionBanner.value = "LOCKED HARD STOP: ${stats.hardStopReason}"
-                return
-            }
-            _botRunning.value = true
-            _lastExecutionBanner.value =
-                "ARMED: ${activeStrategy.name} • Stake $${"%.2f".format(stats.lockedStakeUsd)} • Trades ${stats.dailyTradesCount}/${stats.maxDailyTrades}"
+        if (!_botRunning.value && !_autopilotStandby.value) {
+            armBotWithAutopilotCheck(sourceLabel = "Manual")
         } else {
             _botRunning.value = false
-            _lastExecutionBanner.value = "Auto-Bot placed on Standby."
+            _autopilotArmed.value = false
+            _autopilotStandby.value = false
+            _telemetry.value = _telemetry.value.copy(
+                autopilotArmed = false,
+                autopilotStandby = false
+            )
+            _lastExecutionBanner.value = "Auto-Bot Disarmed & Placed on Standby."
+            pushForegroundNotification(force = true)
         }
-        pushForegroundNotification(force = true)
+    }
+
+    fun toggleHourlySniperMode() {
+        setHourlySniperMode(!sessionPrefs.value.hourlySniperMode)
+    }
+
+    fun setHourlySniperMode(enabled: Boolean) {
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.updateHourlySniperMode(enabled)
+            val stats = computeHardLockedDailyStats(sessionPrefs.value.copy(hourlySniperMode = enabled))
+            if (enabled) {
+                _autopilotArmed.value = true
+                val hv = _telemetry.value.hvWindow
+                if (sessionPrefs.value.autoPauseOnHvAvoid && isHvWindowAvoid(hv)) {
+                    _botRunning.value = false
+                    _autopilotStandby.value = true
+                    _lastExecutionBanner.value =
+                        "CHRONO SNIPER (1/HR) ARMED: Waiting in Autopilot Standby (AVOID ${"%.0f".format(hv.score)}%) • Will Auto-Start on MODERATE/GOOD"
+                } else if (stats.hardStopReason == null) {
+                    _botRunning.value = true
+                    _autopilotStandby.value = false
+                    _lastExecutionBanner.value =
+                        "CHRONO SNIPER (1/HR) ACTIVE: Bot takes max 1 trade per hour, every day (${stats.hourlyTradesThisHour}/1 this hr)"
+                }
+                if (wsClient.connectionStatus.value == WsConnectionStatus.DISCONNECTED) {
+                    val prefs = sessionPrefs.value
+                    if (prefs.accessToken.isNotBlank() && prefs.lastSessionMode == "AUTHENTICATED") {
+                        wsClient.connect(prefs.wsUri, prefs.accessToken, prefs.selectedPair)
+                    } else {
+                        wsClient.startLiveImpulseTestFeed(prefs.selectedPair)
+                    }
+                }
+            } else {
+                _lastExecutionBanner.value =
+                    "Chrono Sniper (1/Hr) Mode OFF — Standard strategy cadence restored"
+            }
+            _telemetry.value = _telemetry.value.copy(
+                hourlySniperMode = enabled,
+                hourlyTradesThisHour = stats.hourlyTradesThisHour,
+                nextHourlyResetMinutes = stats.nextHourlyResetMinutes,
+                autopilotArmed = _autopilotArmed.value,
+                autopilotStandby = _autopilotStandby.value
+            )
+            pushForegroundNotification(force = true)
+        }
     }
 
     fun switchAccountGroup(group: String) {
@@ -368,25 +570,49 @@ class TerminalViewModel(
     fun setAutoPauseOnHvAvoid(enabled: Boolean) {
         viewModelScope.launch(Dispatchers.IO) {
             repository.updateAutoPauseOnHvAvoid(enabled)
-            _lastExecutionBanner.value = if (enabled) {
-                "HV Window Co-Pilot Auto-Pause ON: Bot pauses automatically if HV score drops <50% (AVOID)"
+            val hv = _telemetry.value.hvWindow
+            val stats = computeHardLockedDailyStats(sessionPrefs.value.copy(autoPauseOnHvAvoid = enabled))
+            if (enabled) {
+                _autopilotArmed.value = true
+                if (isHvWindowAvoid(hv)) {
+                    _botRunning.value = false
+                    _autopilotStandby.value = true
+                    _lastExecutionBanner.value =
+                        "AUTOPILOT GUARD ON: Auto-Trading Stopped in AVOID (${"%.0f".format(hv.score)}%) • Will Auto-Start on MODERATE to GOOD"
+                } else if (stats.hardStopReason == null) {
+                    _botRunning.value = true
+                    _autopilotStandby.value = false
+                    _lastExecutionBanner.value =
+                        "AUTOPILOT GUARD ON: Auto-Started Bot in ${hv.state.label} (${"%.0f".format(hv.score)}%) • Auto-Stops on AVOID"
+                }
             } else {
-                "HV Window Co-Pilot Auto-Pause OFF: Manual bot control during AVOID states"
+                _autopilotStandby.value = false
+                _lastExecutionBanner.value =
+                    "Autopilot Guard OFF: Manual bot control during AVOID states"
             }
+            _telemetry.value = _telemetry.value.copy(
+                autopilotArmed = _autopilotArmed.value,
+                autopilotStandby = _autopilotStandby.value
+            )
+            pushForegroundNotification(force = true)
         }
     }
 
     fun clearTradeJournal() {
         viewModelScope.launch(Dispatchers.IO) {
+            lastHourlyTradeTimestampMs = 0L
+            activeOrderExpiresAtMs = 0L
+            activeOpenTrades.clear()
             repository.clearJournal()
-            _lastExecutionBanner.value = "Trade journal & daily hard-stop counters cleared."
+            _lastExecutionBanner.value = "Trade journal, hourly sniper lock & daily hard-stop counters cleared."
         }
     }
 
     fun resetDailyCounters() {
         viewModelScope.launch(Dispatchers.IO) {
+            lastHourlyTradeTimestampMs = 0L
             repository.resetDailyPnlTimestamp()
-            _lastExecutionBanner.value = "Daily trade quota & loss streak counters reset."
+            _lastExecutionBanner.value = "Daily trade quota, hourly sniper slot & loss streak counters reset."
             pushForegroundNotification(force = true)
         }
     }
@@ -511,11 +737,12 @@ class TerminalViewModel(
         val lockedStakeUsd: Double,
         val maxDailyTrades: Int,
         val maxConsecutiveLosses: Int,
+        val hourlyTradesThisHour: Int,
+        val nextHourlyResetMinutes: Int,
         val hardStopReason: String?
     )
 
-    private fun startOfCurrentDayMs(): Long {
-        val now = System.currentTimeMillis()
+    private fun startOfCurrentDayMs(now: Long = System.currentTimeMillis()): Long {
         if (now < nextDayRolloverMs && cachedDayStartMs > 0L) {
             return cachedDayStartMs
         }
@@ -531,11 +758,30 @@ class TerminalViewModel(
         return startMs
     }
 
-    private fun computeHardLockedDailyStats(prefs: SessionPreferences): HardLockedDailyStats {
+    private fun computeHardLockedDailyStats(
+        prefs: SessionPreferences,
+        nowMs: Long = System.currentTimeMillis(),
+        journalSnapshot: List<TradeJournalEntity> = tradeJournal.value
+    ): HardLockedDailyStats {
         val activeStrategy = currentLoadedStrategy()
-        val dayStartMs = maxOf(startOfCurrentDayMs(), prefs.dailyPnlResetAtMs)
-        val journal = tradeJournal.value
+        val dayStartMs = maxOf(startOfCurrentDayMs(nowMs), prefs.dailyPnlResetAtMs)
+
+        val hourCal = Calendar.getInstance().apply {
+            timeInMillis = nowMs
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }
+        val rawHourStartMs = hourCal.timeInMillis
+        val currentHourStartMs = maxOf(rawHourStartMs, prefs.dailyPnlResetAtMs)
+        val nextHourStartMs = rawHourStartMs + 3_600_000L
+        val nextHourlyResetMinutes = (((nextHourStartMs - nowMs).coerceAtLeast(0L) + 59_999L) / 60_000L)
+            .toInt()
+            .coerceIn(1, 60)
+
+        val journal = journalSnapshot
         var dailyTradesCount = 0
+        var dbHourlyTradesCount = 0
         var dailyNetPnl = 0.0
         var consecutiveLosses = 0
         var streakBroken = false
@@ -543,7 +789,11 @@ class TerminalViewModel(
         for (i in journal.indices) {
             val t = journal[i]
             if (t.timestampMs < dayStartMs) break
+            if (t.outcome == "WS_OFFLINE") continue
             dailyTradesCount++
+            if (t.timestampMs >= currentHourStartMs) {
+                dbHourlyTradesCount++
+            }
             if (t.outcome == "WIN" || t.outcome == "LOSS") {
                 dailyNetPnl += t.profitLoss.finiteOr(0.0)
                 if (!streakBroken) {
@@ -557,9 +807,14 @@ class TerminalViewModel(
         }
         dailyNetPnl = dailyNetPnl.finiteOr(0.0)
 
+        val inMemHourly = if (lastHourlyTradeTimestampMs >= currentHourStartMs) 1 else 0
+        val hourlyTradesThisHour = maxOf(dbHourlyTradesCount, inMemHourly)
+
         val activeBalance = if (prefs.accountGroup == "real") prefs.realBalance else prefs.demoBalance
         val lockedStakeUsd = activeStrategy.computeEffectiveStake(activeBalance)
-        val maxDaily = activeStrategy.maxDailyTrades.coerceIn(1, 200)
+        val baseMaxDaily = activeStrategy.maxDailyTrades.coerceIn(1, 200)
+        // In Chrono Sniper (1/Hr) mode, allow 24 hourly trades per day (1 trade each hour every day)
+        val maxDaily = if (prefs.hourlySniperMode) maxOf(24, baseMaxDaily) else baseMaxDaily
         val maxLossStreak = activeStrategy.maxConsecutiveLosses.coerceIn(1, 25)
 
         val hardStopReason = when {
@@ -577,24 +832,41 @@ class TerminalViewModel(
             lockedStakeUsd = lockedStakeUsd,
             maxDailyTrades = maxDaily,
             maxConsecutiveLosses = maxLossStreak,
+            hourlyTradesThisHour = hourlyTradesThisHour,
+            nextHourlyResetMinutes = nextHourlyResetMinutes,
             hardStopReason = hardStopReason
         )
     }
 
     fun executeManualOrder(direction: SignalDirection) {
+        val now = System.currentTimeMillis()
         val prefs = sessionPrefs.value
         val activeStrategy = currentLoadedStrategy()
-        val stats = computeHardLockedDailyStats(prefs)
+        val stats = computeHardLockedDailyStats(prefs, now)
         if (stats.hardStopReason != null) {
             _lastExecutionBanner.value = "BLOCKED BY HARD STOP: ${stats.hardStopReason}"
             return
         }
 
+        if (hasActiveTradeInFlight(now)) {
+            val remSec = ((activeOrderExpiresAtMs - now).coerceAtLeast(1000L) / 1000.0)
+            _lastExecutionBanner.value =
+                "1-TRADE-AT-A-TIME LOCK: 1 trade is already active (${"%.1f".format(remSec)}s left). Wait for settlement."
+            return
+        }
+
+        if (prefs.hourlySniperMode && stats.hourlyTradesThisHour >= 1) {
+            _lastExecutionBanner.value =
+                "CHRONO SNIPER 1/HR LOCK: 1/1 hourly trade already taken • Next slot opens in ${stats.nextHourlyResetMinutes}m"
+            return
+        }
+
         val stake = stats.lockedStakeUsd
-        val duration = activeStrategy.durationSeconds
+        val duration = TradeTimeframe.fromSeconds(
+            prefs.selectedTimeframeSec.takeIf { it > 0 } ?: activeStrategy.durationSeconds
+        ).seconds
         val accountId = if (prefs.accountGroup == "real") prefs.realAccountId else prefs.demoAccountId
         val snap = _telemetry.value
-        val now = System.currentTimeMillis()
         val tradeId = now % 1_000_000L
 
         val sent = wsClient.placeOrder(
@@ -606,19 +878,28 @@ class TerminalViewModel(
             accountGroup = prefs.accountGroup,
             clientOrderId = tradeId
         )
-        if (sent && snap.latestPrice > 0.0) {
-            activeOpenTrades.add(
-                ActiveOpenTrade(
-                    brokerTradeId = tradeId,
-                    strategyName = activeStrategy.name,
-                    pair = prefs.selectedPair,
-                    direction = direction,
-                    stake = stake,
-                    entryPrice = snap.latestPrice,
-                    openedAtMs = now,
-                    expiresAtMs = now + duration * 1000L,
-                    payoutPercent = wsClient.assetPayoutPercent.value
+        if (sent) {
+            activeOrderExpiresAtMs = now + duration * 1000L
+            lastHourlyTradeTimestampMs = now
+            if (snap.latestPrice > 0.0) {
+                activeOpenTrades.add(
+                    ActiveOpenTrade(
+                        brokerTradeId = tradeId,
+                        strategyName = activeStrategy.name,
+                        pair = prefs.selectedPair,
+                        direction = direction,
+                        stake = stake,
+                        entryPrice = snap.latestPrice,
+                        openedAtMs = now,
+                        expiresAtMs = now + duration * 1000L,
+                        payoutPercent = wsClient.assetPayoutPercent.value
+                    )
                 )
+            }
+            _telemetry.value = snap.copy(
+                activeOpenTrades = activeOpenTrades.toList(),
+                singleTradeLocked = true,
+                hourlyTradesThisHour = stats.hourlyTradesThisHour + 1
             )
         }
         backgroundEngineScope.launch(Dispatchers.IO) {
@@ -650,14 +931,18 @@ class TerminalViewModel(
                     profitLoss = 0.0
                 )
             )
-            val newCount = stats.dailyTradesCount + 1
-            if (newCount >= stats.maxDailyTrades) {
-                _botRunning.value = false
-            }
-            _lastExecutionBanner.value = if (sent) {
-                "Executed ${direction.name} $${"%.2f".format(stake)} (${activeStrategy.name} • ${duration}s • Trade $newCount/${stats.maxDailyTrades}) on ${prefs.selectedPair}"
+            if (sent) {
+                val newCount = stats.dailyTradesCount + 1
+                if (newCount >= stats.maxDailyTrades) {
+                    _botRunning.value = false
+                    _autopilotArmed.value = false
+                    _autopilotStandby.value = false
+                }
+                _lastExecutionBanner.value =
+                    "Executed ${direction.name} $${"%.2f".format(stake)} (${activeStrategy.name} • ${duration}s • 1-Trade Lock Active • Trade $newCount/${stats.maxDailyTrades})"
             } else {
-                "Logged ${direction.name} $${"%.2f".format(stake)} (Trade $newCount/${stats.maxDailyTrades} — Connect WS or start stream)"
+                _lastExecutionBanner.value =
+                    "Feed Offline — Start Ballistic Impulse Stream or connect Broker WebSocket before placing ${direction.name} orders"
             }
             pushForegroundNotification(force = true)
         }
@@ -666,6 +951,7 @@ class TerminalViewModel(
     private fun resetEnginesForNewPair(pair: String) {
         tickHistory.clear()
         activeOpenTrades.clear()
+        activeOrderExpiresAtMs = 0L
         candleEngine.reset()
         structureEngine.reset()
         levelEngine.reset()
@@ -673,18 +959,24 @@ class TerminalViewModel(
         regimeEngine.reset()
         indicatorEngine.reset()
         modularStrategyEngine.reset()
+        val prefs = sessionPrefs.value
         _telemetry.value = MarketTelemetryState(
             pair = pair,
-            selectedTimeframeSec = TradeTimeframe.fromSeconds(sessionPrefs.value.selectedTimeframeSec).seconds
+            selectedTimeframeSec = TradeTimeframe.fromSeconds(prefs.selectedTimeframeSec).seconds,
+            autopilotArmed = _autopilotArmed.value,
+            autopilotStandby = _autopilotStandby.value,
+            hourlySniperMode = prefs.hourlySniperMode
         )
     }
 
     private suspend fun processIncomingTick(tick: Tick) {
         val nowMs = System.currentTimeMillis()
-        activeOpenTrades.removeAll { nowMs > it.expiresAtMs + 1500L }
+        activeOpenTrades.removeAll { nowMs >= it.expiresAtMs }
+        if (nowMs >= activeOrderExpiresAtMs && activeOpenTrades.isEmpty()) {
+            activeOrderExpiresAtMs = 0L
+        }
 
         val prevPrice = tickHistory.lastOrNull()?.price ?: 0.0
-        val wasAboveHvAvoid = _telemetry.value.hvWindow.score >= 50.0
         tickHistory.addLast(tick)
         while (tickHistory.size > 300) {
             tickHistory.removeFirst()
@@ -726,14 +1018,19 @@ class TerminalViewModel(
 
         val prefs = sessionPrefs.value
         val activeStrategy = currentLoadedStrategy()
-        val selectedTfSec = TradeTimeframe.fromSeconds(prefs.selectedTimeframeSec.takeIf { it > 0 } ?: activeStrategy.durationSeconds).seconds
+        val selectedTfSec = TradeTimeframe.fromSeconds(
+            prefs.selectedTimeframeSec.takeIf { it > 0 } ?: activeStrategy.durationSeconds
+        ).seconds
         val orderFlowImbalance = wsClient.orderFlowImbalance.value
         val tickIntensityRatio = wsClient.tickIntensityRatio.value
         val assetPayoutPct = wsClient.assetPayoutPercent.value
         val assetLocked = wsClient.assetLocked.value
         val bullishSentimentPct = wsClient.bullishSentimentPercent.value
 
-        // 5. Evaluate Context Enhancer & Base Confidence
+        // 5. Run Gaussian HMM Regime Inference
+        val hmmOutput = regimeEngine.processTicks(tickList)
+
+        // 6. Evaluate Context Enhancer & Base Confidence (including HMM regime, consistency, and exhaustion blocks)
         val (contextBlocks, baseConfidence) = contextEnhancer.evaluateContext(
             price = tick.price,
             indicators = ind,
@@ -747,13 +1044,53 @@ class TerminalViewModel(
             assetPayoutPercent = assetPayoutPct,
             minPayoutPercent = activeStrategy.minPayoutPercent,
             assetLocked = assetLocked,
-            bullishSentimentPercent = bullishSentimentPct
+            bullishSentimentPercent = bullishSentimentPct,
+            trendAgeSeconds = trendAgeSec,
+            hmmOutput = hmmOutput
         )
 
-        // 6. Run Gaussian HMM Regime Inference
-        val hmmOutput = regimeEngine.processTicks(tickList)
+        val stats = computeHardLockedDailyStats(prefs, nowMs)
 
-        val stats = computeHardLockedDailyStats(prefs)
+        // =========================================================================
+        // 6B. BIDIRECTIONAL AUTOPILOT GUARD:
+        //     - Immediately STOPS auto-trading during AVOID (<50%, Tight Chop, Whipsaw)
+        //     - Automatically STARTS/RESUMES auto-trading during MODERATE (50-74%) to GOOD/EXCELLENT (≥75%)
+        // =========================================================================
+        if (stats.hardStopReason != null) {
+            if (_botRunning.value || _autopilotStandby.value) {
+                _botRunning.value = false
+                _autopilotArmed.value = false
+                _autopilotStandby.value = false
+                _lastExecutionBanner.value = "HARD STOP ENGAGED: ${stats.hardStopReason}"
+                pushForegroundNotification(force = true)
+            }
+        } else if (prefs.autoPauseOnHvAvoid && (_autopilotArmed.value || _botRunning.value || _autopilotStandby.value || prefs.hourlySniperMode)) {
+            _autopilotArmed.value = true
+            val isAvoid = isHvWindowAvoid(ind.hvWindow)
+            val isModerateOrGood = isHvWindowModerateOrGood(ind.hvWindow)
+
+            if (isAvoid) {
+                val wasRunning = _botRunning.value
+                _botRunning.value = false
+                _autopilotStandby.value = true
+                if (wasRunning) {
+                    _lastExecutionBanner.value =
+                        "AUTOPILOT GUARD: Auto-Trading Stopped in AVOID (${"%.0f".format(ind.hvWindow.score)}% — ${ind.hvWindow.activeTrap.label}) • Will Auto-Start on MODERATE/GOOD"
+                    pushForegroundNotification(force = true)
+                }
+            } else if (isModerateOrGood) {
+                val wasPaused = !_botRunning.value || _autopilotStandby.value
+                _botRunning.value = true
+                _autopilotStandby.value = false
+                if (wasPaused) {
+                    _lastExecutionBanner.value =
+                        "AUTOPILOT GUARD: Auto-Started Bot in ${ind.hvWindow.state.label} (${"%.0f".format(ind.hvWindow.score)}%)"
+                    pushForegroundNotification(force = true)
+                }
+            }
+        }
+
+        val singleTradeLocked = hasActiveTradeInFlight(nowMs)
 
         val preliminaryState = MarketTelemetryState(
             pair = tick.pair,
@@ -806,7 +1143,13 @@ class TerminalViewModel(
             activeOpenTrades = activeOpenTrades.toList(),
             hvWindow = ind.hvWindow,
             highVoltageStatus = ind.highVoltageStatus,
-            selectedTimeframeSec = selectedTfSec
+            selectedTimeframeSec = selectedTfSec,
+            autopilotArmed = _autopilotArmed.value,
+            autopilotStandby = _autopilotStandby.value,
+            hourlySniperMode = prefs.hourlySniperMode,
+            hourlyTradesThisHour = stats.hourlyTradesThisHour,
+            nextHourlyResetMinutes = stats.nextHourlyResetMinutes,
+            singleTradeLocked = singleTradeLocked
         )
 
         val latency = wsLatencyMs.value
@@ -825,20 +1168,34 @@ class TerminalViewModel(
         )
         _telemetry.value = updatedState
 
-        // 8. Automated Execution Gate driven by the loaded .oqs strategy's execution & HV Window Co-Pilot safety rules
-        if (_botRunning.value && !wsClient.pendingOrderCheck) {
+        // 8. Automated Execution Gate:
+        //    - Requires _botRunning.value == true (Autopilot Guard not in AVOID standby)
+        //    - Enforces Single Active Trade Lock (only 1 trade at a time!)
+        //    - Enforces Chrono Sniper (1/Hr) mode when active (max 1 trade per hour, every day)
+        if (_botRunning.value && !hasActiveTradeInFlight(nowMs)) {
             if (stats.hardStopReason != null) {
                 _botRunning.value = false
+                _autopilotArmed.value = false
+                _autopilotStandby.value = false
                 _lastExecutionBanner.value = "HARD STOP ENGAGED: ${stats.hardStopReason}"
                 pushForegroundNotification(force = true)
                 return
             }
 
-            if (prefs.autoPauseOnHvAvoid && wasAboveHvAvoid && ind.hvWindow.pauseImmediately && ind.hvWindow.engineBooted) {
+            if (prefs.autoPauseOnHvAvoid && isHvWindowAvoid(ind.hvWindow)) {
                 _botRunning.value = false
+                _autopilotStandby.value = true
                 _lastExecutionBanner.value =
-                    "HV WINDOW AVOID (${"%.0f".format(ind.hvWindow.score)}% — ${ind.hvWindow.activeTrap.label}): Auto-Bot paused immediately to prevent trap losses"
+                    "AUTOPILOT GUARD: Auto-Trading Paused in AVOID (${"%.0f".format(ind.hvWindow.score)}%) • Waiting for MODERATE/GOOD"
                 pushForegroundNotification(force = true)
+                return
+            }
+
+            // Chrono Sniper Mode: allow strictly 1 trade each hour every day
+            if (prefs.hourlySniperMode && stats.hourlyTradesThisHour >= 1) {
+                if (nowMs - lastForegroundNotificationUpdateMs >= 1000L) {
+                    pushForegroundNotification(force = false)
+                }
                 return
             }
 
@@ -860,6 +1217,8 @@ class TerminalViewModel(
                     clientOrderId = tradeId
                 )
                 if (dispatched) {
+                    activeOrderExpiresAtMs = now + durationSec * 1000L
+                    lastHourlyTradeTimestampMs = now
                     activeOpenTrades.add(
                         ActiveOpenTrade(
                             brokerTradeId = tradeId,
@@ -872,6 +1231,14 @@ class TerminalViewModel(
                             expiresAtMs = now + durationSec * 1000L,
                             payoutPercent = assetPayoutPct
                         )
+                    )
+                    val newHourlyCount = stats.hourlyTradesThisHour + 1
+                    val newTradeTotal = stats.dailyTradesCount + 1
+                    _telemetry.value = _telemetry.value.copy(
+                        activeOpenTrades = activeOpenTrades.toList(),
+                        singleTradeLocked = true,
+                        hourlyTradesThisHour = newHourlyCount,
+                        dailyTradesCount = newTradeTotal
                     )
                     repository.recordTradeEntry(
                         TradeJournalEntity(
@@ -901,14 +1268,18 @@ class TerminalViewModel(
                             profitLoss = 0.0
                         )
                     )
-                    val newTradeTotal = stats.dailyTradesCount + 1
-                    if (newTradeTotal >= stats.maxDailyTrades) {
+                    if (newTradeTotal >= stats.maxDailyTrades && !prefs.hourlySniperMode) {
                         _botRunning.value = false
+                        _autopilotArmed.value = false
+                        _autopilotStandby.value = false
                         _lastExecutionBanner.value =
                             "AUTO #${newTradeTotal}/${stats.maxDailyTrades} [${activeStrategy.name}] -> ${evaluation.finalSignal} $${"%.2f".format(stake)} @ ${"%.4f".format(tick.price)} • DAILY CAP REACHED"
+                    } else if (prefs.hourlySniperMode) {
+                        _lastExecutionBanner.value =
+                            "CHRONO SNIPER (1/1 HR): ${evaluation.finalSignal} $${"%.2f".format(stake)} (${durationSec}s) @ ${"%.4f".format(tick.price)} • Next slot in ${stats.nextHourlyResetMinutes}m"
                     } else {
                         _lastExecutionBanner.value =
-                            "AUTO #${newTradeTotal}/${stats.maxDailyTrades} [${activeStrategy.name}] -> ${evaluation.finalSignal} $${"%.2f".format(stake)} (${durationSec}s) @ ${"%.4f".format(tick.price)}"
+                            "AUTO #${newTradeTotal}/${stats.maxDailyTrades} [${activeStrategy.name}] -> ${evaluation.finalSignal} $${"%.2f".format(stake)} (${durationSec}s) @ ${"%.4f".format(tick.price)} • 1-Trade Lock Active"
                     }
                     pushForegroundNotification(force = true)
                 }
@@ -926,16 +1297,27 @@ class TerminalViewModel(
         if (!force && now - lastForegroundNotificationUpdateMs < 1000L) return
         lastForegroundNotificationUpdateMs = now
         val snap = _telemetry.value
+        val prefs = sessionPrefs.value
         val eval = snap.activeEvaluations.firstOrNull()
         val activeStrategy = currentLoadedStrategy()
+        val maxDaily = if (prefs.hourlySniperMode) maxOf(24, activeStrategy.maxDailyTrades) else activeStrategy.maxDailyTrades
         BotExecutionForegroundService.syncForegroundExecution(
             context = ctx,
             snapshot = ForegroundExecutionSnapshot(
                 botRunning = _botRunning.value,
+                autopilotArmed = _autopilotArmed.value,
+                autopilotStandby = _autopilotStandby.value,
+                hourlySniperMode = prefs.hourlySniperMode,
+                hourlyTradesThisHour = snap.hourlyTradesThisHour,
+                nextHourlyResetMinutes = snap.nextHourlyResetMinutes,
+                singleTradeLocked = snap.singleTradeLocked,
+                hvStateLabel = snap.hvWindow.state.label,
+                hvScore = snap.hvWindow.score,
                 pair = snap.pair,
                 latestPrice = snap.latestPrice,
                 lockedStakeUsd = snap.nextEffectiveStake,
                 dailyTradesCount = snap.dailyTradesCount,
+                maxDailyTrades = maxDaily,
                 consecutiveLosses = snap.consecutiveLosses,
                 dailyNetPnl = snap.dailyNetPnl,
                 hardStopReason = snap.hardStopReason,
@@ -946,6 +1328,8 @@ class TerminalViewModel(
 
     override fun onCleared() {
         BotExecutionForegroundService.onPauseBotRequested = null
+        BotExecutionForegroundService.onResumeBotRequested = null
+        BotExecutionForegroundService.onToggleHourlySniperRequested = null
         backgroundEngineScope.cancel()
         super.onCleared()
     }

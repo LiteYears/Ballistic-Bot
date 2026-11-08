@@ -932,9 +932,15 @@ class OlympTradeWsClient {
         }
         if (demoId != null || demoBal != null || realId != null || realBal != null) {
             _balanceFlow.emit(AccountBalanceUpdate(demoId, demoBal, realId, realBal))
-            if (eventCode == 1068 && demoId != null) {
-                sendFormattedRequest(1043, """[{"account_id":$demoId,"group":"demo"}]""", requiresUuid = true)
-                sendFormattedRequest(182, """[{"account_id":$demoId}]""", requiresUuid = true)
+            if (eventCode == 1068) {
+                if (demoId != null) {
+                    sendFormattedRequest(1043, """[{"account_id":$demoId,"group":"demo"}]""", requiresUuid = true)
+                    sendFormattedRequest(182, """[{"account_id":$demoId}]""", requiresUuid = true)
+                }
+                if (realId != null) {
+                    sendFormattedRequest(1043, """[{"account_id":$realId,"group":"real"}]""", requiresUuid = true)
+                    sendFormattedRequest(182, """[{"account_id":$realId}]""", requiresUuid = true)
+                }
             }
         }
     }
@@ -985,46 +991,56 @@ class OlympTradeWsClient {
         }
     }
 
-    private suspend fun handleOrderAcceptedOrUpdatedEvent(eventCode: Int, dataElement: JsonElement?) {
+    internal suspend fun handleOrderAcceptedOrUpdatedEvent(eventCode: Int, dataElement: JsonElement?) {
         clearPendingOrderLock()
         val arr = dataElement as? JsonArray ?: return
-        val first = arr.firstOrNull() as? JsonObject ?: return
-        val status = first["status"]?.jsonPrimitive?.content?.lowercase() ?: ""
-        if (eventCode == 21 && (status.contains("win") || status.contains("loss") || status.contains("loose"))) {
-            handleOrderClosedEvent(dataElement)
-            return
-        }
-        if (eventCode == 21 && status.isNotBlank() && !status.contains("open") && !status.contains("new")) {
-            return
-        }
+        for (el in arr) {
+            val dealObj = el as? JsonObject ?: continue
+            val status = dealObj["status"]?.jsonPrimitive?.content?.lowercase() ?: ""
+            if (eventCode == 21 && (
+                    status.contains("win") ||
+                        status.contains("loss") ||
+                        status.contains("loose") ||
+                        status.contains("tie") ||
+                        status.contains("standoff") ||
+                        status.contains("refund")
+                    )
+            ) {
+                handleOrderClosedEvent(JsonArray(listOf(dealObj)))
+                continue
+            }
+            if (eventCode == 21 && status.isNotBlank() && !status.contains("open") && !status.contains("new")) {
+                continue
+            }
 
-        val id = first["id"]?.jsonPrimitive?.longOrNull
-            ?: first["deal_id"]?.jsonPrimitive?.longOrNull
-            ?: 0L
-        val pair = first["pair"]?.jsonPrimitive?.content ?: currentPair
-        val dir = first["dir"]?.jsonPrimitive?.content ?: "up"
-        val amount = first["amount"]?.jsonPrimitive?.doubleOrNull ?: 10.0
-        val openPrice = first["open_rate"]?.jsonPrimitive?.doubleOrNull
-            ?: first["curs"]?.jsonPrimitive?.doubleOrNull
-            ?: latestStreamPrice
-        val winperc = first["winperc"]?.jsonPrimitive?.intOrNull
-        if (winperc != null && winperc in 10..99) {
-            _assetPayoutPercent.value = winperc
-        }
-        appendWireLog("✅ ORDER ACCEPTED #$id ($pair ${dir.uppercase()} $$amount)")
-        _orderAcceptedFlow.emit(
-            OrderAcceptedEvent(
-                brokerTradeId = id,
-                pair = pair,
-                direction = dir.uppercase(),
-                amount = amount,
-                openPrice = openPrice,
-                timestampMs = System.currentTimeMillis()
+            val id = dealObj["id"]?.jsonPrimitive?.longOrNull
+                ?: dealObj["deal_id"]?.jsonPrimitive?.longOrNull
+                ?: 0L
+            val pair = dealObj["pair"]?.jsonPrimitive?.content ?: currentPair
+            val dir = dealObj["dir"]?.jsonPrimitive?.content ?: "up"
+            val amount = dealObj["amount"]?.jsonPrimitive?.doubleOrNull ?: 10.0
+            val openPrice = dealObj["open_rate"]?.jsonPrimitive?.doubleOrNull
+                ?: dealObj["curs"]?.jsonPrimitive?.doubleOrNull
+                ?: latestStreamPrice
+            val winperc = dealObj["winperc"]?.jsonPrimitive?.intOrNull
+            if (winperc != null && winperc in 10..99) {
+                _assetPayoutPercent.value = winperc
+            }
+            appendWireLog("✅ ORDER ACCEPTED #$id ($pair ${dir.uppercase()} $$amount)")
+            _orderAcceptedFlow.emit(
+                OrderAcceptedEvent(
+                    brokerTradeId = id,
+                    pair = pair,
+                    direction = dir.uppercase(),
+                    amount = amount,
+                    openPrice = openPrice,
+                    timestampMs = System.currentTimeMillis()
+                )
             )
-        )
+        }
     }
 
-    private suspend fun handleOrderClosedEvent(dataElement: JsonElement?) {
+    internal suspend fun handleOrderClosedEvent(dataElement: JsonElement?) {
         clearPendingOrderLock()
         val arr = dataElement as? JsonArray ?: return
         for (el in arr) {

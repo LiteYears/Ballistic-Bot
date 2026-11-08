@@ -124,10 +124,18 @@ interface OlympQuantDao {
     @Query("SELECT * FROM trade_journal ORDER BY timestampMs DESC")
     fun observeTradeJournal(): Flow<List<TradeJournalEntity>>
 
+    @Query("SELECT * FROM trade_journal ORDER BY timestampMs DESC")
+    suspend fun getAllTradesSnapshot(): List<TradeJournalEntity>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertTrade(trade: TradeJournalEntity): Long
 
-    @Query("SELECT * FROM trade_journal WHERE brokerTradeId = :brokerTradeId OR (outcome = 'PENDING' AND pair = :pair) ORDER BY timestampMs DESC LIMIT 1")
+    @Query(
+        "SELECT * FROM trade_journal " +
+            "WHERE (:brokerTradeId > 0 AND brokerTradeId = :brokerTradeId) " +
+            "OR (outcome = 'PENDING' AND pair = :pair) " +
+            "ORDER BY CASE WHEN (:brokerTradeId > 0 AND brokerTradeId = :brokerTradeId) THEN 0 ELSE 1 END, timestampMs DESC LIMIT 1"
+    )
     suspend fun findPendingTrade(brokerTradeId: Long, pair: String): TradeJournalEntity?
 
     @Update
@@ -179,7 +187,8 @@ data class SessionPreferences(
     val lastSessionMode: String = "SYNTHETIC_FEED",
     val dailyPnlResetAtMs: Long = 0L,
     val selectedTimeframeSec: Int = 5,
-    val autoPauseOnHvAvoid: Boolean = true
+    val autoPauseOnHvAvoid: Boolean = false,
+    val hourlySniperMode: Boolean = false
 ) {
     companion object {
         const val DEFAULT_WS_URI =
@@ -209,6 +218,7 @@ class OlympQuantRepository(
         val DAILY_PNL_RESET_AT_MS = longPreferencesKey("daily_pnl_reset_at_ms")
         val SELECTED_TIMEFRAME_SEC = intPreferencesKey("selected_timeframe_sec")
         val AUTO_PAUSE_ON_HV_AVOID = booleanPreferencesKey("auto_pause_on_hv_avoid")
+        val HOURLY_SNIPER_MODE = booleanPreferencesKey("hourly_sniper_mode")
     }
 
     val sessionFlow: Flow<SessionPreferences> = context.dataStore.data.map { prefs ->
@@ -236,7 +246,8 @@ class OlympQuantRepository(
             lastSessionMode = prefs[Keys.LAST_SESSION_MODE] ?: "SYNTHETIC_FEED",
             dailyPnlResetAtMs = prefs[Keys.DAILY_PNL_RESET_AT_MS] ?: 0L,
             selectedTimeframeSec = TradeTimeframe.fromSeconds(rawTf).seconds,
-            autoPauseOnHvAvoid = prefs[Keys.AUTO_PAUSE_ON_HV_AVOID] ?: true
+            autoPauseOnHvAvoid = prefs[Keys.AUTO_PAUSE_ON_HV_AVOID] ?: false,
+            hourlySniperMode = prefs[Keys.HOURLY_SNIPER_MODE] ?: false
         )
     }
 
@@ -245,22 +256,15 @@ class OlympQuantRepository(
             listOf(
                 HardLockedMandate.fromScript(
                     id = 1L,
-                    scriptCode = com.olympquant.terminal.engine.DefaultStrategyScripts.HIGH_VOLTAGE_OQS_SCRIPT,
+                    scriptCode = com.olympquant.terminal.engine.DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT,
                     isPreset = true,
                     isEnabled = true
-                ),
-                HardLockedMandate.fromScript(
-                    id = 2L,
-                    scriptCode = com.olympquant.terminal.engine.DefaultStrategyScripts.X13_TEMPORAL_OQS_SCRIPT,
-                    isPreset = true,
-                    isEnabled = false
-                ),
-                HardLockedMandate.lockedStrategyConfig().copy(id = 3L, isEnabled = false)
+                )
             )
         } else {
             entities.map { entity ->
                 val script = entity.filtersJson.takeIf { it.contains("[META]") }
-                    ?: com.olympquant.terminal.engine.DefaultStrategyScripts.HIGH_VOLTAGE_OQS_SCRIPT
+                    ?: com.olympquant.terminal.engine.DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT
                 HardLockedMandate.fromScript(
                     id = entity.id,
                     scriptCode = script,
@@ -276,44 +280,29 @@ class OlympQuantRepository(
     suspend fun ensureSeeded() {
         runCatching {
             val existing = dao.getAllStrategies()
-            val validOqs = existing.filter { it.filtersJson.contains("[META]") }
-            if (validOqs.isEmpty()) {
+            val hasOnlySniperM = existing.size == 1 &&
+                existing.first().name.equals(
+                    com.olympquant.terminal.engine.DefaultStrategyScripts.SNIPER_M_STRATEGY_NAME,
+                    ignoreCase = true
+                ) &&
+                existing.first().filtersJson.contains("version = \"8.0\"")
+
+            if (!hasOnlySniperM) {
+                val activeDuration = existing.firstOrNull { it.isEnabled }?.durationSeconds ?: 5
                 dao.clearAllStrategies()
-                val hvConfig = HardLockedMandate.fromScript(
+                val sniperConfig = HardLockedMandate.fromScript(
                     id = 1L,
-                    scriptCode = com.olympquant.terminal.engine.DefaultStrategyScripts.HIGH_VOLTAGE_OQS_SCRIPT,
+                    scriptCode = com.olympquant.terminal.engine.DefaultStrategyScripts.withDurationSec(
+                        com.olympquant.terminal.engine.DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT,
+                        activeDuration
+                    ),
                     isPreset = true,
                     isEnabled = true
                 )
-                val x13Config = HardLockedMandate.fromScript(
-                    id = 2L,
-                    scriptCode = com.olympquant.terminal.engine.DefaultStrategyScripts.X13_TEMPORAL_OQS_SCRIPT,
-                    isPreset = true,
-                    isEnabled = false
-                )
-                val legacyDefault = HardLockedMandate.lockedStrategyConfig().copy(id = 3L, isEnabled = false)
-                dao.insertStrategy(hvConfig.toEntity(id = 1L, isEnabled = true))
-                dao.insertStrategy(x13Config.toEntity(id = 2L, isEnabled = false))
-                dao.insertStrategy(legacyDefault.toEntity(id = 3L, isEnabled = false))
-            } else {
-                val hasHighVoltage = validOqs.any {
-                    it.name.equals(
-                        com.olympquant.terminal.engine.DefaultStrategyScripts.HIGH_VOLTAGE_STRATEGY_NAME,
-                        ignoreCase = true
-                    )
-                }
-                if (!hasHighVoltage) {
-                    val hvConfig = HardLockedMandate.fromScript(
-                        id = 0L,
-                        scriptCode = com.olympquant.terminal.engine.DefaultStrategyScripts.HIGH_VOLTAGE_OQS_SCRIPT,
-                        isPreset = true,
-                        isEnabled = true
-                    )
-                    val newId = dao.insertStrategy(hvConfig.toEntity(id = 0L, isEnabled = true))
-                    dao.setExclusiveLoadedStrategy(newId)
-                } else if (validOqs.none { it.isEnabled }) {
-                    dao.setExclusiveLoadedStrategy(validOqs.first().id)
-                }
+                dao.insertStrategy(sniperConfig.toEntity(id = 1L, isEnabled = true))
+                dao.setExclusiveLoadedStrategy(1L)
+            } else if (!existing.first().isEnabled) {
+                dao.setExclusiveLoadedStrategy(existing.first().id)
             }
         }
     }
@@ -369,7 +358,7 @@ class OlympQuantRepository(
         val all = dao.getAllStrategies()
         val active = all.firstOrNull { it.isEnabled } ?: all.firstOrNull() ?: return
         val updatedScript = com.olympquant.terminal.engine.DefaultStrategyScripts.withDurationSec(
-            scriptCode = active.filtersJson.ifBlank { com.olympquant.terminal.engine.DefaultStrategyScripts.HIGH_VOLTAGE_OQS_SCRIPT },
+            scriptCode = active.filtersJson.ifBlank { com.olympquant.terminal.engine.DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT },
             durationSec = validSec
         )
         val updatedConfig = HardLockedMandate.fromScript(
@@ -384,6 +373,12 @@ class OlympQuantRepository(
     suspend fun updateAutoPauseOnHvAvoid(enabled: Boolean) {
         context.dataStore.edit { prefs ->
             prefs[Keys.AUTO_PAUSE_ON_HV_AVOID] = enabled
+        }
+    }
+
+    suspend fun updateHourlySniperMode(enabled: Boolean) {
+        context.dataStore.edit { prefs ->
+            prefs[Keys.HOURLY_SNIPER_MODE] = enabled
         }
     }
 
@@ -412,20 +407,13 @@ class OlympQuantRepository(
 
     suspend fun resetToDefaultStrategy(): StrategyConfig {
         dao.clearAllStrategies()
-        val hvDefault = HardLockedMandate.highVoltageStrategyConfig(durationSec = 5)
-        val id = dao.insertStrategy(hvDefault.toEntity(id = 1L, isEnabled = true))
-        val x13Config = HardLockedMandate.fromScript(
-            id = 2L,
-            scriptCode = com.olympquant.terminal.engine.DefaultStrategyScripts.X13_TEMPORAL_OQS_SCRIPT,
-            isPreset = true,
-            isEnabled = false
-        )
-        dao.insertStrategy(x13Config.toEntity(id = 2L, isEnabled = false))
+        val sniperDefault = HardLockedMandate.highVoltageStrategyConfig(durationSec = 5)
+        val id = dao.insertStrategy(sniperDefault.toEntity(id = 1L, isEnabled = true))
         dao.setExclusiveLoadedStrategy(id)
         context.dataStore.edit { prefs ->
             prefs[Keys.SELECTED_TIMEFRAME_SEC] = 5
         }
-        return hvDefault.copy(id = id, isEnabled = true)
+        return sniperDefault.copy(id = id, isEnabled = true)
     }
 
     private fun StrategyConfig.toEntity(id: Long, isEnabled: Boolean): StrategyEntity = StrategyEntity(
@@ -539,6 +527,19 @@ class OlympQuantRepository(
         return dao.insertTrade(trade)
     }
 
+    suspend fun updateAcceptedTrade(pair: String, brokerTradeId: Long, openPrice: Double) {
+        if (brokerTradeId <= 0L) return
+        val pending = dao.findPendingTrade(0L, pair) ?: return
+        if (pending.outcome == "PENDING") {
+            dao.updateTrade(
+                pending.copy(
+                    brokerTradeId = brokerTradeId,
+                    entryPrice = if (openPrice > 0.0 && openPrice.isFinite()) openPrice else pending.entryPrice
+                )
+            )
+        }
+    }
+
     suspend fun settleTrade(brokerTradeId: Long, pair: String, exitPrice: Double, winStatus: String, profitLoss: Double) {
         val pending = dao.findPendingTrade(brokerTradeId, pair) ?: return
         dao.updateTrade(
@@ -549,6 +550,17 @@ class OlympQuantRepository(
                 profitLoss = profitLoss
             )
         )
+    }
+
+    suspend fun settleTradeAndGetJournal(
+        brokerTradeId: Long,
+        pair: String,
+        exitPrice: Double,
+        winStatus: String,
+        profitLoss: Double
+    ): List<TradeJournalEntity> {
+        settleTrade(brokerTradeId, pair, exitPrice, winStatus, profitLoss)
+        return dao.getAllTradesSnapshot()
     }
 
     suspend fun resetDailyPnlTimestamp() {

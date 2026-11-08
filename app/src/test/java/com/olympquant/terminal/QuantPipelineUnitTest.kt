@@ -186,7 +186,7 @@ class QuantPipelineUnitTest {
         )
         assertTrue(defaultCompiled.isValid)
         assertNotNull(defaultCompiled.parsedScript)
-        assertEquals("TickRush5s_FTRL_Default", defaultCompiled.parsedScript!!.name)
+        assertEquals("Sniper M", defaultCompiled.parsedScript!!.name)
         assertEquals(5, defaultCompiled.parsedScript!!.execution.durationSec)
 
         // Verify template generator follows the exact same 6-block structure
@@ -294,7 +294,7 @@ class QuantPipelineUnitTest {
         )
         assertTrue(x13Compiled.isValid)
         assertNotNull(x13Compiled.parsedScript)
-        assertEquals("X13_Temporal_Intelligence_5s", x13Compiled.parsedScript!!.name)
+        assertEquals("Sniper M", x13Compiled.parsedScript!!.name)
 
         val x13Strategy = HardLockedMandate.fromScript(
             id = 1L,
@@ -487,10 +487,10 @@ class QuantPipelineUnitTest {
 
         for (tf in timeframes) {
             val hvConfig = HardLockedMandate.highVoltageStrategyConfig(durationSec = tf.seconds)
-            assertEquals("HighVoltage5s_HVWindow", hvConfig.name)
+            assertEquals("Sniper M", hvConfig.name)
             assertEquals(tf.seconds, hvConfig.durationSeconds)
             val compiled = StrategyScriptCompiler.compile(hvConfig.scriptCode)
-            assertTrue("HighVoltage script for ${tf.label} must compile cleanly: ${compiled.errors}", compiled.isValid)
+            assertTrue("Sniper M script for ${tf.label} must compile cleanly: ${compiled.errors}", compiled.isValid)
             assertEquals(tf.seconds, compiled.parsedScript?.execution?.durationSec)
         }
 
@@ -575,25 +575,25 @@ class QuantPipelineUnitTest {
         assertEquals(SignalDirection.UP, hvEval.finalSignal)
         assertTrue("HighVoltage 30s must be readyToExecute in EXCELLENT HV Window", hvEval.readyToExecute)
 
-        // 3. Verify Filter 5 (S/R Wall Check): Resistance within 0.25 points ahead blocks UP entry
-        val blockedResistance = SRZone(
-            centerPrice = cleanBreakoutTicks.last().price + 0.12, // Only 0.12 pts ahead (< 0.25 pt required)
+        // 3. Verify S/R Filters are removed: Resistance 0.12 points ahead does NOT block Sniper M
+        val nearbyResistance = SRZone(
+            centerPrice = cleanBreakoutTicks.last().price + 0.12,
             lowerBound = cleanBreakoutTicks.last().price + 0.07,
             upperBound = cleanBreakoutTicks.last().price + 0.17,
             touchCount = 4,
             lastTouchTimeSec = baseTimeMs / 1000L,
             isSupport = false
         )
-        val indSrBlocked = indicatorEngine.computeIndicators(
+        val indSrUnblocked = indicatorEngine.computeIndicators(
             ticks = cleanBreakoutTicks.takeLast(120),
             candles = candles,
             swings = emptyList(),
             psychLevels = emptyList(),
             nearestSupport = null,
-            nearestResistance = blockedResistance
+            nearestResistance = nearbyResistance
         )
-        assertFalse("Filter 5 must block UP trade when resistance is 0.12pt ahead (< 0.25pt)", indSrBlocked.highVoltageStatus.srObstaclePassed)
-        assertFalse(indSrBlocked.highVoltageStatus.allSixFiltersPassed)
+        assertTrue("Sniper M has no S/R obstacle filter blocking surges", indSrUnblocked.highVoltageStatus.srObstaclePassed)
+        assertTrue(indSrUnblocked.highVoltageStatus.allSixFiltersPassed)
 
         // 4. Verify HV Window TIGHT_CHOP Trap (< 0.20 points across 15s, 30s, 45s, 60s anchors)
         val chopCandleEngine = CandleEngine()
@@ -647,5 +647,599 @@ class QuantPipelineUnitTest {
         assertTrue("HV Window score must drop < 50% in CRAZY_WHIPSAW, got ${indWhipsaw.hvWindow.score}", indWhipsaw.hvWindow.score < 50.0)
         assertTrue(indWhipsaw.hvWindow.pauseImmediately)
     }
+
+    @Test
+    fun `test FX S_R scale clearance, bearish HMM symmetry, dynamic DSL window functions, and non-mutating symbol snapshot`() {
+        val baseTimeMs = 1700000000000L
+        val candleEngine = CandleEngine()
+        val indicatorEngine = IndicatorEngine()
+        val strategyEngine = ModularStrategyEngine()
+
+        // 1. FX Pair (EURUSD ~ 1.0850) with Resistance 0.0012 ahead (> 0.00025 minClearance, < 0.25 index scale)
+        val fxTicks = mutableListOf<Tick>()
+        var fxCandles = emptyList<Candle>()
+        var fxPrice = 1.08500
+        for (step in 0..260) {
+            val stepMs = baseTimeMs + step * 250L
+            fxPrice += 0.00004 // Steady 0.4-pip per tick climb
+            val tick = Tick(pair = "EURUSD", price = fxPrice, timeMs = stepMs)
+            fxTicks.add(tick)
+            fxCandles = candleEngine.processTick(tick)
+        }
+        val fxResistance = SRZone(
+            centerPrice = fxTicks.last().price + 0.0012, // 12 pips ahead (4.8x above 2.5-pip FX requirement)
+            lowerBound = fxTicks.last().price + 0.0010,
+            upperBound = fxTicks.last().price + 0.0014,
+            touchCount = 3,
+            lastTouchTimeSec = baseTimeMs / 1000L,
+            isSupport = false
+        )
+        val indFx = indicatorEngine.computeIndicators(
+            ticks = fxTicks.takeLast(120),
+            candles = fxCandles,
+            swings = emptyList(),
+            psychLevels = emptyList(),
+            nearestSupport = null,
+            nearestResistance = fxResistance
+        )
+        assertTrue("FX S/R obstacle filter must pass when clearance is 0.0012 >= 0.00025", indFx.highVoltageStatus.srObstaclePassed)
+        val fxTelemetry = MarketTelemetryState(
+            pair = "EURUSD",
+            latestPrice = fxTicks.last().price,
+            latestTimeMs = fxTicks.last().timeMs,
+            tickCount = fxTicks.size,
+            candles = fxCandles.takeLast(80),
+            recentTicks = fxTicks.takeLast(120),
+            zFast = indFx.zFast,
+            zSlow = indFx.zSlow,
+            trend = indFx.trend,
+            persistence = indFx.persistence,
+            consistency = indFx.consistency,
+            volatility = indFx.volatility,
+            velocity = indFx.velocity,
+            slope = indFx.slope,
+            slopeRatio = indFx.slopeRatio,
+            netDelta5 = indFx.netDelta5,
+            relPos = indFx.relPos,
+            hvoiScore = indFx.hvoiScore,
+            microstructure = indFx.microstructure,
+            assetPayoutPercent = 85,
+            assetLocked = false,
+            wsSynchronized = true,
+            hvWindow = indFx.hvWindow,
+            highVoltageStatus = indFx.highVoltageStatus,
+            selectedTimeframeSec = 5
+        )
+        val fxEval = strategyEngine.evaluateStrategy(
+            strategy = HardLockedMandate.highVoltageStrategyConfig(durationSec = 5),
+            telemetry = fxTelemetry,
+            wsLatencyMs = 28L
+        )
+        assertTrue("HighVoltage Gate 5 must pass for FX pair with 0.0012 clearance", fxEval.filterDiagnostics.all { it.passed })
+        assertTrue("FX breakout must be readyToExecute", fxEval.readyToExecute)
+
+        // 2. Bearish HMM Regime Symmetry: steady bearish downtrend should classify as Trending or Expansion
+        val regimeEngine = RegimeDetectionEngine()
+        val bearishTicks = (0 until 80).map { i ->
+            Tick(pair = "LATAM_X", price = 4500.0 - i * 0.35, timeMs = baseTimeMs + i * 200L)
+        }
+        val bearishRegime = regimeEngine.processTicks(bearishTicks)
+        assertNotNull(bearishRegime)
+        assertTrue(
+            "Bearish trend must classify as Trending or Expansion, got ${bearishRegime!!.regimeName}",
+            bearishRegime.regimeName == "Trending" || bearishRegime.regimeName == "Expansion"
+        )
+
+        // 3. Verify non-mutating getLiveSymbolSnapshot and Studio aliases (ofi_imbalance, velocity, sr_min_clearance)
+        val countBefore = strategyEngine.temporalEngine.rollingMean("rush_snr", 4)
+        val snapshotSymbols = strategyEngine.getLiveSymbolSnapshot(
+            telemetry = fxTelemetry.copy(orderFlowImbalance = 44.5),
+            wsLatencyMs = 28L,
+            scriptCode = DefaultStrategyScripts.HIGH_VOLTAGE_OQS_SCRIPT
+        )
+        val countAfter = strategyEngine.temporalEngine.rollingMean("rush_snr", 4)
+        assertEquals("getLiveSymbolSnapshot must not mutate rolling window state", countBefore, countAfter, 1e-9)
+        assertEquals(44.5, snapshotSymbols["ofi_imbalance"] ?: 0.0, 1e-6)
+        assertEquals(0.00025, snapshotSymbols["sr_min_clearance"] ?: 0.0, 1e-7)
+        assertTrue((snapshotSymbols["velocity"] ?: 0.0) > 0.0)
+    }
+
+    @Test
+    fun `test Bidirectional Autopilot Guard, Single Trade Lock, Chrono Sniper 1_Hr Mode, and Foreground KeepAlive`() {
+        // 1. Foreground service keep-alive during Autopilot Standby (AVOID) and Chrono Sniper 1/Hr
+        val idleSnap = com.olympquant.terminal.service.ForegroundExecutionSnapshot(
+            botRunning = false,
+            autopilotArmed = false,
+            autopilotStandby = false,
+            hourlySniperMode = false,
+            singleTradeLocked = false
+        )
+        assertFalse(idleSnap.shouldKeepServiceAlive)
+
+        val avoidStandbySnap = idleSnap.copy(autopilotArmed = true, autopilotStandby = true)
+        assertTrue("Foreground service must stay alive during AVOID standby to auto-start on MODERATE/GOOD", avoidStandbySnap.shouldKeepServiceAlive)
+
+        val sniperSnap = idleSnap.copy(hourlySniperMode = true, hourlyTradesThisHour = 1, nextHourlyResetMinutes = 42)
+        assertTrue("Foreground service must stay alive in 24/7 Chrono Sniper 1/Hr mode", sniperSnap.shouldKeepServiceAlive)
+
+        val singleTradeSnap = idleSnap.copy(singleTradeLocked = true)
+        assertTrue("Foreground service must stay alive while 1 active trade is in-flight", singleTradeSnap.shouldKeepServiceAlive)
+
+        // 2. Verify HV Window transitions from AVOID (<50%) to MODERATE (50-74%) and EXCELLENT (>=75%)
+        val baseTimeMs = 1700000000000L
+        val candleEngine = CandleEngine()
+        val indicatorEngine = IndicatorEngine()
+
+        // Step A: Feed tight chop -> AVOID (<50%)
+        val chopTicks = mutableListOf<Tick>()
+        var candles = emptyList<Candle>()
+        for (step in 0..250) {
+            val tick = Tick(
+                pair = "LATAM_X",
+                price = 4500.0 + if (step % 2 == 0) 0.015 else -0.015,
+                timeMs = baseTimeMs + step * 250L
+            )
+            chopTicks.add(tick)
+            candles = candleEngine.processTick(tick)
+        }
+        val avoidInd = indicatorEngine.computeIndicators(chopTicks.takeLast(120), candles)
+        assertEquals(com.olympquant.terminal.domain.HvWindowState.AVOID, avoidInd.hvWindow.state)
+        assertTrue(avoidInd.hvWindow.pauseImmediately)
+
+        // Step B: Feed clean directional breakout -> recovers to MODERATE and then EXCELLENT
+        var recoveredModerateOrGood = false
+        var price = 4500.0
+        val lastChopMs = chopTicks.last().timeMs
+        for (step in 1..260) {
+            price += 0.05
+            val tick = Tick(pair = "LATAM_X", price = price, timeMs = lastChopMs + step * 250L)
+            chopTicks.add(tick)
+            candles = candleEngine.processTick(tick)
+            if (step % 20 == 0) {
+                val ind = indicatorEngine.computeIndicators(chopTicks.takeLast(120), candles)
+                if (!ind.hvWindow.pauseImmediately &&
+                    (ind.hvWindow.state == com.olympquant.terminal.domain.HvWindowState.MODERATE ||
+                        ind.hvWindow.state == com.olympquant.terminal.domain.HvWindowState.EXCELLENT) &&
+                    ind.hvWindow.score >= 50.0
+                ) {
+                    recoveredModerateOrGood = true
+                }
+            }
+        }
+        assertTrue("HV Window must recover from AVOID to MODERATE/EXCELLENT for Autopilot Auto-Start", recoveredModerateOrGood)
+    }
+
+    @Test
+    fun `test Audited Mathematical Guards block context traps low consistency climax exhaustion and settle shadow learning at selected timeframe`() {
+        val baseTimeMs = 1700000000000L
+        val candleEngine = CandleEngine()
+        val indicatorEngine = IndicatorEngine()
+        val strategyEngine = ModularStrategyEngine()
+        val hvStrategy = HardLockedMandate.highVoltageStrategyConfig(durationSec = 15)
+
+        // 1. Build clean breakout baseline
+        val cleanTicks = mutableListOf<Tick>()
+        var candles = emptyList<Candle>()
+        var price = 4500.0
+        for (step in 0..260) {
+            price += 0.045
+            val tick = Tick(pair = "LATAM_X", price = price, timeMs = baseTimeMs + step * 250L)
+            cleanTicks.add(tick)
+            candles = candleEngine.processTick(tick)
+        }
+        val indClean = indicatorEngine.computeIndicators(cleanTicks.takeLast(120), candles)
+        val baseTelemetry = MarketTelemetryState(
+            pair = "LATAM_X",
+            latestPrice = cleanTicks.last().price,
+            latestTimeMs = cleanTicks.last().timeMs,
+            tickCount = cleanTicks.size,
+            candles = candles.takeLast(80),
+            recentTicks = cleanTicks.takeLast(120),
+            zFast = indClean.zFast,
+            zSlow = indClean.zSlow,
+            trend = indClean.trend,
+            persistence = indClean.persistence,
+            consistency = indClean.consistency,
+            volatility = indClean.volatility,
+            velocity = indClean.velocity,
+            slope = indClean.slope,
+            slopeRatio = indClean.slopeRatio,
+            netDelta5 = indClean.netDelta5,
+            relPos = indClean.relPos,
+            hvoiScore = indClean.hvoiScore,
+            microstructure = indClean.microstructure,
+            assetPayoutPercent = 85,
+            assetLocked = false,
+            wsSynchronized = true,
+            hvWindow = indClean.hvWindow,
+            highVoltageStatus = indClean.highVoltageStatus,
+            selectedTimeframeSec = 15
+        )
+
+        // Verify clean setup is readyToExecute when contextBlockReasons is empty
+        val cleanEval = strategyEngine.evaluateStrategy(hvStrategy, baseTelemetry, wsLatencyMs = 30L)
+        assertTrue("Clean breakout with zero context blocks must be readyToExecute", cleanEval.readyToExecute)
+
+        // 2. Verify ContextEnhancer structural block (e.g. Bearish Rejection Wick or Counter Order-Flow) strictly blocks execution!
+        val contextBlockedEval = strategyEngine.evaluateStrategy(
+            strategy = hvStrategy,
+            telemetry = baseTelemetry.copy(
+                contextBlockReasons = listOf("Bearish Rejection Wick (68%)")
+            ),
+            wsLatencyMs = 30L
+        )
+        assertFalse("Non-empty contextBlockReasons must strictly block readyToExecute", contextBlockedEval.readyToExecute)
+        assertEquals(SignalDirection.NONE, contextBlockedEval.finalSignal)
+        assertTrue(
+            "filterDiagnostics must include Context & Structural Guard when blocked",
+            contextBlockedEval.filterDiagnostics.any { it.gateTitle == "Context & Structural Guard" && !it.passed }
+        )
+
+        // 3. Verify reversed smoothed tick direction (zFast < zSlow while ticks move UP) is rejected by Sniper M
+        val unalignedSmoothEval = strategyEngine.evaluateStrategy(
+            strategy = hvStrategy,
+            telemetry = baseTelemetry.copy(
+                zFast = 4498.0,
+                zSlow = 4505.0
+            ),
+            wsLatencyMs = 30L
+        )
+        assertFalse("Momentum opposing smoothed tick direction must not execute", unalignedSmoothEval.readyToExecute)
+
+        // 4. Verify Timeframe-Aware Shadow Learning: 15s timeframe settles after 15,000ms (not 5,000ms)
+        val freshEngine = ModularStrategyEngine()
+        val noiseTicks = (0 until 14).map { i ->
+            val offset = if (i % 2 == 0) 0.15 else -0.15
+            Tick(pair = "LATAM_X", price = 4500.0 + offset, timeMs = baseTimeMs + i * 240L)
+        }
+        val lastNoiseTs = noiseTicks.last().timeMs
+        val lastNoiseP = noiseTicks.last().price
+        val rushTicks = noiseTicks + listOf(0.42, 0.88, 1.38, 1.92).mapIndexed { idx, cum ->
+            Tick(pair = "LATAM_X", price = lastNoiseP + cum, timeMs = lastNoiseTs + (idx + 1) * 140L)
+        }
+        // Enqueue shadow rush with 15s timeframe
+        freshEngine.extractRawTickRushMetrics(
+            MarketTelemetryState(
+                pair = "LATAM_X",
+                latestPrice = rushTicks.last().price,
+                latestTimeMs = rushTicks.last().timeMs,
+                tickCount = rushTicks.size,
+                recentTicks = rushTicks,
+                selectedTimeframeSec = 15
+            )
+        )
+        // At +6,000ms (< 15,000ms), 15s shadow rush must NOT have settled yet
+        val tickAt6s = Tick(pair = "LATAM_X", price = rushTicks.last().price + 0.8, timeMs = rushTicks.last().timeMs + 6_000L)
+        val metricsAt6s = freshEngine.extractRawTickRushMetrics(
+            MarketTelemetryState(
+                pair = "LATAM_X",
+                latestPrice = tickAt6s.price,
+                latestTimeMs = tickAt6s.timeMs,
+                tickCount = rushTicks.size + 1,
+                recentTicks = rushTicks + tickAt6s,
+                selectedTimeframeSec = 15
+            )
+        )
+        assertEquals("15s shadow trade must not settle at 6s", 0, metricsAt6s.shadowSamplesLearned)
+
+        // At +15,500ms (>= 15,000ms), 15s shadow rush settles and updates FTRL weights
+        val tickAt15s = Tick(pair = "LATAM_X", price = rushTicks.last().price + 1.4, timeMs = rushTicks.last().timeMs + 15_500L)
+        val metricsAt15s = freshEngine.extractRawTickRushMetrics(
+            MarketTelemetryState(
+                pair = "LATAM_X",
+                latestPrice = tickAt15s.price,
+                latestTimeMs = tickAt15s.timeMs,
+                tickCount = rushTicks.size + 2,
+                recentTicks = rushTicks + tickAt6s + tickAt15s,
+                selectedTimeframeSec = 15
+            )
+        )
+        assertTrue("15s shadow trade must settle after 15,000ms", metricsAt15s.shadowSamplesLearned >= 1)
+    }
+
+    @Test
+    fun `test Sniper M analyzes tick stream smooths trajectory follows momentum and rides UP and DOWN surges with zero filter blocks`() {
+        val strategyEngine = ModularStrategyEngine()
+        val sniperStrategy = HardLockedMandate.lockedStrategyConfig()
+        assertEquals("Sniper M", sniperStrategy.name)
+
+        val contextEnhancer = com.olympquant.terminal.engine.ContextEnhancer()
+        val candleEngine = CandleEngine()
+        val indicatorEngine = IndicatorEngine()
+        val baseTimeMs = 1700000000000L
+
+        // 1. UPWARD TICK STREAM SURGE:
+        //    - 20 baseline ticks oscillating mildly around 4500.0
+        //    - Followed by a smooth, accelerating 6-tick upward surge (+0.35, +0.75, +1.20, +1.70, +2.25, +2.85)
+        val baseUpTicks = (0 until 20).map { i ->
+            val noise = if (i % 2 == 0) 0.08 else -0.08
+            Tick(pair = "LATAM_X", price = 4500.0 + noise, timeMs = baseTimeMs + i * 220L)
+        }
+        val upLastTs = baseUpTicks.last().timeMs
+        val upLastPrice = baseUpTicks.last().price
+        val upSurgeDeltas = listOf(0.35, 0.75, 1.20, 1.70, 2.25, 2.85)
+        val upTicks = baseUpTicks + upSurgeDeltas.mapIndexed { idx, cum ->
+            Tick(pair = "LATAM_X", price = upLastPrice + cum, timeMs = upLastTs + (idx + 1) * 140L)
+        }
+        var upCandles = emptyList<Candle>()
+        upTicks.forEach { upCandles = candleEngine.processTick(it) }
+        val indUp = indicatorEngine.computeIndicators(upTicks, upCandles)
+
+        // Even with a tight resistance zone right above price, ContextEnhancer must produce 0 blocks
+        val tightResistance = SRZone(
+            centerPrice = upTicks.last().price + 0.05,
+            lowerBound = upTicks.last().price + 0.01,
+            upperBound = upTicks.last().price + 0.10,
+            touchCount = 5,
+            lastTouchTimeSec = baseTimeMs / 1000L,
+            isSupport = false
+        )
+        val (upBlocks, upScore) = contextEnhancer.evaluateContext(
+            price = upTicks.last().price,
+            indicators = indUp,
+            candles = upCandles,
+            swings = emptyList(),
+            nearestSupport = null,
+            nearestResistance = tightResistance,
+            corridorWidth = 1.0
+        )
+        assertTrue("ContextEnhancer must have zero strategy filter blocks: $upBlocks", upBlocks.isEmpty())
+
+        val upEval = strategyEngine.evaluateStrategy(
+            strategy = sniperStrategy,
+            telemetry = MarketTelemetryState(
+                pair = "LATAM_X",
+                latestPrice = upTicks.last().price,
+                latestTimeMs = upTicks.last().timeMs,
+                tickCount = upTicks.size,
+                candles = upCandles,
+                recentTicks = upTicks,
+                zFast = indUp.zFast,
+                zSlow = indUp.zSlow,
+                trend = indUp.trend,
+                persistence = indUp.persistence,
+                consistency = indUp.consistency,
+                volatility = indUp.volatility,
+                velocity = indUp.velocity,
+                netDelta5 = indUp.netDelta5,
+                relPos = indUp.relPos,
+                microstructure = indUp.microstructure,
+                hvWindow = indUp.hvWindow,
+                highVoltageStatus = indUp.highVoltageStatus,
+                baseConfidenceScore = upScore,
+                contextBlockReasons = upBlocks,
+                wsSynchronized = true
+            ),
+            wsLatencyMs = 30L
+        )
+        assertEquals(SignalDirection.UP, upEval.finalSignal)
+        assertTrue("Sniper M must ride upward smoothed tick surge: ${upEval.triggerReason}", upEval.readyToExecute)
+
+        // 2. DOWNWARD TICK STREAM SURGE:
+        //    - 20 baseline ticks oscillating mildly around 4500.0
+        //    - Followed by a smooth, accelerating 6-tick downward surge (-0.35, -0.75, -1.20, -1.70, -2.25, -2.85)
+        val downCandleEngine = CandleEngine()
+        val downIndEngine = IndicatorEngine()
+        val downTicks = baseUpTicks + upSurgeDeltas.mapIndexed { idx, cum ->
+            Tick(pair = "LATAM_X", price = upLastPrice - cum, timeMs = upLastTs + (idx + 1) * 140L)
+        }
+        var downCandles = emptyList<Candle>()
+        downTicks.forEach { downCandles = downCandleEngine.processTick(it) }
+        val indDown = downIndEngine.computeIndicators(downTicks, downCandles)
+
+        val downEval = strategyEngine.evaluateStrategy(
+            strategy = sniperStrategy,
+            telemetry = MarketTelemetryState(
+                pair = "LATAM_X",
+                latestPrice = downTicks.last().price,
+                latestTimeMs = downTicks.last().timeMs,
+                tickCount = downTicks.size,
+                candles = downCandles,
+                recentTicks = downTicks,
+                zFast = indDown.zFast,
+                zSlow = indDown.zSlow,
+                trend = indDown.trend,
+                persistence = indDown.persistence,
+                consistency = indDown.consistency,
+                volatility = indDown.volatility,
+                velocity = indDown.velocity,
+                netDelta5 = indDown.netDelta5,
+                relPos = indDown.relPos,
+                microstructure = indDown.microstructure,
+                hvWindow = indDown.hvWindow,
+                highVoltageStatus = indDown.highVoltageStatus,
+                wsSynchronized = true
+            ),
+            wsLatencyMs = 30L
+        )
+        assertEquals(SignalDirection.DOWN, downEval.finalSignal)
+        assertTrue("Sniper M must ride downward smoothed tick surge: ${downEval.triggerReason}", downEval.readyToExecute)
+    }
+
+    @Test
+    fun `test Logic and System Integrity Audit fixes for hysteresis snapshot isolation zero-mean rolling windows 8-tick warm-up burst guard and multi-deal WS events`() {
+        val baseTimeMs = 1700000000000L
+        val strategyEngine = ModularStrategyEngine()
+
+        // 1. Verify getLiveSymbolSnapshot with hysteresis(...) in [VARIABLES] does NOT mutate hysteresis state
+        val hystScript = """
+            [META]
+            name = "HystAuditTest"
+            version = "1.0"
+            author = "Audit"
+            description = "Tests non-mutating hysteresis evaluation in getLiveSymbolSnapshot"
+            [EXECUTION]
+            duration_sec = 5
+            [VARIABLES]
+            let custom_hyst = hysteresis(rush_snr, 1.50, 1.10)
+            [SIGNAL_UP]
+            rush_dir == UP
+            [SIGNAL_DOWN]
+            rush_dir == DOWN
+            [GATES]
+            gate "HystGate" : custom_hyst == 1
+        """.trimIndent()
+
+        val highSnrTicks = (0 until 10).map { i ->
+            Tick(pair = "LATAM_X", price = 4500.0 + i * 0.45, timeMs = baseTimeMs + i * 180L)
+        }
+        val highSnrTelemetry = MarketTelemetryState(
+            pair = "LATAM_X",
+            latestPrice = highSnrTicks.last().price,
+            latestTimeMs = highSnrTicks.last().timeMs,
+            tickCount = highSnrTicks.size,
+            recentTicks = highSnrTicks,
+            wsSynchronized = true
+        )
+        // Call getLiveSymbolSnapshot (read-only UI/Studio preview) when rush_snr >= 1.50
+        val snapHigh = strategyEngine.getLiveSymbolSnapshot(highSnrTelemetry, wsLatencyMs = 25L, scriptCode = hystScript)
+        assertEquals(1.0, snapHigh["custom_hyst"] ?: 0.0, 1e-6)
+
+        // Now evaluate at rush_snr ~ 1.20 (between exit=1.10 and enter=1.50):
+        // Because getLiveSymbolSnapshot did NOT mutate hysteresis state, the latch must still be false (0.0)!
+        val midActivated = strategyEngine.temporalEngine.evaluateHysteresis(
+            key = "dsl_hyst_rush_snr_1.50_1.10",
+            currentValue = 1.25,
+            enterThreshold = 1.50,
+            exitThreshold = 1.10,
+            mutateState = false
+        )
+        assertFalse("getLiveSymbolSnapshot must not mutate live hysteresis latch state", midActivated)
+
+        // 2. Verify roll_mean / roll_median / ema accurately return 0.0 for populated zero-mean series (e.g. ofi)
+        val zeroMeanEngine = ModularStrategyEngine()
+        val symTicksA = (0 until 10).map { i ->
+            Tick(pair = "LATAM_X", price = 4500.0 + (if (i % 2 == 0) 0.10 else -0.10), timeMs = baseTimeMs + i * 200L)
+        }
+        // Push two frames with +25.0 and -25.0 OFI so the 2-tick rolling mean is exactly 0.0
+        val rushA = zeroMeanEngine.extractRawTickRushMetrics(highSnrTelemetry, mutateState = true)
+        zeroMeanEngine.temporalEngine.pushObservationFrame(
+            highSnrTelemetry.copy(orderFlowImbalance = 25.0),
+            rushA,
+            wsLatencyMs = 20L,
+            mutateState = true
+        )
+        zeroMeanEngine.temporalEngine.pushObservationFrame(
+            highSnrTelemetry.copy(orderFlowImbalance = -25.0),
+            rushA,
+            wsLatencyMs = 20L,
+            mutateState = true
+        )
+        assertTrue(zeroMeanEngine.temporalEngine.hasSeries("ofi"))
+        assertEquals(0.0, zeroMeanEngine.temporalEngine.rollingMean("ofi", 2), 1e-9)
+
+        val compiledRollMean = StrategyScriptCompiler.compile(
+            """
+            [META]
+            name = "ZeroMeanRollTest"
+            version = "1.0"
+            author = "Audit"
+            description = "Tests zero-mean rolling series"
+            [EXECUTION]
+            duration_sec = 5
+            [VARIABLES]
+            let ofi_mean_2 = roll_mean(ofi, 2)
+            [SIGNAL_UP]
+            rush_dir == UP
+            [SIGNAL_DOWN]
+            rush_dir == DOWN
+            [GATES]
+            gate "G1" : rush_snr >= 0.0
+            """.trimIndent()
+        ).parsedScript!!
+        val symbolsWithNonZeroCurrentOfi = mutableMapOf("ofi" to -25.0, "rush_dir" to 1.0, "rush_snr" to 1.4, "UP" to 1.0, "DOWN" to -1.0)
+        val evalZeroMean = StrategyScriptCompiler.evaluateVariablesAndSignals(
+            compiledRollMean,
+            symbolsWithNonZeroCurrentOfi,
+            zeroMeanEngine.temporalEngine
+        )
+        // Must be 0.0 (the true 2-observation rolling mean of +25 and -25), NOT fallback to raw ofi (-25.0)!
+        assertEquals(0.0, evalZeroMean.evaluatedSymbols["ofi_mean_2"] ?: -999.0, 1e-6)
+
+        // 3. Verify IndicatorEngine & Sniper M work seamlessly on 10-tick streams (6 <= len < 15)
+        val indEngine = IndicatorEngine()
+        val candleEngine = CandleEngine()
+        val tenTicks = listOf(
+            4500.00, 4500.08, 4499.95, 4500.05, 4499.98,
+            4500.32, 4500.68, 4501.08, 4501.52, 4502.00
+        ).mapIndexed { idx, p ->
+            Tick(pair = "LATAM_X", price = p, timeMs = baseTimeMs + idx * 140L)
+        }
+        var tenCandles = emptyList<Candle>()
+        tenTicks.forEach { tenCandles = candleEngine.processTick(it) }
+        val ind10 = indEngine.computeIndicators(tenTicks, tenCandles)
+        assertEquals(SignalDirection.UP, ind10.trend)
+        assertTrue("10-tick stream must produce zFast > zSlow on upward surge", ind10.zFast > ind10.zSlow)
+
+        val eval10 = ModularStrategyEngine().evaluateStrategy(
+            strategy = HardLockedMandate.lockedStrategyConfig(),
+            telemetry = MarketTelemetryState(
+                pair = "LATAM_X",
+                latestPrice = tenTicks.last().price,
+                latestTimeMs = tenTicks.last().timeMs,
+                tickCount = tenTicks.size,
+                candles = tenCandles,
+                recentTicks = tenTicks,
+                zFast = ind10.zFast,
+                zSlow = ind10.zSlow,
+                trend = ind10.trend,
+                consistency = ind10.consistency,
+                volatility = ind10.volatility,
+                velocity = ind10.velocity,
+                netDelta5 = ind10.netDelta5,
+                microstructure = ind10.microstructure,
+                hvWindow = ind10.hvWindow,
+                highVoltageStatus = ind10.highVoltageStatus,
+                wsSynchronized = true
+            ),
+            wsLatencyMs = 25L
+        )
+        assertEquals(SignalDirection.UP, eval10.finalSignal)
+        assertTrue("10-tick upward surge must be readyToExecute in Sniper M", eval10.readyToExecute)
+
+        // 4. Verify multi-deal Event 21/22 array in OlympTradeWsClient emits all deals without dropping index > 0
+        kotlinx.coroutines.runBlocking {
+            val ws = OlympTradeWsClient()
+            val multiDealJson = kotlinx.serialization.json.Json.parseToJsonElement(
+                """
+                [
+                  {"id": 9001, "pair": "LATAM_X", "dir": "up", "amount": 15.0, "open_rate": 4501.25, "status": "open", "winperc": 85},
+                  {"id": 9002, "pair": "EURUSD", "dir": "down", "amount": 20.0, "open_rate": 1.0845, "close_rate": 1.0830, "status": "win", "winperc": 82}
+                ]
+                """.trimIndent()
+            )
+            ws.handleOrderAcceptedOrUpdatedEvent(21, multiDealJson)
+            val wireLogs = ws.rawWireLog.value.joinToString("\n")
+            assertTrue("First deal #9001 must be logged as accepted", wireLogs.contains("ORDER ACCEPTED #9001"))
+            assertTrue("Second deal #9002 in same Event 21 array must be settled", wireLogs.contains("ORDER SETTLED #9002: WIN"))
+        }
+
+        // 5. Verify Sniper M v8.0 rejects collapsing/dying surge tails (tick_convexity < 0.55)
+        val dyingSurgePrices = listOf(
+            4500.00, 4500.06, 4499.96, 4500.04, 4499.98, 4500.05,
+            4500.85, 4501.65, // Big early steps (+0.80, +0.80)
+            4501.79, 4501.91  // Dying tail steps (+0.14, +0.12 -> convexity = 0.26 / 1.60 = 0.16 < 0.55)
+        )
+        val dyingTicks = dyingSurgePrices.mapIndexed { idx, p ->
+            Tick(pair = "LATAM_X", price = p, timeMs = baseTimeMs + idx * 140L)
+        }
+        val dyingEval = ModularStrategyEngine().evaluateStrategy(
+            strategy = HardLockedMandate.lockedStrategyConfig(),
+            telemetry = MarketTelemetryState(
+                pair = "LATAM_X",
+                latestPrice = dyingTicks.last().price,
+                latestTimeMs = dyingTicks.last().timeMs,
+                tickCount = dyingTicks.size,
+                recentTicks = dyingTicks,
+                wsSynchronized = true
+            ),
+            wsLatencyMs = 25L
+        )
+        assertFalse("Collapsing/dying surge tail (tick_convexity < 0.55) must not execute", dyingEval.readyToExecute)
+    }
 }
+
+
+
+
 

@@ -33,7 +33,8 @@ class ModularStrategyEngine {
         val features: DoubleArray,
         val regime: TemporalRegimeType = TemporalRegimeType.EXPANSION_IMPULSE,
         val predictedProb: Double = 0.65,
-        val wasSpikeNoise: Boolean = false
+        val wasSpikeNoise: Boolean = false,
+        val horizonMs: Long = 5000L
     )
 
     internal data class RawTickRushMetrics(
@@ -112,8 +113,9 @@ class ModularStrategyEngine {
         for (i in 0 until FEATURE_DIM) {
             ftrlN[i] = 1.0
             val denom = ((FTRL_BETA + sqrt(ftrlN[i])) / FTRL_ALPHA) + FTRL_L2
-            ftrlZ[i] = -PRIOR_WEIGHTS[i] * denom
-            ftrlW[i] = PRIOR_WEIGHTS[i]
+            val prior = PRIOR_WEIGHTS[i]
+            ftrlZ[i] = -(prior * denom + sign(prior) * FTRL_L1)
+            ftrlW[i] = prior
         }
     }
 
@@ -137,8 +139,8 @@ class ModularStrategyEngine {
         wsLatencyMs: Long,
         scriptCode: String = DefaultStrategyScripts.DEFAULT_OQS_SCRIPT
     ): Map<String, Double> {
-        val rush = extractRawTickRushMetrics(telemetry)
-        val temporalSnapshot = temporalEngine.pushObservationFrame(telemetry, rush, wsLatencyMs)
+        val rush = extractRawTickRushMetrics(telemetry, mutateState = false)
+        val temporalSnapshot = temporalEngine.pushObservationFrame(telemetry, rush, wsLatencyMs, mutateState = false)
         val enrichedTelemetry = telemetry.copy(temporalTelemetry = temporalSnapshot)
         val symbols = StrategyScriptCompiler.buildLiveSymbolTable(enrichedTelemetry, rush, wsLatencyMs, temporalEngine)
         val compiled = getOrCompileScript(scriptCode)
@@ -147,7 +149,7 @@ class ModularStrategyEngine {
             for (i in parsed.variables.indices) {
                 val v = parsed.variables[i]
                 val evaluated = if (v.compiledExpr != null) {
-                    v.compiledExpr.eval(symbols).finiteOr(0.0)
+                    v.compiledExpr.eval(symbols, temporalEngine, mutateState = false).finiteOr(0.0)
                 } else {
                     runCatching {
                         StrategyScriptCompiler.evaluateMathExpression(v.rawExpression, symbols)
@@ -212,51 +214,71 @@ class ModularStrategyEngine {
         val effectiveMinConfidence = parsedScript.execution.minConfidence.coerceIn(1.0, 99.0)
 
         val payoutAndLockPassed = !telemetry.assetLocked && telemetry.assetPayoutPercent >= minOf(minPayoutPercent, effectiveMinPayout)
-        val allFiltersPassed = diagnostics.all { it.passed } &&
+        val contextPassed = telemetry.contextBlockReasons.isEmpty()
+        val finalDiagnostics = if (!contextPassed) {
+            diagnostics + FilterDiagnostic(
+                filterType = FilterType.ANTI_SPIKE_DOMINANCE_GATE,
+                passed = false,
+                actualValueFormatted = "${telemetry.contextBlockReasons.size} Block(s)",
+                thresholdFormatted = "0 Blocks",
+                reason = telemetry.contextBlockReasons.joinToString(" • "),
+                gateTitle = "Context & Structural Guard"
+            )
+        } else {
+            diagnostics
+        }
+        val allFiltersPassed = finalDiagnostics.all { it.passed } &&
             payoutAndLockPassed &&
+            contextPassed &&
             telemetry.hardStopReason == null
 
-        val isHighVoltage = parsedScript.name.contains("HighVoltage", ignoreCase = true) ||
-            strategy.name.contains("HighVoltage", ignoreCase = true)
-
-        // Use HV Window score when running HighVoltage strategy, or the higher of raw FTRL and X13 Calibrated Win Prob
-        val baseConfidence = max(
-            rush.ftrlWinProbPercent.finiteOr(0.0),
-            if (rawSignal != SignalDirection.NONE) temporalSnapshot.calibratedWinProbPercent.finiteOr(0.0) else 0.0
-        ).coerceIn(0.0, 100.0)
-        val effectiveConfidence = if (isHighVoltage && telemetry.hvWindow.engineBooted) {
-            max(telemetry.hvWindow.score.finiteOr(0.0), if (allFiltersPassed && rawSignal != SignalDirection.NONE) baseConfidence else 0.0)
-                .coerceIn(0.0, 100.0)
+        // Pure Sniper M surge confidence calculation (incorporates SNR, purity, convexity acceleration, and arrival compression)
+        val convexityBoost = ((rush.tickConvexity - 0.85).coerceIn(-0.3, 0.8)) * 8.0
+        val compressionBoost = ((1.05 - rush.arrivalCompressionRatio).coerceIn(-0.2, 0.5)) * 6.0
+        val surgeConfidenceBoost = if (rawSignal != SignalDirection.NONE && allFiltersPassed) {
+            (66.0 +
+                min(18.0, (rush.rushSnr - 1.0).coerceAtLeast(0.0) * 12.0) +
+                min(10.0, (rush.purityPercent - 60.0).coerceAtLeast(0.0) * 0.25) +
+                convexityBoost +
+                compressionBoost)
+                .finiteOr(74.0)
         } else {
-            baseConfidence
+            0.0
         }
+        val rawBaseConfidence = max(
+            max(
+                rush.ftrlWinProbPercent.finiteOr(0.0),
+                if (rawSignal != SignalDirection.NONE) temporalSnapshot.calibratedWinProbPercent.finiteOr(0.0) else 0.0
+            ),
+            surgeConfidenceBoost
+        ).coerceIn(0.0, 100.0)
+
+        val contextPenalty = telemetry.contextBlockReasons.size * 25.0
+        val effectiveConfidence = (rawBaseConfidence - contextPenalty).finiteOr(0.0).coerceIn(0.0, 100.0)
         val confidencePassed = effectiveConfidence >= effectiveMinConfidence
-        val enoughTicks = telemetry.tickCount >= 10 || telemetry.recentTicks.size >= 8
+        val enoughTicks = telemetry.tickCount >= 8 || telemetry.recentTicks.size >= 8
         val readyToExecute = enoughTicks &&
             temporalSnapshot.snapshotSynchronized &&
             rawSignal != SignalDirection.NONE &&
             allFiltersPassed &&
             confidencePassed
 
-        val hvWin = telemetry.hvWindow
-        val hvStat = telemetry.highVoltageStatus
-        val triggerReason = if (isHighVoltage) {
-            if (rawSignal != SignalDirection.NONE && allFiltersPassed) {
-                "${parsedScript.name} [${rawSignal.name} ${parsedScript.execution.durationSec}s]: HV=${"%.0f".format(hvWin.score)}% (${hvWin.state.label}) • Vel=${"%.2f".format(hvStat.tickVelocity)}T/s • RelPos=${"%.0f".format(hvStat.relPos50)}% • Δ5=${"%+.5f".format(hvStat.netDelta5)}"
-            } else {
-                "${parsedScript.name} [${parsedScript.execution.durationSec}s] • HV Window ${"%.0f".format(hvWin.score)}% (${hvWin.state.label}) • Filters ${hvStat.passedFilterCount}/6 • Trap: ${hvWin.activeTrap.label}"
-            }
-        } else if (rawSignal != SignalDirection.NONE) {
-            "${parsedScript.name} [${rawSignal.name}]: Calib P(Win)=${"%.1f".format(effectiveConfidence)}% • SNR ${"%.2f".format(rush.rushSnr)}x • Purity ${"%.0f".format(rush.purityPercent)}% • ${temporalSnapshot.regimeType.displayName}"
-        } else {
-            "${parsedScript.name} X13 Scanner (L2=${"%.0f".format(temporalSnapshot.signalLayerScore)}% • Calib=${"%.0f".format(temporalSnapshot.calibratedWinProbPercent)}% • Stability=${"%.0f".format(temporalSnapshot.gateStabilityPercent)}% • EV=${"%+.1f".format(temporalSnapshot.oosExpectancyPercent)}%)"
+        val smoothedDirLabel = when {
+            telemetry.zFast > telemetry.zSlow -> "UP"
+            telemetry.zFast < telemetry.zSlow -> "DOWN"
+            else -> telemetry.highVoltageStatus.zlemaTrend.name
         }
 
-        val regimeNote = if (isHighVoltage) {
-            "HV Window [${hvWin.state.label} ${"%.1f".format(hvWin.score)}% | Hold ${"%.0f".format(hvWin.stabilitySeconds)}s] • 60s Range ${"%.4f".format(hvWin.anchorRange60s)} • Wicks ${"%.0f".format(hvWin.wickCollapseRatioPercent)}% • MTF ${hvWin.mtfAlignedCount}/4"
+        val triggerReason = if (!contextPassed && rawSignal != SignalDirection.NONE) {
+            "BLOCKED [${rawSignal.name}]: ${telemetry.contextBlockReasons.first()}"
+        } else if (rawSignal != SignalDirection.NONE && allFiltersPassed) {
+            "Sniper M [SURGE ${rawSignal.name} ${parsedScript.execution.durationSec}s]: Smooth=$smoothedDirLabel • Surge=${"%.2f".format(rush.rushSnr)}x • Convex=${"%.2f".format(rush.tickConvexity)}x • Speed=${"%.2f".format(rush.tickSpeedTps)}T/s • Purity=${"%.0f".format(rush.purityPercent)}%"
         } else {
-            "X13 Temporal [${temporalSnapshot.regimeType.displayName}] • L1:${if (temporalSnapshot.eligibilityLayerPassed) "OK" else "HOLD"} • L2:${"%.0f".format(temporalSnapshot.signalLayerScore)}% • L3:${"%.0f".format(temporalSnapshot.validationLayerScore)}% • Stability ${"%.1f".format(temporalSnapshot.gateStabilityPercent)}% • OOS EV ${"%+.1f".format(temporalSnapshot.oosExpectancyPercent)}%"
+            "Sniper M [${parsedScript.execution.durationSec}s] • Smooth Dir: $smoothedDirLabel • Momentum: ${rush.rushDirection.name} (${"%.0f".format(rush.purityPercent)}%) • Surge: ${"%.2f".format(rush.rushSnr)}x @ ${"%.2f".format(rush.tickSpeedTps)}T/s"
         }
+
+        val regimeNote =
+            "Sniper M Tick Engine • 1. Smooth EMA ($smoothedDirLabel) • 2. Momentum Purity ${"%.0f".format(rush.purityPercent)}% • 3. Surge ${"%.2f".format(rush.rushSnr)}x (Convex ${"%.2f".format(rush.tickConvexity)}x @ ${"%.2f".format(rush.tickSpeedTps)} T/s)"
 
         return StrategyEvaluation(
             strategyId = strategy.id,
@@ -266,8 +288,8 @@ class ModularStrategyEngine {
             confidenceScore = effectiveConfidence,
             minConfidenceRequired = effectiveMinConfidence,
             triggerReason = triggerReason,
-            filterDiagnostics = diagnostics,
-            contextBlockReasons = emptyList(),
+            filterDiagnostics = finalDiagnostics,
+            contextBlockReasons = telemetry.contextBlockReasons,
             regimeAdjustmentNote = regimeNote,
             readyToExecute = readyToExecute,
             temporalTelemetry = temporalSnapshot
@@ -275,27 +297,33 @@ class ModularStrategyEngine {
     }
 
     @Synchronized
-    internal fun extractRawTickRushMetrics(telemetry: MarketTelemetryState): RawTickRushMetrics {
+    internal fun extractRawTickRushMetrics(
+        telemetry: MarketTelemetryState,
+        mutateState: Boolean = true
+    ): RawTickRushMetrics {
         val ticks = telemetry.recentTicks
         if (ticks.size >= 6) {
             val lastIdx = ticks.lastIndex
             val latestTick = ticks[lastIdx]
             val latestTimeMs = if (latestTick.timeMs > 0L) latestTick.timeMs else telemetry.latestTimeMs
 
-            // Step A: Resolve any matured 5-second virtual shadow rushes and update FTRL-Proximal weights online!
-            settleMaturedShadowRushes(latestTimeMs, latestTick.price)
+            // Step A: Resolve any matured virtual shadow rushes and update FTRL-Proximal weights online!
+            if (mutateState) {
+                settleMaturedShadowRushes(latestTimeMs, latestTick.price)
+            }
 
             val k = min(4, lastIdx)
 
-            // 1. Baseline single-tick noise step from ticks preceding the active 3-tick tip
+            // 1. Robust Winsorized baseline single-tick noise step from ticks preceding the active 3-tick tip
+            //    Prevents a single prior freak tick jump from inflating the noise baseline and blinding SNR.
             val noiseEndIdx = (lastIdx - 3).coerceAtLeast(1)
             val noiseStartIdx = (noiseEndIdx - 24).coerceAtLeast(1)
-            var noiseSum = 0.0
+            var rawNoiseSum = 0.0
             var noiseCount = 0
             for (i in noiseStartIdx..noiseEndIdx) {
                 val step = abs(ticks[i].price - ticks[i - 1].price)
                 if (step.isFinite() && step > 0.0) {
-                    noiseSum += step
+                    rawNoiseSum += step
                     noiseCount++
                 }
             }
@@ -303,13 +331,28 @@ class ModularStrategyEngine {
                 for (i in 1..lastIdx) {
                     val step = abs(ticks[i].price - ticks[i - 1].price)
                     if (step.isFinite() && step > 0.0) {
-                        noiseSum += step
+                        rawNoiseSum += step
                         noiseCount++
                     }
                 }
             }
-            val avgNoiseStep = if (noiseCount > 0) {
-                (noiseSum / noiseCount.toDouble()).coerceAtLeast(1e-7)
+            val prelimNoiseMean = if (noiseCount > 0) rawNoiseSum / noiseCount.toDouble() else 0.0
+            val winsorCap = (prelimNoiseMean * 2.2).coerceAtLeast(1e-7)
+            var winsorSum = 0.0
+            var winsorCount = 0
+            if (prelimNoiseMean > 0.0) {
+                for (i in noiseStartIdx..noiseEndIdx) {
+                    val step = abs(ticks[i].price - ticks[i - 1].price)
+                    if (step.isFinite() && step > 0.0) {
+                        winsorSum += min(step, winsorCap)
+                        winsorCount++
+                    }
+                }
+            }
+            val avgNoiseStep = if (winsorCount > 0) {
+                (winsorSum / winsorCount.toDouble()).coerceAtLeast(1e-7)
+            } else if (prelimNoiseMean > 0.0) {
+                prelimNoiseMean.coerceAtLeast(1e-7)
             } else {
                 (telemetry.volatility * 0.45).finiteOr(1e-5).coerceAtLeast(1e-7)
             }
@@ -322,6 +365,8 @@ class ModularStrategyEngine {
             var pathLen4 = 0.0
             var maxSingleStep4 = 0.0
             var sameDirStepsIn4 = 0
+            var forwardIn4 = 0.0
+            var counterIn4 = 0.0
             val candidateDir = when {
                 netDelta4 > 1e-9 -> SignalDirection.UP
                 netDelta4 < -1e-9 -> SignalDirection.DOWN
@@ -333,8 +378,21 @@ class ModularStrategyEngine {
                 val absD = abs(d)
                 pathLen4 += absD
                 if (absD > maxSingleStep4) maxSingleStep4 = absD
-                if (candidateDir == SignalDirection.UP && d > 0.0) sameDirStepsIn4++
-                if (candidateDir == SignalDirection.DOWN && d < 0.0) sameDirStepsIn4++
+                if (candidateDir == SignalDirection.UP) {
+                    if (d > 0.0) {
+                        sameDirStepsIn4++
+                        forwardIn4 += absD
+                    } else if (d < 0.0) {
+                        counterIn4 += absD
+                    }
+                } else if (candidateDir == SignalDirection.DOWN) {
+                    if (d < 0.0) {
+                        sameDirStepsIn4++
+                        forwardIn4 += absD
+                    } else if (d > 0.0) {
+                        counterIn4 += absD
+                    }
+                }
             }
 
             val purityPercent = if (pathLen4 > 1e-9) {
@@ -343,15 +401,18 @@ class ModularStrategyEngine {
                 0.0
             }
 
-            // 3. Feature 1: RushSNR_4
+            // 3. Feature 1: RushSNR_4 (blended 4-tick and 3-tick surge SNR)
             val snr4 = abs(netDelta4) / (avgNoiseStep * sqrt(k.toDouble()))
             val snr3 = abs(netDelta3) / (avgNoiseStep * sqrt(k3.toDouble()))
             val rushSnr = maxOf(snr4, snr3 * 0.96).finiteOr(0.0)
 
             // 4. Feature 2: TickConvexity ((|d_t| + |d_{t-1}|) / (|d_{t-2}| + |d_{t-3}|))
-            val d0 = abs(ticks[lastIdx].price - ticks[lastIdx - 1].price)
-            val d1 = if (lastIdx >= 2) abs(ticks[lastIdx - 1].price - ticks[lastIdx - 2].price) else d0
-            val d2 = if (lastIdx >= 3) abs(ticks[lastIdx - 2].price - ticks[lastIdx - 3].price) else avgNoiseStep
+            val signedD0 = ticks[lastIdx].price - ticks[lastIdx - 1].price
+            val signedD1 = if (lastIdx >= 2) ticks[lastIdx - 1].price - ticks[lastIdx - 2].price else signedD0
+            val signedD2 = if (lastIdx >= 3) ticks[lastIdx - 2].price - ticks[lastIdx - 3].price else signedD1
+            val d0 = abs(signedD0)
+            val d1 = abs(signedD1)
+            val d2 = if (lastIdx >= 3) abs(signedD2) else avgNoiseStep
             val d3 = if (lastIdx >= 4) abs(ticks[lastIdx - 3].price - ticks[lastIdx - 4].price) else avgNoiseStep
             val earlySteps = (d2 + d3).coerceAtLeast(avgNoiseStep * 0.6)
             val tickConvexity = ((d0 + d1) / earlySteps).finiteOr(1.0).coerceIn(0.2, 4.0)
@@ -404,10 +465,14 @@ class ModularStrategyEngine {
             val std15 = sqrt(varSum15 / zCount15.toDouble()).coerceAtLeast(avgNoiseStep)
             val localZScore15 = (abs(latestTick.price - mean15) / std15).finiteOr(1.5).coerceIn(0.0, 5.0)
 
-            // Consecutive directional streak & zero-hesitation tip alignment
-            val lastStep = ticks[lastIdx].price - ticks[lastIdx - 1].price
-            val prevStep = if (lastIdx >= 2) ticks[lastIdx - 1].price - ticks[lastIdx - 2].price else lastStep
+            // Consecutive directional streak, 3-tick smoothed velocity, & anti-whipsaw tip alignment
+            val lastStep = signedD0
+            val prevStep = signedD1
             val lastStepRatio = (abs(lastStep) / avgNoiseStep).finiteOr(0.0)
+            val smoothedTipDelta = (0.50 * signedD0 + 0.32 * signedD1 + 0.18 * signedD2).finiteOr(0.0)
+            val smoothedTipAligned = (candidateDir == SignalDirection.UP && smoothedTipDelta >= avgNoiseStep * 0.65) ||
+                (candidateDir == SignalDirection.DOWN && smoothedTipDelta <= -avgNoiseStep * 0.65)
+            val noInternalWhipsaw = counterIn4 <= forwardIn4 * 0.35
 
             var consecutiveStreak = 0
             if (candidateDir != SignalDirection.NONE) {
@@ -429,11 +494,13 @@ class ModularStrategyEngine {
                 (candidateDir == SignalDirection.DOWN && prevStep <= 0.0)
 
             val tipAligned = latestStepAligned &&
+                smoothedTipAligned &&
+                noInternalWhipsaw &&
                 lastStepRatio >= 0.70 &&
                 (prevStepAligned || sameDirStepsIn4 >= 3)
 
-            // Tick arrival speed over the 4-tick rush window
-            val dtMs = (ticks[lastIdx].timeMs - ticks[lastIdx - k].timeMs).coerceAtLeast(1L)
+            // Tick arrival speed over the 4-tick rush window (guard against 0ms burst timestamps)
+            val dtMs = (ticks[lastIdx].timeMs - ticks[lastIdx - k].timeMs).coerceAtLeast(k * 40L)
             val windowTps = (k * 1000.0) / dtMs.toDouble()
             val tickSpeedTps = maxOf(windowTps.coerceAtMost(25.0), telemetry.velocity.finiteOr(0.0))
 
@@ -476,8 +543,9 @@ class ModularStrategyEngine {
                 (predictFtrlWinProbability(featureVector) * 55.0).coerceAtMost(48.0)
             }
 
-            // Enqueue virtual shadow rush if a candidate burst is underway so the model learns online every 5s
+            // Enqueue virtual shadow rush at the active timeframe horizon so the model learns online
             if (
+                mutateState &&
                 candidateDir != SignalDirection.NONE &&
                 rushSnr >= 1.22 &&
                 purityPercent >= 62.0 &&
@@ -487,6 +555,7 @@ class ModularStrategyEngine {
                 if (pendingShadowRushes.size >= 48) {
                     pendingShadowRushes.removeFirst()
                 }
+                val horizonMs = (telemetry.selectedTimeframeSec.coerceIn(5, 60)) * 1000L
                 pendingShadowRushes.addLast(
                     PendingShadowRush(
                         entryTimeMs = latestTimeMs,
@@ -495,7 +564,8 @@ class ModularStrategyEngine {
                         features = featureVector,
                         regime = if (rushSnr >= 1.45) TemporalRegimeType.EXPANSION_IMPULSE else TemporalRegimeType.TREND,
                         predictedProb = (ftrlWinProbPercent / 100.0).coerceIn(0.1, 0.95),
-                        wasSpikeNoise = singleTickDominancePercent > 64.0
+                        wasSpikeNoise = singleTickDominancePercent > 64.0,
+                        horizonMs = horizonMs
                     )
                 )
             }
@@ -600,9 +670,15 @@ class ModularStrategyEngine {
     }
 
     private fun settleMaturedShadowRushes(currentTimeMs: Long, currentPrice: Double) {
+        if (pendingShadowRushes.isNotEmpty() && currentTimeMs < pendingShadowRushes.first().entryTimeMs) {
+            // Stream clock rewound (e.g., replay or simulation reset)
+            pendingShadowRushes.clear()
+            lastShadowEnqueueTimeMs = 0L
+            return
+        }
         while (pendingShadowRushes.isNotEmpty()) {
             val oldest = pendingShadowRushes.first()
-            if (currentTimeMs - oldest.entryTimeMs < 5000L) break
+            if (currentTimeMs - oldest.entryTimeMs < oldest.horizonMs) break
             pendingShadowRushes.removeFirst()
 
             val isContinuationWin = (oldest.direction == SignalDirection.UP && currentPrice > oldest.entryPrice) ||
@@ -645,12 +721,13 @@ class ModularStrategyEngine {
     internal fun updateFtrlWeightsOnline(x: DoubleArray, labelY: Double) {
         val p = predictFtrlWinProbability(x)
         val err = (p - labelY).finiteOr(0.0)
+        val sqrtGamma = sqrt(FORGETTING_GAMMA)
         for (i in 0 until FEATURE_DIM) {
             val grad = (err * x[i]).finiteOr(0.0)
             val nOld = max(1e-6, ftrlN[i] * FORGETTING_GAMMA)
             val nNew = nOld + grad * grad
             val sigma = (sqrt(nNew) - sqrt(nOld)) / FTRL_ALPHA
-            ftrlZ[i] = (ftrlZ[i] * FORGETTING_GAMMA) + grad - sigma * ftrlW[i]
+            ftrlZ[i] = (ftrlZ[i] * sqrtGamma) + grad - sigma * ftrlW[i]
             ftrlN[i] = nNew
         }
     }

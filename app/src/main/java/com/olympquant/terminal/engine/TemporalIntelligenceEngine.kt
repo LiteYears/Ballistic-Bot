@@ -143,7 +143,8 @@ class TemporalIntelligenceEngine {
     internal fun pushObservationFrame(
         telemetry: MarketTelemetryState,
         rush: ModularStrategyEngine.RawTickRushMetrics,
-        wsLatencyMs: Long
+        wsLatencyMs: Long,
+        mutateState: Boolean = true
     ): TemporalTelemetrySnapshot {
         val ticks = telemetry.recentTicks
         val latestTickMs = ticks.lastOrNull()?.timeMs ?: telemetry.latestTimeMs
@@ -159,79 +160,95 @@ class TemporalIntelligenceEngine {
             tickAgeMs <= MAX_STALE_TICK_AGE_MS &&
             wsLatencyMs <= 450L
 
-        // Push instantaneous metrics into zero-allocation rolling ring buffers
         val dirSign = when (rush.rushDirection) {
             SignalDirection.UP -> 1.0
             SignalDirection.DOWN -> -1.0
             SignalDirection.NONE -> 0.0
         }
-        recordSeries("rush_dir", dirSign)
-        recordSeries("rush_snr", rush.rushSnr.finiteOr(0.0))
-        recordSeries("tick_purity", rush.purityPercent.finiteOr(0.0))
-        recordSeries("tick_speed", rush.tickSpeedTps.finiteOr(0.0))
-        recordSeries("single_tick_dominance", rush.singleTickDominancePercent.finiteOr(0.0))
-        recordSeries("tick_convexity", rush.tickConvexity.finiteOr(1.0))
-        recordSeries("ftrl_win_prob", rush.ftrlWinProbPercent.finiteOr(50.0))
-        recordSeries("ofi", telemetry.orderFlowImbalance.finiteOr(0.0))
-        recordSeries("micro_impulse_score", telemetry.microstructure.microImpulseScore.finiteOr(0.0))
-        recordSeries("micro_efficiency", telemetry.microstructure.directionalEfficiency.finiteOr(0.0))
-        recordSeries("volatility", telemetry.volatility.finiteOr(0.0))
-        recordSeries("slope_ratio", telemetry.slopeRatio.finiteOr(0.0))
-
-        // Track directional agreement flags for N-of-M persistence (e.g. 3 of last 5 ticks)
-        val upFavorable = if (
-            rush.rushDirection == SignalDirection.UP &&
-            rush.rushSnr >= 1.18 &&
-            rush.purityPercent >= 64.0
-        ) 1.0 else 0.0
-        val downFavorable = if (
-            rush.rushDirection == SignalDirection.DOWN &&
-            rush.rushSnr >= 1.18 &&
-            rush.purityPercent >= 64.0
-        ) 1.0 else 0.0
-        recordSeries("up_favorable", upFavorable)
-        recordSeries("down_favorable", downFavorable)
-
-        // 2. Rolling-Window Intelligence (Median & Mean across recent observations)
-        val rollingSnrMean3 = rollingMean("rush_snr", 3)
-        val rollingPurityMean4 = rollingMean("tick_purity", 4)
-        val rollingOfiMedian5 = rollingMedian("ofi", 5)
-        val rollingImpulseMean4 = rollingMean("micro_impulse_score", 4)
-        val rollingDominanceMean3 = rollingMean("single_tick_dominance", 3)
-
-        // 3. Hysteresis State Evaluation (Enter @ >=threshold, Hold until <exit_threshold)
         val effectiveImpulseMetric = max(
             telemetry.microstructure.microImpulseScore.finiteOr(0.0),
             (rush.rushSnr * 36.0 + rush.purityPercent * 0.32).coerceIn(0.0, 100.0)
         )
-        recordSeries("effective_impulse", effectiveImpulseMetric)
 
+        if (mutateState) {
+            // Push instantaneous metrics into zero-allocation rolling ring buffers
+            recordSeries("rush_dir", dirSign)
+            recordSeries("rush_snr", rush.rushSnr.finiteOr(0.0))
+            recordSeries("tick_purity", rush.purityPercent.finiteOr(0.0))
+            recordSeries("tick_speed", rush.tickSpeedTps.finiteOr(0.0))
+            recordSeries("velocity", rush.tickSpeedTps.finiteOr(0.0))
+            recordSeries("single_tick_dominance", rush.singleTickDominancePercent.finiteOr(0.0))
+            recordSeries("tick_convexity", rush.tickConvexity.finiteOr(1.0))
+            recordSeries("ftrl_win_prob", rush.ftrlWinProbPercent.finiteOr(50.0))
+            recordSeries("ofi", telemetry.orderFlowImbalance.finiteOr(0.0))
+            recordSeries("ofi_imbalance", telemetry.orderFlowImbalance.finiteOr(0.0))
+            recordSeries("micro_impulse_score", telemetry.microstructure.microImpulseScore.finiteOr(0.0))
+            recordSeries("micro_efficiency", telemetry.microstructure.directionalEfficiency.finiteOr(0.0))
+            recordSeries("volatility", telemetry.volatility.finiteOr(0.0))
+            recordSeries("slope_ratio", telemetry.slopeRatio.finiteOr(0.0))
+            recordSeries("hv_score", telemetry.hvWindow.score.finiteOr(60.0))
+            recordSeries("rel_pos", telemetry.relPos.finiteOr(50.0))
+            recordSeries("net_delta_5", telemetry.netDelta5.finiteOr(0.0))
+
+            // Track directional agreement flags for N-of-M persistence (e.g. 3 of last 5 ticks)
+            val upFavorable = if (
+                rush.rushDirection == SignalDirection.UP &&
+                rush.rushSnr >= 1.18 &&
+                rush.purityPercent >= 64.0
+            ) 1.0 else 0.0
+            val downFavorable = if (
+                rush.rushDirection == SignalDirection.DOWN &&
+                rush.rushSnr >= 1.18 &&
+                rush.purityPercent >= 64.0
+            ) 1.0 else 0.0
+            recordSeries("up_favorable", upFavorable)
+            recordSeries("down_favorable", downFavorable)
+            recordSeries("effective_impulse", effectiveImpulseMetric)
+        }
+
+        // 2. Rolling-Window Intelligence (Median & Mean across recent observations)
+        val rollingSnrMean3 = rollingMean("rush_snr", 3).let { if (it > 0.0) it else rush.rushSnr.finiteOr(0.0) }
+        val rollingPurityMean4 = rollingMean("tick_purity", 4).let { if (it > 0.0) it else rush.purityPercent.finiteOr(0.0) }
+        val rollingOfiMedian5 = if ((historyCount["ofi"] ?: 0) > 0) rollingMedian("ofi", 5) else telemetry.orderFlowImbalance.finiteOr(0.0)
+        val rollingImpulseMean4 = rollingMean("micro_impulse_score", 4).let {
+            if (it > 0.0) it else telemetry.microstructure.microImpulseScore.finiteOr(0.0)
+        }
+        val rollingDominanceMean3 = rollingMean("single_tick_dominance", 3).let {
+            if (it > 0.0) it else rush.singleTickDominancePercent.finiteOr(35.0)
+        }
+
+        // 3. Hysteresis State Evaluation (Enter @ >=threshold, Hold until <exit_threshold)
         val momentumHysteresisActive = evaluateHysteresis(
             key = "x13_momentum_state",
             currentValue = effectiveImpulseMetric,
             enterThreshold = 65.0,
-            exitThreshold = 50.0
+            exitThreshold = 50.0,
+            mutateState = mutateState
         )
         val purityHysteresisActive = evaluateHysteresis(
             key = "x13_purity_state",
             currentValue = rush.purityPercent,
             enterThreshold = 72.0,
-            exitThreshold = 62.0
+            exitThreshold = 62.0,
+            mutateState = mutateState
         )
         val snrHysteresisActive = evaluateHysteresis(
             key = "x13_snr_state",
             currentValue = rush.rushSnr,
             enterThreshold = 1.32,
-            exitThreshold = 1.12
+            exitThreshold = 1.12,
+            mutateState = mutateState
         )
 
         // 4. Adaptive Regime Engine (Trend, Expansion/Impulse, Consolidation, Transition)
         val detectedRegime = classifyAdaptiveRegime(telemetry, rush, rollingSnrMean3)
-        if (detectedRegime == lastRegimeType) {
-            regimeStableTicks = (regimeStableTicks + 1).coerceAtMost(100)
-        } else {
-            lastRegimeType = detectedRegime
-            regimeStableTicks = 1
+        if (mutateState) {
+            if (detectedRegime == lastRegimeType) {
+                regimeStableTicks = (regimeStableTicks + 1).coerceAtMost(100)
+            } else {
+                lastRegimeType = detectedRegime
+                regimeStableTicks = 1
+            }
         }
         val regimeTransitionStable = detectedRegime != TemporalRegimeType.TRANSITION_UNCERTAIN &&
             regimeStableTicks >= 1
@@ -257,18 +274,20 @@ class TemporalIntelligenceEngine {
         val ofiDivergence = (rush.rushDirection == SignalDirection.UP && rollingOfiMedian5 < -38.0) ||
             (rush.rushDirection == SignalDirection.DOWN && rollingOfiMedian5 > 38.0)
         val noiseClean = !isIsolatedSpikeTrap && !ofiDivergence
-        if (isIsolatedSpikeTrap) {
+        if (mutateState && isIsolatedSpikeTrap) {
             totalNoiseEventsClassified++
         }
 
         // Track impulse onset for signal latency measurement
-        if (rush.rushDirection != SignalDirection.NONE && rush.rushSnr >= 1.25) {
-            if (currentImpulseStartMs == 0L) {
-                currentImpulseStartMs = latestTickMs - interTickDeltaMs
+        if (mutateState) {
+            if (rush.rushDirection != SignalDirection.NONE && rush.rushSnr >= 1.25) {
+                if (currentImpulseStartMs == 0L) {
+                    currentImpulseStartMs = latestTickMs - interTickDeltaMs
+                }
+                lastSignalLatencyMs = (latestTickMs - currentImpulseStartMs).coerceIn(60L, 650L)
+            } else {
+                currentImpulseStartMs = 0L
             }
-            lastSignalLatencyMs = (latestTickMs - currentImpulseStartMs).coerceIn(60L, 650L)
-        } else {
-            currentImpulseStartMs = 0L
         }
 
         // 6. Calibrated Prediction Engine (Directional & Regime-Stratified + Cold-Start Guard)
@@ -437,6 +456,11 @@ class TemporalIntelligenceEngine {
     }
 
     @Synchronized
+    fun hasSeries(seriesName: String): Boolean {
+        return (historyCount[seriesName] ?: 0) > 0
+    }
+
+    @Synchronized
     fun rollingMean(seriesName: String, window: Int): Double {
         val ring = historyRing[seriesName] ?: return 0.0
         val count = historyCount[seriesName] ?: 0
@@ -509,7 +533,8 @@ class TemporalIntelligenceEngine {
         key: String,
         currentValue: Double,
         enterThreshold: Double,
-        exitThreshold: Double
+        exitThreshold: Double,
+        mutateState: Boolean = true
     ): Boolean {
         val prevActive = hysteresisStates[key] ?: false
         val nextActive = if (enterThreshold >= exitThreshold) {
@@ -527,7 +552,9 @@ class TemporalIntelligenceEngine {
                 currentValue <= enterThreshold + 1e-9
             }
         }
-        hysteresisStates[key] = nextActive
+        if (mutateState) {
+            hysteresisStates[key] = nextActive
+        }
         return nextActive
     }
 

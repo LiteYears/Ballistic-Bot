@@ -199,6 +199,12 @@ class LevelEngine {
     }
 
     fun processTick(prevPrice: Double, tick: Tick, avgRange: Double): PsychGridBounceSignal? {
+        // Expire stale psychological grid bounce signals after 30 seconds
+        lastBounceSignal?.let { existing ->
+            if (tick.timeMs > existing.timestampMs && (tick.timeMs - existing.timestampMs) > 30_000L) {
+                lastBounceSignal = null
+            }
+        }
         if (prevPrice <= 0.0) return lastBounceSignal
         val spacing = computeGridSpacing(tick.price, avgRange)
         val tolerance = spacing * 0.16
@@ -234,12 +240,16 @@ class LevelEngine {
 
 /**
  * Consolidated Support & Resistance Memory Zone Engine with Adaptive Corridor Width:
- * max(0.20, 4.0 * AverageCandleRange) scaled to asset price magnitude.
+ * max(scaleFloor, 4.0 * AverageCandleRange) scaled to asset price magnitude.
  */
 class SRMemoryEngine {
     fun computeAdaptiveCorridor(avgCandleRange: Double, price: Double): Double {
         val rawCorridor = 4.0 * avgCandleRange
-        val minFloor = if (price > 100.0) 0.20 else avgCandleRange * 1.5
+        val minFloor = when {
+            price > 100.0 -> 0.20
+            price in 0.01..15.0 -> max(0.00020, avgCandleRange * 1.5)
+            else -> max(0.02, avgCandleRange * 1.5)
+        }
         return max(minFloor, rawCorridor)
     }
 

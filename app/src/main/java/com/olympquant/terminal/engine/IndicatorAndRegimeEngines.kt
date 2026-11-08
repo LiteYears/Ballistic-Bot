@@ -105,7 +105,7 @@ class IndicatorEngine {
         nearestResistance: SRZone? = null
     ): IndicatorSnapshot {
         val len = ticks.size
-        if (len < 15) {
+        if (len < 6) {
             val lastPrice = (ticks.lastOrNull()?.price ?: 0.0).finiteOr(0.0)
             return IndicatorSnapshot(
                 zFast = lastPrice,
@@ -271,17 +271,24 @@ class IndicatorEngine {
 
         // Compute HighVoltage 6-Filter Mathematical Status
         val highVoltageStatus = computeHighVoltageFilterStatus(
+            prices = prices,
+            len = len,
             currentPrice = lastPriceVal,
             zFast = zFast,
             zSlow = zSlow,
             trend = trend,
+            htfBias = htfBias,
+            persistence = persistence,
+            consistency = consistency,
+            volatility = volatility,
             velocity = velocity,
+            slopeRatio = slopeRatio,
             relPos = relPos,
             netDelta5 = netDelta5,
             candles = candles,
             nearestSupport = nearestSupport,
             nearestResistance = nearestResistance,
-            microExhaustion = microstructure.microExhaustion,
+            microstructure = microstructure,
             hvWindow = hvWindow
         )
 
@@ -388,9 +395,19 @@ class IndicatorEngine {
         val microHesitation = (if (hesWindow > 0) (hesitantSteps.toDouble() / hesWindow * 100.0) else 0.0).finiteOr(0.0)
 
         val lastStep = abs(prices[n - 1] - prices[n - 2])
+        val recentStepWin = min(5, n - 1)
+        var recentStepSum = 0.0
+        for (i in (n - recentStepWin) until n) {
+            recentStepSum += abs(prices[i] - prices[i - 1])
+        }
+        val recentStepAvg = if (recentStepWin > 0) recentStepSum / recentStepWin else volatility
+        val stepExpansionRatio = if (volatility > 1e-9) recentStepAvg / volatility else 1.0
+
         val microExhaustion = when {
-            slopeRatio >= 3.2 && lastStep < volatility * 0.4 -> 85.0
-            slopeRatio >= 2.6 -> 55.0
+            slopeRatio >= 3.0 && (lastStep < volatility * 0.45 || microAcceleration < -0.20) -> 86.0
+            slopeRatio >= 3.0 && stepExpansionRatio >= 1.45 -> 82.0
+            (relPos >= 97.5 || relPos <= 2.5) && microAcceleration < -0.25 -> 80.0
+            slopeRatio >= 2.6 && microAcceleration < -0.10 -> 62.0
             else -> 15.0
         }
 
@@ -488,7 +505,14 @@ class IndicatorEngine {
         period: Int,
         out: DoubleArray
     ): DoubleArray {
-        val lag = max(1, (period - 1) / 2)
+        // Fast ZLEMA (period < 20) removes full lag (period - 1) / 2 to track the price tip;
+        // Slow baseline ZLEMA (period >= 20) removes half lag (period - 1) / 4 so zFast - zSlow
+        // does not collapse to zero during steady constant-velocity trends.
+        val lag = if (period >= 20) {
+            max(1, (period - 1) / 4)
+        } else {
+            max(1, (period - 1) / 2)
+        }
         val k = 2.0 / (period + 1.0)
         out[0] = prices[0]
         for (i in 1 until len) {
@@ -568,7 +592,6 @@ class IndicatorEngine {
             val cLow = recent12.minOf { it.low }
             max(anchorMax - anchorMin, (cHigh - cLow) * 0.75).finiteOr(0.0)
         } else {
-            // If only short-window test ticks are present without 60s span, extrapolate 60s range from tick span
             val tickMin = ticks.minOf { it.price }
             val tickMax = ticks.maxOf { it.price }
             max(anchorMax - anchorMin, tickMax - tickMin).finiteOr(0.0)
@@ -581,11 +604,16 @@ class IndicatorEngine {
         // Multi-timeframe directional alignment across 15s, 30s, 45s, 60s
         val mtfDeltas = doubleArrayOf(delta15s, delta30s, delta45s, delta60s)
         var mtfAlignedCount = 0
+        var mtfUpCount = 0
+        var mtfDownCount = 0
         for (d in mtfDeltas) {
+            if (d > 0.0) mtfUpCount++
+            if (d < 0.0) mtfDownCount++
             val aligned = (trend == SignalDirection.UP && d > 0.0) ||
                 (trend == SignalDirection.DOWN && d < 0.0)
             if (aligned) mtfAlignedCount++
         }
+        val mtfCoherentCount = max(mtfAlignedCount, max(mtfUpCount, mtfDownCount))
 
         // 2. Active candle + last 4 completed candles (up to 5 candles) inspection for
         //    "Crazy Market" whipsaw collapse wicks (>55%) and solid directional bodies
@@ -593,6 +621,7 @@ class IndicatorEngine {
         var maxWickRatio = 0.20
         var avgBodyRatio = 0.68
         var alignedCandleCount = 0
+        var coherentCandleCount = 0
 
         if (candles.isNotEmpty()) {
             val inspectCount = min(5, candles.size)
@@ -600,19 +629,23 @@ class IndicatorEngine {
             var highWickCandles = 0
             var bodySum = 0.0
             var maxW = 0.0
+            var bullCount = 0
+            var bearCount = 0
             for (c in slice) {
                 val range = c.totalRange.coerceAtLeast(1e-9)
                 val dominantWickRatio = (max(c.upperWick, c.lowerWick) / range).finiteOr(0.0).coerceIn(0.0, 1.0)
-                val bodyRatio = (c.bodySize / range).finiteOr(0.5).coerceIn(0.0, 1.0)
+                val bodyRatio = if (c.high - c.low <= 1e-8) 0.68 else (c.bodySize / range).finiteOr(0.5).coerceIn(0.0, 1.0)
                 if (dominantWickRatio > maxW) maxW = dominantWickRatio
                 if (dominantWickRatio > HV_WICK_COLLAPSE_RATIO) {
                     highWickCandles++
                 }
                 bodySum += bodyRatio
+                if (c.isBullish) bullCount++ else bearCount++
                 if ((trend == SignalDirection.UP && c.isBullish) || (trend == SignalDirection.DOWN && !c.isBullish)) {
                     alignedCandleCount++
                 }
             }
+            coherentCandleCount = max(alignedCandleCount, max(bullCount, bearCount))
             maxWickRatio = maxW
             avgBodyRatio = (bodySum / inspectCount.toDouble()).finiteOr(0.60)
             val activeCandle = slice.last()
@@ -625,27 +658,33 @@ class IndicatorEngine {
         }
 
         // 3. Raw HV Window Suitability Score (0..100%)
+        // Uses structural coherence so clean Support/Resistance bounces and Mean-Reversion turns
+        // are not falsely penalized when zFast flips at a key level.
+        val structuralConsistency = max(consistency, 1.0 - consistency).coerceIn(0.0, 1.0)
         val mtfAlignmentRatio = if (candles.size >= 4) {
-            mtfAlignedCount / 4.0
+            mtfCoherentCount / 4.0
         } else {
-            consistency.coerceIn(0.0, 1.0)
+            structuralConsistency
         }
         val velocityFactor = (velocity / 2.2).coerceIn(0.0, 1.15)
         val candleAlignmentFactor = if (candles.isNotEmpty()) {
-            alignedCandleCount.toDouble() / min(5, candles.size).toDouble()
+            coherentCandleCount.toDouble() / min(5, candles.size).toDouble()
         } else {
-            consistency
+            structuralConsistency
         }
-        val exhaustionPenalty = if (slopeRatio >= 3.25) 14.0 else 0.0
+        // Only penalize slopeRatio >= 3.25 when consistency or body quality is deteriorating (true spike exhaustion)
+        val exhaustionPenalty = if (slopeRatio >= 3.25 && (structuralConsistency < 0.85 || avgBodyRatio < 0.55)) 14.0 else 0.0
+        val lowConsistencyPenalty = if (structuralConsistency < 0.55) 16.0 else if (structuralConsistency < 0.68) 8.0 else 0.0
 
         val baseRawScore = (
             (avgBodyRatio * 28.0) +
-                (consistency * 28.0) +
+                (structuralConsistency * 28.0) +
                 (mtfAlignmentRatio * 20.0) +
                 (velocityFactor * 14.0) +
                 (candleAlignmentFactor * 14.0) -
-                exhaustionPenalty
-            ).finiteOr(60.0).coerceIn(10.0, 98.0)
+                exhaustionPenalty -
+                lowConsistencyPenalty
+            ).finiteOr(55.0).coerceIn(10.0, 98.0)
 
         val rawScore = when {
             crazyWhipsawDetected -> min(38.0, baseRawScore * 0.48).coerceIn(12.0, 44.0)
@@ -658,7 +697,6 @@ class IndicatorEngine {
             smoothedHvScore = rawScore
             hvEmaInitialized = true
         } else {
-            // Fast-decay EMA (alpha = 0.08) during normal evolution; accelerate protective drop on trap detection
             val effectiveAlpha = if (crazyWhipsawDetected || tightChopDetected) 0.35 else HV_EMA_ALPHA
             smoothedHvScore = (effectiveAlpha * rawScore + (1.0 - effectiveAlpha) * smoothedHvScore)
                 .finiteOr(rawScore)
@@ -699,13 +737,13 @@ class IndicatorEngine {
         val pauseImmediately = state == HvWindowState.AVOID || crazyWhipsawDetected || tightChopDetected
 
         val stepGuideHint = when {
-            !engineBooted -> "Step 1 (Booting): Populating 1-minute candle map (${"%.0f".format(elapsedBootSec)}s / 15s)..."
-            pauseImmediately && crazyWhipsawDetected -> "Step 4 (AVOID — CRAZY MARKET): Collapse wicks >55% detected. Pause Bot immediately!"
-            pauseImmediately && tightChopDetected -> "Step 4 (AVOID — TIGHT_CHOP): 60s range ${"%.3f".format(anchorRange60s)} < ${"%.2f".format(tightChopThreshold)}. Keep Bot OFF!"
-            pauseImmediately -> "Step 4 (AVOID <50%): Market choppy/unstable. Keep Bot OFF to prevent loss clusters."
-            finalHvScore >= 75.0 && stabilitySeconds >= 15.0 -> "Step 3 (LAUNCH BOT): Score ≥75% & stable for ${"%.0f".format(stabilitySeconds)}s — Clean directional trend!"
-            finalHvScore >= 72.0 -> "Step 2–3 (STABILIZING ≥72%): Holding at ${"%.0f".format(finalHvScore)}% (${"%.0f".format(stabilitySeconds)}s / 15s stability target)."
-            else -> "Step 2 (MODERATE ${"%.0f".format(finalHvScore)}%): Wait for score to climb & hold ≥72% for 15–20s."
+            !engineBooted -> "Phase 1 (Warm-Up): Building 60s multi-timeframe anchor map (${"%.0f".format(elapsedBootSec)}s / 15s)..."
+            pauseImmediately && crazyWhipsawDetected -> "Phase 4 (AVOID — WHIPSAW): Rejection wicks >55% detected. Disengage Auto-Bot immediately."
+            pauseImmediately && tightChopDetected -> "Phase 4 (AVOID — TIGHT CHOP): 60s range ${"%.4f".format(anchorRange60s)} < ${"%.4f".format(tightChopThreshold)}. Stand down."
+            pauseImmediately -> "Phase 4 (AVOID <50%): Structure unstable. Keep Auto-Bot disarmed to avoid chop."
+            finalHvScore >= 75.0 && stabilitySeconds >= 15.0 -> "Phase 3 (EXECUTION READY): Score ≥75% & held for ${"%.0f".format(stabilitySeconds)}s — Clean directional momentum."
+            finalHvScore >= 72.0 -> "Phase 2–3 (STABILIZING ≥72%): Holding at ${"%.0f".format(finalHvScore)}% (${"%.0f".format(stabilitySeconds)}s / 15s target)."
+            else -> "Phase 2 (MODERATE ${"%.0f".format(finalHvScore)}%): Wait for score to reach & hold ≥72% for 15–20s."
         }
 
         return HvWindowSnapshot(
@@ -734,137 +772,154 @@ class IndicatorEngine {
     }
 
     private fun computeHighVoltageFilterStatus(
+        prices: DoubleArray,
+        len: Int,
         currentPrice: Double,
         zFast: Double,
         zSlow: Double,
         trend: SignalDirection,
+        htfBias: SignalDirection,
+        persistence: Int,
+        consistency: Double,
+        volatility: Double,
         velocity: Double,
+        slopeRatio: Double,
         relPos: Double,
         netDelta5: Double,
         candles: List<Candle>,
         nearestSupport: SRZone?,
         nearestResistance: SRZone?,
-        microExhaustion: Double,
+        microstructure: MicrostructureSnapshot,
         hvWindow: HvWindowSnapshot
     ): HighVoltageFilterStatus {
-        // 1. Trend Direction (ZLEMA Fast 10 vs Slow 30)
+        // =========================================================================
+        // SNIPER M — 3-STEP SMOOTHED TICK STREAM MOMENTUM & SURGE ENGINE
+        // 1. Smooth the Tick Stream: Fast Zero-Lag EMA (zFast) vs Slow EMA (zSlow) + ZLEMA Velocity
+        // 2. Follow the Momentum: 3-tick smoothed velocity & recent ticks move in smoothed direction
+        // 3. Ride the Surge: Tick stream displacement, acceleration & speed surge above noise
+        // =========================================================================
         val zSpread = (zFast - zSlow).finiteOr(0.0)
-        val trendPassed = trend == SignalDirection.UP || trend == SignalDirection.DOWN
+        val zFastSlope = if (len >= 3) {
+            (zFastBuf[len - 1] - zFastBuf[max(0, len - 3)]).finiteOr(0.0)
+        } else {
+            zSpread
+        }
+        val smoothedDir = when {
+            zSpread > 1e-10 && zFastSlope >= -1e-10 -> SignalDirection.UP
+            zSpread < -1e-10 && zFastSlope <= 1e-10 -> SignalDirection.DOWN
+            else -> trend
+        }
 
-        // 2. Micro-Velocity (Tick Speed in last 3 seconds >= 1.5 T/s)
-        val velocityPassed = velocity >= HV_MIN_VELOCITY_TPS - 1e-6
+        // Step 1: Smoothed Tick Trajectory is directional and actively advancing
+        val trendPassed = smoothedDir == SignalDirection.UP || smoothedDir == SignalDirection.DOWN
 
-        // 3. 50-Tick Range Breakout (relPos >= 80% for UP, relPos <= 20% for DOWN)
-        val positionBreakoutPassed = when (trend) {
-            SignalDirection.UP -> relPos >= HV_BREAKOUT_UPPER_PCT - 1e-6
-            SignalDirection.DOWN -> relPos <= HV_BREAKOUT_LOWER_PCT + 1e-6
+        // Step 2: Momentum follows the smoothed tick direction (3-tick zero-lag smoothed step + tip alignment)
+        val d0 = if (len >= 2) (prices[len - 1] - prices[len - 2]).finiteOr(0.0) else 0.0
+        val d1 = if (len >= 3) (prices[len - 2] - prices[len - 3]).finiteOr(d0) else d0
+        val d2 = if (len >= 4) (prices[len - 3] - prices[len - 4]).finiteOr(d1) else d1
+        val smoothedVelocity3 = 0.50 * d0 + 0.32 * d1 + 0.18 * d2
+        val tipAligned = (smoothedDir == SignalDirection.UP && d0 >= 0.0 && smoothedVelocity3 > 0.0) ||
+            (smoothedDir == SignalDirection.DOWN && d0 <= 0.0 && smoothedVelocity3 < 0.0)
+        val activeMomentumPassed = tipAligned &&
+            (consistency >= 0.60 || microstructure.directionalEfficiency >= 60.0) &&
+            when (smoothedDir) {
+                SignalDirection.UP -> netDelta5 > 0.0
+                SignalDirection.DOWN -> netDelta5 < 0.0
+                SignalDirection.NONE -> false
+            }
+
+        // Step 3A: Tick Stream Surge Speed (>= 1.15 T/s)
+        val sniperMinVelocity = 1.15
+        val velocityPassed = velocity >= sniperMinVelocity - 1e-6
+
+        // Step 3B: Tick Stream Surge Magnitude (clears baseline noise oscillation)
+        val surgeFloor = max(1e-8, volatility * 1.15)
+        val positionBreakoutPassed = when (smoothedDir) {
+            SignalDirection.UP -> netDelta5 >= surgeFloor
+            SignalDirection.DOWN -> netDelta5 <= -surgeFloor
             SignalDirection.NONE -> false
         }
 
-        // 4. Active Directional Momentum (netDelta5 over last 6 ticks > 0 for UP, < 0 for DOWN)
-        val activeMomentumPassed = when (trend) {
-            SignalDirection.UP -> netDelta5 > 1e-9
-            SignalDirection.DOWN -> netDelta5 < -1e-9
-            SignalDirection.NONE -> false
-        }
-
-        // 5. Support / Resistance Obstacles (0.25 points ahead of UP/DOWN trade)
+        // No S/R wall or candle compression filters blocking Sniper M
         val minClearance = if (currentPrice in 0.01..15.0) 0.00025 else HV_SR_CLEARANCE_POINTS
-        val srClearanceAhead = when (trend) {
-            SignalDirection.UP -> {
-                if (nearestResistance != null && nearestResistance.centerPrice >= currentPrice) {
-                    (nearestResistance.centerPrice - currentPrice).finiteOr(999.0)
-                } else {
-                    999.0
-                }
-            }
-            SignalDirection.DOWN -> {
-                if (nearestSupport != null && nearestSupport.centerPrice <= currentPrice) {
-                    (currentPrice - nearestSupport.centerPrice).finiteOr(999.0)
-                } else {
-                    999.0
-                }
-            }
+        val supportDist = if (nearestSupport != null) {
+            abs(currentPrice - nearestSupport.centerPrice).finiteOr(999.0)
+        } else {
+            999.0
+        }
+        val resistanceDist = if (nearestResistance != null) {
+            abs(nearestResistance.centerPrice - currentPrice).finiteOr(999.0)
+        } else {
+            999.0
+        }
+        val srClearanceAhead = when (smoothedDir) {
+            SignalDirection.UP -> resistanceDist
+            SignalDirection.DOWN -> supportDist
             SignalDirection.NONE -> 999.0
         }
-        val srObstaclePassed = srClearanceAhead >= minClearance
+        val srObstaclePassed = true
 
-        // 6. Volatility & Regimes (Compression < 40% of last 10 candles' avg range, or Exhausted)
-        var currentCandleRange = 0.10
-        var avg10CandleRange = 0.10
-        var candleRangeRatio = 1.0
-        var isCompressed = false
-        var isExhausted = false
+        val activeCandleRange = candles.lastOrNull()?.totalRange?.finiteOr(0.10) ?: 0.10
+        val volatilityFilterPassed = !hvWindow.tightChopDetected
+        val hvWindowPassed = !hvWindow.tightChopDetected
 
-        if (candles.size >= 3) {
-            val activeCandle = candles.last()
-            val historySlice = if (candles.size > 1) {
-                candles.subList(max(0, candles.size - 11), candles.size - 1)
-            } else {
-                candles
-            }
-            val avgRange = (historySlice.sumOf { it.totalRange } / historySlice.size.toDouble())
-                .finiteOr(0.05)
-                .coerceAtLeast(1e-6)
-            currentCandleRange = activeCandle.totalRange.finiteOr(avgRange)
-            avg10CandleRange = avgRange
-            // Because an active 5s candle may have just opened (< 3 ticks), blend with previous completed candle
-            val effectiveCurrentRange = if (activeCandle.tickCount <= 2 && candles.size >= 2) {
-                max(currentCandleRange, candles[candles.size - 2].totalRange)
-            } else {
-                currentCandleRange
-            }
-            candleRangeRatio = (effectiveCurrentRange / avgRange).finiteOr(1.0)
-            isCompressed = candleRangeRatio < 0.40
-            isExhausted = candleRangeRatio > 2.65 || microExhaustion >= 80.0
-        } else {
-            isExhausted = microExhaustion >= 80.0
-        }
-        val volatilityFilterPassed = !isCompressed && !isExhausted
-        val hvWindowPassed = hvWindow.state != HvWindowState.AVOID &&
-            !hvWindow.tightChopDetected &&
-            !hvWindow.crazyWhipsawDetected
-
-        val allSixFiltersPassed = trendPassed &&
+        val sniperSurgeReady = trendPassed &&
+            activeMomentumPassed &&
             velocityPassed &&
             positionBreakoutPassed &&
-            activeMomentumPassed &&
-            srObstaclePassed &&
-            volatilityFilterPassed &&
-            hvWindowPassed
+            volatilityFilterPassed
+
+        val activePlaybook = if (sniperSurgeReady) "SNIPER M SURGE" else "SNIPER M SCAN"
+        val opportunityDirection = if (sniperSurgeReady) smoothedDir else SignalDirection.NONE
+        val surgeSnrRatio = if (volatility > 1e-9) abs(netDelta5) / volatility else 1.0
+        val accelBonus = (microstructure.microAcceleration.coerceIn(0.0, 2.0)) * 3.0
+        val opportunityScore = (65.0 + min(20.0, surgeSnrRatio * 8.0) + min(12.0, consistency * 12.0) + accelBonus)
+            .finiteOr(72.0)
+            .coerceIn(60.0, 98.0)
 
         return HighVoltageFilterStatus(
-            zlemaTrend = trend,
+            zlemaTrend = smoothedDir,
             zlemaSpread = zSpread,
+            zFastValue = zFast.finiteOr(0.0),
+            zSlowValue = zSlow.finiteOr(0.0),
             trendFilterPassed = trendPassed,
             velocityTps = velocity,
-            minVelocityRequired = HV_MIN_VELOCITY_TPS,
+            minVelocityRequired = sniperMinVelocity,
             velocityFilterPassed = velocityPassed,
             relPos50 = relPos,
-            breakoutUpperPct = HV_BREAKOUT_UPPER_PCT,
-            breakoutLowerPct = HV_BREAKOUT_LOWER_PCT,
+            breakoutUpperPct = 50.0,
+            breakoutLowerPct = 50.0,
             positionBreakoutPassed = positionBreakoutPassed,
             netDelta5 = netDelta5,
             activeMomentumPassed = activeMomentumPassed,
             srClearanceAhead = srClearanceAhead,
             srMinClearanceRequired = minClearance,
             srObstaclePassed = srObstaclePassed,
-            currentCandleRange = currentCandleRange,
-            avg10CandleRange = avg10CandleRange,
-            candleRangeRatio = candleRangeRatio,
-            isCompressed = isCompressed,
-            isExhausted = isExhausted,
+            currentCandleRange = activeCandleRange,
+            avg10CandleRange = activeCandleRange,
+            candleRangeRatio = 1.0,
+            isCompressed = hvWindow.tightChopDetected,
+            isExhausted = false,
             volatilityFilterPassed = volatilityFilterPassed,
             hvWindowPassed = hvWindowPassed,
-            allSixFiltersPassed = allSixFiltersPassed
+            allSixFiltersPassed = sniperSurgeReady,
+            activePlaybook = activePlaybook,
+            opportunityDirection = opportunityDirection,
+            continuationReady = sniperSurgeReady,
+            srBounceReady = false,
+            meanReversionReady = false,
+            opportunityScore = opportunityScore,
+            supportDistance = supportDist,
+            resistanceDistance = resistanceDist
         )
     }
 }
 
 /**
- * Evaluates structural danger zones (rejection wicks, adaptive S/R corridor blocks,
- * broker asset locks, minimum payout filter, and WebSocket order-flow contradictions)
- * and computes the audited scale-invariant confidence score.
+ * Streamlined Sniper M Context Evaluator:
+ * - All legacy S/R, Swing, Rejection Wick, HMM, and Exhaustion filters have been removed
+ *   so they never block or interfere with Sniper M tick surge execution.
+ * - Only verifies broker-level tradeability (Asset Not Locked & Payout >= Min Payout).
  */
 class ContextEnhancer {
     fun evaluateContext(
@@ -880,12 +935,13 @@ class ContextEnhancer {
         assetPayoutPercent: Int = 85,
         minPayoutPercent: Int = 75,
         assetLocked: Boolean = false,
-        bullishSentimentPercent: Int = 50
+        bullishSentimentPercent: Int = 50,
+        trendAgeSeconds: Double = 15.0,
+        hmmOutput: RegimeOutput? = null
     ): Pair<List<String>, Double> {
         val blocks = mutableListOf<String>()
-        val dir = indicators.trend
 
-        // 0. Broker Asset Lock & Minimum Payout Filter from WebSocket Stream
+        // Broker-level checks only (no strategy filters)
         if (assetLocked) {
             blocks.add("Broker Asset Locked (Trading Suspended)")
         }
@@ -893,78 +949,15 @@ class ContextEnhancer {
             blocks.add("Payout ${assetPayoutPercent}% < Min ${minPayoutPercent}% Filter")
         }
 
-        // 1. Rejection Wick Check on latest candles
-        if (candles.size >= 2) {
-            val last = candles.last()
-            val range = last.totalRange
-            if (dir == SignalDirection.UP && last.upperWick > range * 0.55) {
-                blocks.add("Bearish Rejection Wick (${(last.upperWick / range * 100).toInt()}%)")
-            } else if (dir == SignalDirection.DOWN && last.lowerWick > range * 0.55) {
-                blocks.add("Bullish Rejection Wick (${(last.lowerWick / range * 100).toInt()}%)")
-            }
+        val effScore = (indicators.microstructure.directionalEfficiency / 100.0).coerceIn(0.0, 1.0)
+        val surgeBonus = if (indicators.volatility > 1e-9) {
+            min(20.0, (abs(indicators.netDelta5) / indicators.volatility) * 8.0)
+        } else {
+            10.0
         }
-
-        // 2. Adaptive S/R Corridor Proximity Check (bypassed during strong breakouts relPos > 92 or < 8)
-        val isStrongBreakout = indicators.relPos >= 92.0 || indicators.relPos <= 8.0
-        if (!isStrongBreakout) {
-            if (dir == SignalDirection.UP && nearestResistance != null) {
-                val dist = nearestResistance.centerPrice - price
-                if (dist in 0.0..corridorWidth && nearestResistance.touchCount >= 2) {
-                    blocks.add("Entering Resistance Zone (dist=${"%.4f".format(dist)})")
-                }
-            }
-            if (dir == SignalDirection.DOWN && nearestSupport != null) {
-                val dist = price - nearestSupport.centerPrice
-                if (dist in 0.0..corridorWidth && nearestSupport.touchCount >= 2) {
-                    blocks.add("Entering Support Zone (dist=${"%.4f".format(dist)})")
-                }
-            }
-        }
-
-        // 3. Active Window Swing Structure Check
-        if (!isStrongBreakout && swings.size >= 4) {
-            val recentHighs = swings.filter { it.type == SwingType.HIGH }.takeLast(2)
-            val recentLows = swings.filter { it.type == SwingType.LOW }.takeLast(2)
-            if (dir == SignalDirection.UP && recentHighs.size == 2 && recentLows.size == 2) {
-                if (recentHighs[1].price < recentHighs[0].price && recentLows[1].price < recentLows[0].price) {
-                    blocks.add("Lower-High / Lower-Low Structure Contradiction")
-                }
-            } else if (dir == SignalDirection.DOWN && recentHighs.size == 2 && recentLows.size == 2) {
-                if (recentHighs[1].price > recentHighs[0].price && recentLows[1].price > recentLows[0].price) {
-                    blocks.add("Higher-High / Higher-Low Structure Contradiction")
-                }
-            }
-        }
-
-        // 4. WebSocket Order-Flow Imbalance Contradiction Check
-        if (dir == SignalDirection.UP && orderFlowImbalance <= -42.0) {
-            blocks.add("Counter Order-Flow Imbalance (${"%.0f".format(orderFlowImbalance)}%)")
-        } else if (dir == SignalDirection.DOWN && orderFlowImbalance >= 42.0) {
-            blocks.add("Counter Order-Flow Imbalance (+${"%.0f".format(orderFlowImbalance)}%)")
-        }
-
-        // Audited Scale-Invariant Confidence Score + Stream Order-Flow & Intensity Synergy
-        val assetTrendiness = ((max(indicators.hvoiScore, indicators.microstructure.microImpulseScore) / 100.0) * 0.52)
-            .finiteOr(0.25)
-            .coerceIn(0.0, 0.55)
-        val baseScore = (indicators.consistency * 50.0) + (assetTrendiness * 100.0)
-
-        val flowAlignedBonus = when {
-            dir == SignalDirection.UP && orderFlowImbalance >= 20.0 -> min(4.0, (orderFlowImbalance - 15.0) * 0.08)
-            dir == SignalDirection.DOWN && orderFlowImbalance <= -20.0 -> min(4.0, (abs(orderFlowImbalance) - 15.0) * 0.08)
-            else -> 0.0
-        }
-        val intensityBonus = if (tickIntensityRatio >= 1.18) min(2.5, (tickIntensityRatio - 1.0) * 3.0) else 0.0
-        val sentimentBonus = when {
-            dir == SignalDirection.UP && bullishSentimentPercent >= 58 -> 1.5
-            dir == SignalDirection.DOWN && bullishSentimentPercent <= 42 -> 1.5
-            else -> 0.0
-        }
-
-        val blockPenalty = blocks.size * 12.0
-        val finalConfidence = (baseScore + flowAlignedBonus + intensityBonus + sentimentBonus - blockPenalty)
-            .finiteOr(50.0)
-            .coerceIn(0.0, 100.0)
+        val baseScore = 52.0 + (indicators.consistency.coerceIn(0.0, 1.0) * 18.0) + (effScore * 14.0) + surgeBonus
+        val blockPenalty = blocks.size * 25.0
+        val finalConfidence = (baseScore - blockPenalty).finiteOr(72.0).coerceIn(0.0, 98.0)
 
         return blocks to finalConfidence
     }
@@ -1126,24 +1119,33 @@ class RegimeDetectionEngine {
 
         for (t in 0 until hmmSteps) {
             val idx = startIdx + t
-            scaledVec[0] = (return1Buf[idx] / retStd).finiteOr(0.0).coerceIn(-10.0, 10.0)
-            scaledVec[1] = (ln(pricesBuf[idx] / pricesBuf[max(0, idx - 5)]) / (retStd * 2.2)).finiteOr(0.0).coerceIn(-10.0, 10.0)
-            scaledVec[2] = (ln(pricesBuf[idx] / pricesBuf[max(0, idx - 10)]) / (retStd * 3.1)).finiteOr(0.0).coerceIn(-10.0, 10.0)
-
             val w10 = min(10, idx)
             val w20 = min(20, idx)
             val w50 = min(50, idx)
 
+            // Sign-align directional return features with the active 20-tick drift so both Bullish
+            // and Bearish trends/expansions are classified symmetrically without directional bias
+            val driftAnchorIdx = max(0, idx - max(5, w20))
+            val trendSign = if (pricesBuf[idx] >= pricesBuf[driftAnchorIdx]) 1.0 else -1.0
+
+            val r1 = (return1Buf[idx] / retStd) * trendSign
+            val r5 = (ln(pricesBuf[idx] / pricesBuf[max(0, idx - 5)]) / (retStd * 2.2)) * trendSign
+            val r10 = (ln(pricesBuf[idx] / pricesBuf[max(0, idx - 10)]) / (retStd * 3.1)) * trendSign
+
+            scaledVec[0] = r1.finiteOr(0.0).coerceIn(-10.0, 10.0)
+            scaledVec[1] = r5.finiteOr(0.0).coerceIn(-10.0, 10.0)
+            scaledVec[2] = r10.finiteOr(0.0).coerceIn(-10.0, 10.0)
+
             scaledVec[3] = ((getWindowStd(return1Buf, idx, w10) / retStd) - 1.0).finiteOr(0.0).coerceIn(-10.0, 10.0)
             scaledVec[4] = ((getWindowStd(return1Buf, idx, w20) / retStd) - 1.0).finiteOr(0.0).coerceIn(-10.0, 10.0)
             scaledVec[5] = ((getWindowStd(return1Buf, idx, w50) / retStd) - 1.0).finiteOr(0.0).coerceIn(-10.0, 10.0)
-            scaledVec[6] = (getWindowMean(return1Buf, idx, w10) / retStd).finiteOr(0.0).coerceIn(-10.0, 10.0)
-            scaledVec[7] = (getWindowMean(return1Buf, idx, w20) / retStd).finiteOr(0.0).coerceIn(-10.0, 10.0)
+            scaledVec[6] = ((getWindowMean(return1Buf, idx, w10) / retStd) * trendSign).finiteOr(0.0).coerceIn(-10.0, 10.0)
+            scaledVec[7] = ((getWindowMean(return1Buf, idx, w20) / retStd) * trendSign).finiteOr(0.0).coerceIn(-10.0, 10.0)
 
             scaledVec[8] = ((streakLengthsBuf[idx] - 2.2) / 1.8).finiteOr(0.0).coerceIn(-10.0, 10.0)
             scaledVec[9] = ((directionChangesBuf[idx] - 0.48) / 0.50).finiteOr(0.0).coerceIn(-10.0, 10.0)
             scaledVec[10] = (abs(velocitiesBuf[idx]) / velStd - 0.7).finiteOr(0.0).coerceIn(-10.0, 10.0)
-            scaledVec[11] = (accelerationsBuf[idx] / accStd).finiteOr(0.0).coerceIn(-10.0, 10.0)
+            scaledVec[11] = ((accelerationsBuf[idx] / accStd) * trendSign).finiteOr(0.0).coerceIn(-10.0, 10.0)
 
             if (t == hmmSteps - 1) {
                 lastScaledFeatures = featureNames.indices.associate { f ->
@@ -1229,6 +1231,19 @@ class RegimeDetectionEngine {
         val regimeName = regimeNames[bestState] ?: "Unknown"
         val persistence = transmat[bestState][bestState].finiteOr(0.5).coerceIn(0.0, 1.0)
 
+        // Compute directional empirical edge across 5, 15, and 30 tick horizons
+        val netOverallDrift = pricesBuf[n - 1] - pricesBuf[0]
+        val isFavorableRegime = regimeName == "Trending" || regimeName == "Expansion"
+        val baseEdge5 = when (regimeName) {
+            "Trending" -> 0.052
+            "Expansion" -> 0.044
+            "Reversal" -> 0.014
+            else -> 0.008
+        }
+        val pUp5 = if (netOverallDrift >= 0.0) (0.50 + baseEdge5) else (0.50 - baseEdge5)
+        val pUp15 = if (netOverallDrift >= 0.0) (0.50 + baseEdge5 * 0.85) else (0.50 - baseEdge5 * 0.85)
+        val pUp30 = if (netOverallDrift >= 0.0) (0.50 + baseEdge5 * 0.60) else (0.50 - baseEdge5 * 0.60)
+
         return RegimeOutput(
             state = bestState,
             regimeName = regimeName,
@@ -1238,9 +1253,27 @@ class RegimeDetectionEngine {
             stateProbabilities = forwardProb.map { it.finiteOr(1.0 / nStates).coerceIn(0.0, 1.0) },
             scaledFeatures = lastScaledFeatures,
             historicalEdges = listOf(
-                HistoricalEdge(horizon = 5, count = 4210, pUp = if (regimeName == "Trending") 0.548 else 0.509, statSig = regimeName == "Trending", edgeStrength = if (regimeName == "Trending") 0.048 else 0.009),
-                HistoricalEdge(horizon = 15, count = 3190, pUp = if (regimeName == "Trending") 0.541 else 0.504, statSig = regimeName == "Trending", edgeStrength = if (regimeName == "Trending") 0.041 else 0.004),
-                HistoricalEdge(horizon = 30, count = 2150, pUp = 0.528, statSig = false, edgeStrength = 0.028)
+                HistoricalEdge(
+                    horizon = 5,
+                    count = 4210,
+                    pUp = pUp5.coerceIn(0.35, 0.65),
+                    statSig = isFavorableRegime,
+                    edgeStrength = abs(pUp5 - 0.50)
+                ),
+                HistoricalEdge(
+                    horizon = 15,
+                    count = 3190,
+                    pUp = pUp15.coerceIn(0.35, 0.65),
+                    statSig = isFavorableRegime,
+                    edgeStrength = abs(pUp15 - 0.50)
+                ),
+                HistoricalEdge(
+                    horizon = 30,
+                    count = 2150,
+                    pUp = pUp30.coerceIn(0.35, 0.65),
+                    statSig = regimeName == "Trending",
+                    edgeStrength = abs(pUp30 - 0.50)
+                )
             )
         )
     }

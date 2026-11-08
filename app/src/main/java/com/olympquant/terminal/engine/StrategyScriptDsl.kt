@@ -28,19 +28,25 @@ import kotlin.math.sqrt
  */
 object DefaultStrategyScripts {
 
-    const val DEFAULT_STRATEGY_NAME = "TickRush5s_FTRL_Default"
+    const val SNIPER_M_STRATEGY_NAME = "Sniper M"
+    const val DEFAULT_STRATEGY_NAME = SNIPER_M_STRATEGY_NAME
+    const val HIGH_VOLTAGE_STRATEGY_NAME = SNIPER_M_STRATEGY_NAME
+    const val X13_TEMPORAL_STRATEGY_NAME = SNIPER_M_STRATEGY_NAME
 
-    val DEFAULT_OQS_SCRIPT: String = """
+    val SNIPER_M_OQS_SCRIPT: String = """
 # ============================================================================
-# OLYMPQUANT STRATEGY SCRIPT (.oqs)
-# Uniform 6-Block Programmable Strategy Definition
+# OLYMPQUANT — SNIPER M (.oqs)
+# Single Streamlined Momentum Surge Strategy:
+#   1. Analyze & Smooth the raw tick stream (Zero-Lag Fast Smoother vs Slow Baseline)
+#   2. Follow the smoothed momentum direction (UP or DOWN)
+#   3. Detect an accelerating surge in the smoothed direction & ride the surge
 # ============================================================================
 
 [META]
-name = "TickRush5s_FTRL_Default"
-version = "2.0"
+name = "Sniper M"
+version = "8.0"
 author = "OlympQuant Core"
-description = "Default 5s raw tick-stream rush strategy with Online FTRL-Proximal ML meta-labeling and anti-spike dominance protection."
+description = "Analyzes raw tick stream data, smooths it with a zero-lag filter, follows directional momentum, and places a trade when an active tick stream surge aligns with the smoothed direction."
 
 [EXECUTION]
 duration_sec = 5
@@ -50,165 +56,47 @@ min_stake_usd = 1.0
 max_stake_usd = 4000.0
 cooldown_ms = 4000
 min_payout_pct = 75
-min_confidence = 62.0
+min_confidence = 58.0
 max_daily_trades = 10
 max_consecutive_losses = 3
 
 [VARIABLES]
-let snr_headroom = rush_snr - 1.35
-let smooth_ratio = 100.0 - single_tick_dominance
-let composite_edge = (ftrl_win_prob * 0.65) + (tick_purity * 0.35)
+let smooth_spread = z_fast - z_slow
+let surge_snr = max(rush_snr, roll_mean(rush_snr, 3))
+let surge_purity = max(tick_purity, roll_mean(tick_purity, 4))
+let surge_power = (surge_snr * 0.65) + (tick_convexity * 0.35)
 
 [SIGNAL_UP]
 rush_dir == UP
-rush_snr >= 1.35
-tick_purity >= 72.0
-tip_aligned == 1
-tick_streak >= 2 and tick_streak <= 6
-single_tick_dominance <= 62.0
-
-[SIGNAL_DOWN]
-rush_dir == DOWN
-rush_snr >= 1.35
-tick_purity >= 72.0
-tip_aligned == 1
-tick_streak >= 2 and tick_streak <= 6
-single_tick_dominance <= 62.0
-
-[GATES]
-gate "Tick Rush SNR Band" : rush_snr >= 1.35 and rush_snr <= 4.80 and cleared_noise_mean == 1
-gate "4-Tick Directional Purity" : tick_purity >= 72.0 and tip_aligned == 1
-gate "Speed & Freshness Window" : tick_speed >= 1.15 and tick_streak >= 2 and tick_streak <= 6 and ws_latency_ms <= 180
-gate "Anti-Spike Dominance & Convexity" : single_tick_dominance <= 62.0 and tick_convexity >= 0.82
-gate "Online FTRL-Proximal P(Win 5s)" : ftrl_win_prob >= 62.0 and composite_edge >= 64.0
-""".trimIndent()
-
-    const val X13_TEMPORAL_STRATEGY_NAME = "X13_Temporal_Intelligence_5s"
-
-    val X13_TEMPORAL_OQS_SCRIPT: String = """
-# ============================================================================
-# OLYMPQUANT X13 — TEMPORAL INTELLIGENCE STRATEGY (.oqs)
-# 3-Layer Signal Architecture:
-#   Layer 1: Market Eligibility (Hard rejection on noise/latency/payout/stale snapshot)
-#   Layer 2: Signal Intelligence (Rolling windows + Hysteresis + N-of-M persistence)
-#   Layer 3: Prediction Validation (Calibrated FTRL + Regime-Adaptive + Cold-Start Guard)
-# ============================================================================
-
-[META]
-name = "X13_Temporal_Intelligence_5s"
-version = "13.0"
-author = "OlympQuant X13 Core"
-description = "X13 Temporal Intelligence 3-Layer 5s engine: Rolling-window OFI/SNR/Purity consensus, Schmitt-trigger hysteresis, N-of-M persistence, regime-adaptive thresholds, and calibrated FTRL validation."
-
-[EXECUTION]
-duration_sec = 5
-stake_mode = "PERCENT_BALANCE"
-stake_value = 5.0
-min_stake_usd = 1.0
-max_stake_usd = 4000.0
-cooldown_ms = 4000
-min_payout_pct = 75
-min_confidence = 62.0
-max_daily_trades = 10
-max_consecutive_losses = 3
-
-[VARIABLES]
-let smooth_snr = max(rush_snr, roll_mean(rush_snr, 3))
-let smooth_purity = max(tick_purity, roll_mean(tick_purity, 4))
-let ofi_consensus = roll_median(ofi, 5)
-let impulse_hyst = hysteresis(micro_impulse_score, 65.0, 50.0)
-let purity_hyst = hysteresis(tick_purity, 72.0, 62.0)
-let temporal_edge = (signal_layer_score * 0.55) + (validation_layer_score * 0.45)
-
-[SIGNAL_UP]
-rush_dir == UP
-eligibility_passed == 1
-smooth_snr >= regime_snr_thresh
-smooth_purity >= regime_purity_thresh or purity_hyst == 1
-persist_count_5 >= 2 or tip_aligned == 1
-
-[SIGNAL_DOWN]
-rush_dir == DOWN
-eligibility_passed == 1
-smooth_snr >= regime_snr_thresh
-smooth_purity >= regime_purity_thresh or purity_hyst == 1
-persist_count_5 >= 2 or tip_aligned == 1
-
-[GATES]
-gate "L1: Market Eligibility & Snapshot Sync" : eligibility_passed == 1 and snapshot_sync == 1 and noise_clean == 1
-gate "L2: Regime-Adaptive Rolling SNR" : smooth_snr >= regime_snr_thresh and rush_snr <= 4.85 and cleared_noise_mean == 1
-gate "L2: Hysteresis Purity & Persistence" : (smooth_purity >= regime_purity_thresh or purity_hyst == 1) and (persist_count_5 >= 2 or tip_aligned == 1)
-gate "L2: Rolling OFI & Anti-Spike Filter" : single_tick_dominance <= 64.0 and ofi_consensus >= -38.0 and ofi_consensus <= 38.0 or signal_layer_score >= 68.0
-gate "L3: Calibrated FTRL & Regime Validation" : calibrated_win_prob >= 62.0 and regime_stable == 1 and temporal_edge >= 62.0
-""".trimIndent()
-
-    const val HIGH_VOLTAGE_STRATEGY_NAME = "HighVoltage5s_HVWindow"
-
-    val HIGH_VOLTAGE_OQS_SCRIPT: String = """
-# ============================================================================
-# OLYMPQUANT — HIGHVOLTAGE + HV WINDOW STRATEGY (.oqs)
-# Part 1: 6 Strict Mathematical Filters (HighVoltage Breakout Engine):
-#   1. Trend Direction (ZLEMA Fast 10 vs Slow 30)
-#   2. Micro-Velocity (Tick Speed >= 1.5 T/s in 3s window)
-#   3. 50-Tick Range Breakout (relPos >= 80% UP / <= 20% DOWN)
-#   4. Active Directional Momentum (6-tick netDelta5 > 0 UP / < 0 DOWN)
-#   5. Support/Resistance Obstacle Wall (>= 0.25 pt clearance ahead)
-#   6. Volatility Regime (Not compressed <40% 10c avg & not exhausted)
-# Part 2: HV Window Co-Pilot (Zero-Lag Fast-Decay EMA α=0.08):
-#   - EXCELLENT (>=75%), MODERATE (50-74%), AVOID (<50%)
-#   - Filters out TIGHT_CHOP (<0.20 pt 60s range) & Crazy Market (>55% wicks)
-# ============================================================================
-
-[META]
-name = "HighVoltage5s_HVWindow"
-version = "5.0"
-author = "OlympQuant HV Core"
-description = "HighVoltage micro-timeframe breakout strategy (6 strict mathematical filters: ZLEMA 10/30 trend, >=1.5 T/s 3s velocity, 80%/20% 50-tick breakout, 6-tick netDelta5 momentum, 0.25pt S/R wall block, 10-candle compression/exhaustion guard) paired with the zero-lag EMA (α=0.08) HV Window co-pilot."
-
-[EXECUTION]
-duration_sec = 5
-stake_mode = "PERCENT_BALANCE"
-stake_value = 5.0
-min_stake_usd = 1.0
-max_stake_usd = 4000.0
-cooldown_ms = 4000
-min_payout_pct = 75
-min_confidence = 55.0
-max_daily_trades = 10
-max_consecutive_losses = 3
-
-[VARIABLES]
-let hv_edge = (hv_score * 0.65) + (calibrated_win_prob * 0.35)
-let zlema_abs_spread = abs(zlema_spread)
-let breakout_dist = abs(rel_pos - 50.0)
-let delta5_mag = abs(net_delta_5)
-
-[SIGNAL_UP]
 zlema_trend_dir == UP
-tick_speed >= 1.50
-rel_pos >= 80.0
-net_delta_5 > 0.0
-sr_wall_clear == 1
-vol_regime_ok == 1
-hv_score >= 50.0 and hv_tight_chop == 0 and hv_crazy_whipsaw == 0
+rush_snr >= 1.25
+tick_purity >= 65.0
+tip_aligned == 1
+cleared_noise_mean == 1
+tick_convexity >= 0.55
+tick_speed >= 1.15
+single_tick_dominance <= 65.0
 
 [SIGNAL_DOWN]
+rush_dir == DOWN
 zlema_trend_dir == DOWN
-tick_speed >= 1.50
-rel_pos <= 20.0
-net_delta_5 < 0.0
-sr_wall_clear == 1
-vol_regime_ok == 1
-hv_score >= 50.0 and hv_tight_chop == 0 and hv_crazy_whipsaw == 0
+rush_snr >= 1.25
+tick_purity >= 65.0
+tip_aligned == 1
+cleared_noise_mean == 1
+tick_convexity >= 0.55
+tick_speed >= 1.15
+single_tick_dominance <= 65.0
 
 [GATES]
-gate "1. ZLEMA (10 vs 30) Trend Check" : zlema_trend_dir == UP or zlema_trend_dir == DOWN
-gate "2. Micro-Velocity (>= 1.5 T/s in 3s)" : tick_speed >= 1.50
-gate "3. 50-Tick Range Breakout (80% / 20%)" : (zlema_trend_dir == UP and rel_pos >= 80.0) or (zlema_trend_dir == DOWN and rel_pos <= 20.0)
-gate "4. Active 6-Tick Momentum (netDelta5)" : (zlema_trend_dir == UP and net_delta_5 > 0.0) or (zlema_trend_dir == DOWN and net_delta_5 < 0.0)
-gate "5. S/R Obstacle Wall (>= 0.25 pt)" : sr_wall_clear == 1 and sr_ahead_dist >= 0.25
-gate "6. Volatility & HV Window Co-Pilot" : vol_regime_ok == 1 and hv_score >= 50.0 and hv_tight_chop == 0 and hv_crazy_whipsaw == 0
+gate "1. Smoothed Tick Direction & Momentum" : (rush_dir == UP and zlema_trend_dir == UP) or (rush_dir == DOWN and zlema_trend_dir == DOWN)
+gate "2. Tick Stream Surge (SNR >= 1.25x & Speed >= 1.15 T/s)" : rush_snr >= 1.25 and tick_speed >= 1.15 and cleared_noise_mean == 1 and tick_convexity >= 0.55
+gate "3. Clean Surge Purity (>= 65% & No 1-Tick Glitch)" : tick_purity >= 65.0 and tip_aligned == 1 and single_tick_dominance <= 65.0 and ws_latency_ms <= 250
 """.trimIndent()
+
+    val DEFAULT_OQS_SCRIPT: String = SNIPER_M_OQS_SCRIPT
+    val HIGH_VOLTAGE_OQS_SCRIPT: String = SNIPER_M_OQS_SCRIPT
+    val X13_TEMPORAL_OQS_SCRIPT: String = SNIPER_M_OQS_SCRIPT
 
     fun withDurationSec(scriptCode: String, durationSec: Int): String {
         val validSec = durationSec.coerceIn(5, 900)
@@ -221,20 +109,18 @@ gate "6. Volatility & HV Window Co-Pilot" : vol_regime_ok == 1 and hv_score >= 5
     }
 
     fun buildNewStrategyTemplate(customName: String, durationSec: Int = 5): String {
-        val cleanName = customName.trim().ifEmpty { "Custom_HighVoltage_Strategy" }.replace("\"", "")
+        val cleanName = customName.trim().ifEmpty { SNIPER_M_STRATEGY_NAME }.replace("\"", "")
         val validSec = durationSec.coerceIn(5, 900)
         return """
 # ============================================================================
-# OLYMPQUANT STRATEGY SCRIPT (.oqs) — HIGHVOLTAGE & HV WINDOW ENABLED
-# All 6 sections ([META], [EXECUTION], [VARIABLES], [SIGNAL_UP], [SIGNAL_DOWN], [GATES])
-# are required so every strategy follows the exact same programmable structure.
+# OLYMPQUANT — SNIPER M TEMPLATE (.oqs)
 # ============================================================================
 
 [META]
 name = "$cleanName"
-version = "1.0"
-author = "User Quant"
-description = "Custom programmable .oqs strategy with HighVoltage 6-filter primitives, HV Window co-pilot, and X13 Temporal Intelligence."
+version = "8.0"
+author = "OlympQuant Core"
+description = "Analyzes raw tick stream data, smooths it with a zero-lag filter, follows directional momentum, and places a trade when an active tick stream surge aligns with the smoothed direction."
 
 [EXECUTION]
 duration_sec = $validSec
@@ -244,40 +130,42 @@ min_stake_usd = 1.0
 max_stake_usd = 4000.0
 cooldown_ms = 4000
 min_payout_pct = 75
-min_confidence = 60.0
+min_confidence = 58.0
 max_daily_trades = 10
 max_consecutive_losses = 3
 
 [VARIABLES]
-let snr_ratio = max(rush_snr, roll_mean(rush_snr, 3))
-let body_momentum = abs(net_delta_4) / max(avg_noise_step, 0.00001)
-let edge_score = (hv_score * 0.50) + (calibrated_win_prob * 0.50)
+let smooth_spread = z_fast - z_slow
+let surge_snr = max(rush_snr, roll_mean(rush_snr, 3))
+let surge_purity = max(tick_purity, roll_mean(tick_purity, 4))
+let surge_power = (surge_snr * 0.65) + (tick_convexity * 0.35)
 
 [SIGNAL_UP]
+rush_dir == UP
 zlema_trend_dir == UP
-tick_speed >= 1.50
-rel_pos >= 80.0
-net_delta_5 > 0.0
-sr_wall_clear == 1
-vol_regime_ok == 1
-hv_score >= 50.0 and hv_tight_chop == 0 and hv_crazy_whipsaw == 0
+rush_snr >= 1.25
+tick_purity >= 65.0
+tip_aligned == 1
+cleared_noise_mean == 1
+tick_convexity >= 0.55
+tick_speed >= 1.15
+single_tick_dominance <= 65.0
 
 [SIGNAL_DOWN]
+rush_dir == DOWN
 zlema_trend_dir == DOWN
-tick_speed >= 1.50
-rel_pos <= 20.0
-net_delta_5 < 0.0
-sr_wall_clear == 1
-vol_regime_ok == 1
-hv_score >= 50.0 and hv_tight_chop == 0 and hv_crazy_whipsaw == 0
+rush_snr >= 1.25
+tick_purity >= 65.0
+tip_aligned == 1
+cleared_noise_mean == 1
+tick_convexity >= 0.55
+tick_speed >= 1.15
+single_tick_dominance <= 65.0
 
 [GATES]
-gate "1. ZLEMA (10 vs 30) Trend Check" : zlema_trend_dir == UP or zlema_trend_dir == DOWN
-gate "2. Micro-Velocity (>= 1.5 T/s in 3s)" : tick_speed >= 1.50
-gate "3. 50-Tick Range Breakout (80% / 20%)" : (zlema_trend_dir == UP and rel_pos >= 80.0) or (zlema_trend_dir == DOWN and rel_pos <= 20.0)
-gate "4. Active 6-Tick Momentum (netDelta5)" : (zlema_trend_dir == UP and net_delta_5 > 0.0) or (zlema_trend_dir == DOWN and net_delta_5 < 0.0)
-gate "5. S/R Obstacle Wall (>= 0.25 pt)" : sr_wall_clear == 1 and sr_ahead_dist >= 0.25
-gate "6. Volatility & HV Window Co-Pilot" : vol_regime_ok == 1 and hv_score >= 50.0 and hv_tight_chop == 0 and hv_crazy_whipsaw == 0
+gate "1. Smoothed Tick Direction & Momentum" : (rush_dir == UP and zlema_trend_dir == UP) or (rush_dir == DOWN and zlema_trend_dir == DOWN)
+gate "2. Tick Stream Surge (SNR >= 1.25x & Speed >= 1.15 T/s)" : rush_snr >= 1.25 and tick_speed >= 1.15 and cleared_noise_mean == 1 and tick_convexity >= 0.55
+gate "3. Clean Surge Purity (>= 65% & No 1-Tick Glitch)" : tick_purity >= 65.0 and tip_aligned == 1 and single_tick_dominance <= 65.0 and ws_latency_ms <= 250
 """.trimIndent()
     }
 
@@ -293,12 +181,22 @@ gate "6. Volatility & HV Window Co-Pilot" : vol_regime_ok == 1 and hv_score >= 5
         VariableDoc("tick_speed", "T/s", "HighVoltage Filter 2: 3-second tick speed in ticks/sec (minVelocity >= 1.5)"),
         VariableDoc("rel_pos", "%", "HighVoltage Filter 3: 50-tick range breakout position (UP >= 80%, DOWN <= 20%)"),
         VariableDoc("net_delta_5", "px", "HighVoltage Filter 4: Net price displacement over last 6 ticks (>0 UP, <0 DOWN)"),
-        VariableDoc("sr_wall_clear", "0/1", "HighVoltage Filter 5: 1 if no S/R wall within 0.25 points ahead of trade direction"),
+        VariableDoc("sr_wall_clear", "0/1", "HighVoltage Filter 5: 1 if no S/R wall within scale-adjusted clearance ahead of trade"),
         VariableDoc("sr_ahead_dist", "px", "HighVoltage Filter 5: Distance in points to nearest S/R wall ahead of trade"),
+        VariableDoc("sr_min_clearance", "px", "HighVoltage Filter 5: Scale-adjusted minimum S/R clearance (0.25 idx / 0.00025 FX)"),
         VariableDoc("candle_range_ratio", "x", "HighVoltage Filter 6: Current candle range divided by 10-candle avg range"),
         VariableDoc("vol_compressed", "0/1", "HighVoltage Filter 6: 1 if current candle range < 40% of 10-candle average"),
         VariableDoc("vol_exhausted", "0/1", "HighVoltage Filter 6: 1 if candle range is abnormally exhausted (>265%)"),
         VariableDoc("vol_regime_ok", "0/1", "HighVoltage Filter 6: 1 if candle volatility is neither compressed nor exhausted"),
+        VariableDoc("opportunity_dir", "UP/DOWN", "Omni-Playbook Direction (UP=1, DOWN=-1, NONE=0) across Continuation, S/R Bounce, and Mean Reversion"),
+        VariableDoc("continuation_ready", "0/1", "1 if all 6 strict Trend/Momentum Continuation filters are satisfied"),
+        VariableDoc("sr_bounce_ready", "0/1", "1 if price is actively bouncing off Support (UP) or rejecting off Resistance (DOWN)"),
+        VariableDoc("mean_rev_ready", "0/1", "1 if price is snapping back from Overbought (>=82% -> DOWN) or Oversold (<=18% -> UP) extreme"),
+        VariableDoc("any_setup_ready", "0/1", "1 if Continuation, Support/Resistance Bounce, or Mean Reversion is ready to execute"),
+        VariableDoc("playbook_type", "0..3", "Active Playbook ID (1 = CONTINUATION, 2 = SR_BOUNCE, 3 = MEAN_REVERSION, 0 = SCANNING)"),
+        VariableDoc("opportunity_score", "%", "Quality score (0..100%) of the active Continuation, S/R Bounce, or Mean-Reversion setup"),
+        VariableDoc("support_dist", "px", "Distance in points above nearest Support / Swing Low / Grid floor"),
+        VariableDoc("resistance_dist", "px", "Distance in points below nearest Resistance / Swing High / Grid ceiling"),
         VariableDoc("hv_score", "%", "HV Window Co-Pilot: Zero-lag fast-decay EMA (α=0.08) score (≥75 Excellent, 50-74 Mod, <50 Avoid)"),
         VariableDoc("hv_raw_score", "%", "HV Window Co-Pilot: Instantaneous unsmoothed structural score (0..100%)"),
         VariableDoc("hv_state", "0..2", "HV Window State (2 = EXCELLENT ≥75%, 1 = MODERATE 50-74%, 0 = AVOID <50%)"),
@@ -370,7 +268,9 @@ gate "6. Volatility & HV Window Co-Pilot" : vol_regime_ok == 1 and hv_score >= 5
         VariableDoc("hmm_confidence", "%", "Gaussian HMM state posterior confidence (0..100%)"),
         VariableDoc("ws_latency_ms", "ms", "Live WebSocket round-trip latency in milliseconds"),
         VariableDoc("payout_pct", "%", "Current broker payout percentage for the active asset"),
-        VariableDoc("sentiment_pct", "%", "Live crowd bullish sentiment percentage (0..100%)")
+        VariableDoc("sentiment_pct", "%", "Live crowd bullish sentiment percentage (0..100%)"),
+        VariableDoc("ofi_imbalance", "%", "Alias for `ofi`: Order Flow Imbalance (-100..+100%)"),
+        VariableDoc("velocity", "T/s", "Alias for `tick_speed`: 3-second tick velocity in ticks/sec")
     )
 }
 
@@ -435,18 +335,34 @@ data class DslGateDefinition(
 
 @Immutable
 sealed interface CompiledMathExpr {
-    fun eval(symbols: Map<String, Double>): Double
+    fun eval(
+        symbols: Map<String, Double>,
+        temporalEngine: TemporalIntelligenceEngine? = null,
+        mutateState: Boolean = true
+    ): Double
 
     data class Literal(val value: Double) : CompiledMathExpr {
-        override fun eval(symbols: Map<String, Double>): Double = value
+        override fun eval(
+            symbols: Map<String, Double>,
+            temporalEngine: TemporalIntelligenceEngine?,
+            mutateState: Boolean
+        ): Double = value
     }
 
     data class Variable(val name: String) : CompiledMathExpr {
-        override fun eval(symbols: Map<String, Double>): Double = (symbols[name] ?: 0.0).finiteOr(0.0)
+        override fun eval(
+            symbols: Map<String, Double>,
+            temporalEngine: TemporalIntelligenceEngine?,
+            mutateState: Boolean
+        ): Double = (symbols[name] ?: 0.0).finiteOr(0.0)
     }
 
     data class UnaryNeg(val inner: CompiledMathExpr) : CompiledMathExpr {
-        override fun eval(symbols: Map<String, Double>): Double = -inner.eval(symbols)
+        override fun eval(
+            symbols: Map<String, Double>,
+            temporalEngine: TemporalIntelligenceEngine?,
+            mutateState: Boolean
+        ): Double = -inner.eval(symbols, temporalEngine, mutateState)
     }
 
     data class BinaryOp(
@@ -454,9 +370,13 @@ sealed interface CompiledMathExpr {
         val left: CompiledMathExpr,
         val right: CompiledMathExpr
     ) : CompiledMathExpr {
-        override fun eval(symbols: Map<String, Double>): Double {
-            val l = left.eval(symbols)
-            val r = right.eval(symbols)
+        override fun eval(
+            symbols: Map<String, Double>,
+            temporalEngine: TemporalIntelligenceEngine?,
+            mutateState: Boolean
+        ): Double {
+            val l = left.eval(symbols, temporalEngine, mutateState)
+            val r = right.eval(symbols, temporalEngine, mutateState)
             val res = when (op) {
                 '+' -> l + r
                 '-' -> l - r
@@ -472,8 +392,12 @@ sealed interface CompiledMathExpr {
         val fnName: String,
         val arg: CompiledMathExpr
     ) : CompiledMathExpr {
-        override fun eval(symbols: Map<String, Double>): Double {
-            val v = arg.eval(symbols)
+        override fun eval(
+            symbols: Map<String, Double>,
+            temporalEngine: TemporalIntelligenceEngine?,
+            mutateState: Boolean
+        ): Double {
+            val v = arg.eval(symbols, temporalEngine, mutateState)
             return when (fnName) {
                 "abs" -> abs(v)
                 "sqrt" -> sqrt(v.coerceAtLeast(0.0)).finiteOr(0.0)
@@ -487,15 +411,22 @@ sealed interface CompiledMathExpr {
         val arg1: CompiledMathExpr,
         val arg2: CompiledMathExpr
     ) : CompiledMathExpr {
-        override fun eval(symbols: Map<String, Double>): Double {
-            val a = arg1.eval(symbols)
-            val b = arg2.eval(symbols)
+        override fun eval(
+            symbols: Map<String, Double>,
+            temporalEngine: TemporalIntelligenceEngine?,
+            mutateState: Boolean
+        ): Double {
+            val a = arg1.eval(symbols, temporalEngine, mutateState)
+            val b = arg2.eval(symbols, temporalEngine, mutateState)
+            val w = b.toInt().coerceIn(1, 16)
             return when (fnName) {
                 "min" -> min(a, b)
                 "max" -> max(a, b)
                 "roll_mean" -> {
                     val varKey = (arg1 as? Variable)?.name
-                    if (varKey != null && symbols.containsKey("__roll_mean_${varKey}")) {
+                    if (varKey != null && temporalEngine != null && temporalEngine.hasSeries(varKey)) {
+                        temporalEngine.rollingMean(varKey, w)
+                    } else if (varKey != null && symbols.containsKey("__roll_mean_${varKey}")) {
                         symbols["__roll_mean_${varKey}"]?.finiteOr(a) ?: a
                     } else {
                         a
@@ -503,7 +434,9 @@ sealed interface CompiledMathExpr {
                 }
                 "roll_median" -> {
                     val varKey = (arg1 as? Variable)?.name
-                    if (varKey != null && symbols.containsKey("__roll_median_${varKey}")) {
+                    if (varKey != null && temporalEngine != null && temporalEngine.hasSeries(varKey)) {
+                        temporalEngine.rollingMedian(varKey, w)
+                    } else if (varKey != null && symbols.containsKey("__roll_median_${varKey}")) {
                         symbols["__roll_median_${varKey}"]?.finiteOr(a) ?: a
                     } else {
                         a
@@ -511,7 +444,9 @@ sealed interface CompiledMathExpr {
                 }
                 "ema" -> {
                     val varKey = (arg1 as? Variable)?.name
-                    if (varKey != null && symbols.containsKey("__ema_${varKey}")) {
+                    if (varKey != null && temporalEngine != null && temporalEngine.hasSeries(varKey)) {
+                        temporalEngine.rollingEma(varKey, w)
+                    } else if (varKey != null && symbols.containsKey("__ema_${varKey}")) {
                         symbols["__ema_${varKey}"]?.finiteOr(a) ?: a
                     } else {
                         a
@@ -528,24 +463,39 @@ sealed interface CompiledMathExpr {
         val arg2: CompiledMathExpr,
         val arg3: CompiledMathExpr
     ) : CompiledMathExpr {
-        override fun eval(symbols: Map<String, Double>): Double {
-            val v = arg1.eval(symbols)
-            val p1 = arg2.eval(symbols)
-            val p2 = arg3.eval(symbols)
+        override fun eval(
+            symbols: Map<String, Double>,
+            temporalEngine: TemporalIntelligenceEngine?,
+            mutateState: Boolean
+        ): Double {
+            val v = arg1.eval(symbols, temporalEngine, mutateState)
+            val p1 = arg2.eval(symbols, temporalEngine, mutateState)
+            val p2 = arg3.eval(symbols, temporalEngine, mutateState)
             return when (fnName) {
                 "hysteresis" -> {
                     val varKey = (arg1 as? Variable)?.name
-                    if (varKey != null && symbols.containsKey("__hyst_${varKey}")) {
+                    if (temporalEngine != null) {
+                        val hystKey = "dsl_hyst_${varKey ?: "expr"}_${"%.2f".format(p1)}_${"%.2f".format(p2)}"
+                        if (temporalEngine.evaluateHysteresis(hystKey, v, p1, p2, mutateState = mutateState)) 1.0 else 0.0
+                    } else if (varKey != null && symbols.containsKey("__hyst_${varKey}")) {
                         symbols["__hyst_${varKey}"] ?: if (v >= p1) 1.0 else 0.0
                     } else {
-                        // Stateless fallback: if above midpoint between exit and enter when in momentum
                         if (v >= p1 || (v >= p2 && (symbols["hyst_momentum"] ?: 0.0) >= 0.5)) 1.0 else 0.0
                     }
                 }
                 "n_of_m" -> {
                     val requiredN = p1.toInt().coerceAtLeast(1)
-                    val persistCount = (symbols["persist_count_5"] ?: 0.0).toInt()
-                    if (v >= 0.5 || persistCount >= requiredN) 1.0 else 0.0
+                    val windowM = p2.toInt().coerceIn(1, 16)
+                    val varKey = (arg1 as? Variable)?.name
+                    val hits = if (varKey != null && temporalEngine != null) {
+                        max(
+                            temporalEngine.countTruthyInWindow(varKey, windowM),
+                            (symbols["persist_count_5"] ?: 0.0).toInt()
+                        )
+                    } else {
+                        (symbols["persist_count_5"] ?: 0.0).toInt()
+                    }
+                    if (v >= 0.5 || hits >= requiredN) 1.0 else 0.0
                 }
                 else -> 0.0
             }
@@ -555,28 +505,44 @@ sealed interface CompiledMathExpr {
 
 @Immutable
 sealed interface CompiledBoolExpr {
-    fun eval(symbols: Map<String, Double>): Boolean
+    fun eval(
+        symbols: Map<String, Double>,
+        temporalEngine: TemporalIntelligenceEngine? = null,
+        mutateState: Boolean = true
+    ): Boolean
 
     data class Or(val parts: List<CompiledBoolExpr>) : CompiledBoolExpr {
-        override fun eval(symbols: Map<String, Double>): Boolean {
+        override fun eval(
+            symbols: Map<String, Double>,
+            temporalEngine: TemporalIntelligenceEngine?,
+            mutateState: Boolean
+        ): Boolean {
             for (i in parts.indices) {
-                if (parts[i].eval(symbols)) return true
+                if (parts[i].eval(symbols, temporalEngine, mutateState)) return true
             }
             return false
         }
     }
 
     data class And(val parts: List<CompiledBoolExpr>) : CompiledBoolExpr {
-        override fun eval(symbols: Map<String, Double>): Boolean {
+        override fun eval(
+            symbols: Map<String, Double>,
+            temporalEngine: TemporalIntelligenceEngine?,
+            mutateState: Boolean
+        ): Boolean {
             for (i in parts.indices) {
-                if (!parts[i].eval(symbols)) return false
+                if (!parts[i].eval(symbols, temporalEngine, mutateState)) return false
             }
             return true
         }
     }
 
     data class Not(val inner: CompiledBoolExpr) : CompiledBoolExpr {
-        override fun eval(symbols: Map<String, Double>): Boolean = !inner.eval(symbols)
+        override fun eval(
+            symbols: Map<String, Double>,
+            temporalEngine: TemporalIntelligenceEngine?,
+            mutateState: Boolean
+        ): Boolean = !inner.eval(symbols, temporalEngine, mutateState)
     }
 
     data class Comparison(
@@ -584,9 +550,13 @@ sealed interface CompiledBoolExpr {
         val left: CompiledMathExpr,
         val right: CompiledMathExpr
     ) : CompiledBoolExpr {
-        override fun eval(symbols: Map<String, Double>): Boolean {
-            val l = left.eval(symbols)
-            val r = right.eval(symbols)
+        override fun eval(
+            symbols: Map<String, Double>,
+            temporalEngine: TemporalIntelligenceEngine?,
+            mutateState: Boolean
+        ): Boolean {
+            val l = left.eval(symbols, temporalEngine, mutateState)
+            val r = right.eval(symbols, temporalEngine, mutateState)
             return when (op) {
                 ">=" -> l >= r - 1e-9
                 "<=" -> l <= r + 1e-9
@@ -600,7 +570,11 @@ sealed interface CompiledBoolExpr {
     }
 
     data class MathTruthy(val expr: CompiledMathExpr) : CompiledBoolExpr {
-        override fun eval(symbols: Map<String, Double>): Boolean = abs(expr.eval(symbols)) > 1e-9
+        override fun eval(
+            symbols: Map<String, Double>,
+            temporalEngine: TemporalIntelligenceEngine?,
+            mutateState: Boolean
+        ): Boolean = abs(expr.eval(symbols, temporalEngine, mutateState)) > 1e-9
     }
 }
 
@@ -1023,7 +997,11 @@ object StrategyScriptCompiler {
 
         // Pre-populate rolling & hysteresis lookup keys for DSL functions `roll_mean(...)`, `roll_median(...)`, `ema(...)`, `hysteresis(...)`
         if (temporalEngine != null) {
-            val tracked = listOf("rush_snr", "tick_purity", "ofi", "micro_impulse_score", "tick_speed", "single_tick_dominance", "ftrl_win_prob")
+            val tracked = listOf(
+                "rush_snr", "tick_purity", "ofi", "ofi_imbalance",
+                "micro_impulse_score", "tick_speed", "velocity",
+                "single_tick_dominance", "ftrl_win_prob", "hv_score", "rel_pos", "net_delta_5"
+            )
             for (series in tracked) {
                 map["__roll_mean_$series"] = temporalEngine.rollingMean(series, 4)
                 map["__roll_median_$series"] = temporalEngine.rollingMedian(series, 5)
@@ -1033,6 +1011,7 @@ object StrategyScriptCompiler {
             map["__roll_mean_rush_snr"] = map["roll_snr_3"] ?: rush.rushSnr
             map["__roll_mean_tick_purity"] = map["roll_purity_4"] ?: rush.purityPercent
             map["__roll_median_ofi"] = map["roll_ofi_median_5"] ?: telemetry.orderFlowImbalance
+            map["__roll_median_ofi_imbalance"] = map["roll_ofi_median_5"] ?: telemetry.orderFlowImbalance
             map["__roll_mean_micro_impulse_score"] = map["roll_impulse_4"] ?: telemetry.microstructure.microImpulseScore
         }
         map["__hyst_micro_impulse_score"] = map["hyst_momentum"] ?: 0.0
@@ -1042,13 +1021,35 @@ object StrategyScriptCompiler {
         // Market & Microstructure Telemetry variables
         map["price"] = telemetry.latestPrice.finiteOr(0.0)
         map["ofi"] = telemetry.orderFlowImbalance.finiteOr(0.0)
+        map["ofi_imbalance"] = telemetry.orderFlowImbalance.finiteOr(0.0)
+        map["velocity"] = rush.tickSpeedTps.finiteOr(0.0)
         map["tick_intensity"] = telemetry.tickIntensityRatio.finiteOr(1.0)
         map["micro_impulse_score"] = telemetry.microstructure.microImpulseScore.finiteOr(0.0)
         map["micro_efficiency"] = telemetry.microstructure.directionalEfficiency.finiteOr(0.0)
         map["micro_acceleration"] = telemetry.microstructure.microAcceleration.finiteOr(0.0)
-        map["z_fast"] = telemetry.zFast.finiteOr(0.0)
-        map["z_slow"] = telemetry.zSlow.finiteOr(0.0)
-        map["zlema_spread"] = (telemetry.zFast - telemetry.zSlow).finiteOr(0.0)
+        var resolvedZFast = telemetry.zFast.finiteOr(0.0)
+        var resolvedZSlow = telemetry.zSlow.finiteOr(0.0)
+        if (((resolvedZFast == 0.0 && resolvedZSlow == 0.0) || abs(resolvedZFast - resolvedZSlow) < 1e-12) &&
+            telemetry.recentTicks.size >= 4
+        ) {
+            val ticks = telemetry.recentTicks
+            var emaFast = ticks.first().price
+            var emaSlow = ticks.first().price
+            val alphaFast = 2.0 / (6.0 + 1.0)
+            val alphaSlow = 2.0 / (16.0 + 1.0)
+            for (i in 1 until ticks.size) {
+                val p = ticks[i].price
+                val lagIdx = max(0, i - 2)
+                val deLagged = p + (p - ticks[lagIdx].price)
+                emaFast = alphaFast * deLagged + (1.0 - alphaFast) * emaFast
+                emaSlow = alphaSlow * p + (1.0 - alphaSlow) * emaSlow
+            }
+            resolvedZFast = emaFast.finiteOr(telemetry.latestPrice)
+            resolvedZSlow = emaSlow.finiteOr(telemetry.latestPrice)
+        }
+        map["z_fast"] = resolvedZFast
+        map["z_slow"] = resolvedZSlow
+        map["zlema_spread"] = (resolvedZFast - resolvedZSlow).finiteOr(0.0)
         map["volatility"] = telemetry.volatility.finiteOr(0.0)
         map["consistency"] = telemetry.consistency.finiteOr(0.0)
         map["persistence"] = telemetry.persistence.toDouble()
@@ -1063,26 +1064,44 @@ object StrategyScriptCompiler {
         map["sentiment_pct"] = telemetry.bullishSentimentPercent.toDouble()
         map["trade_duration_sec"] = telemetry.selectedTimeframeSec.toDouble()
 
-        // HighVoltage5s 6 Strict Mathematical Filter Built-In Variables
         val hvFilter = telemetry.highVoltageStatus
         val hvWin = telemetry.hvWindow
-        val zlemaTrendNumeric = when (telemetry.trend) {
-            SignalDirection.UP -> 1.0
-            SignalDirection.DOWN -> -1.0
-            SignalDirection.NONE -> when {
-                telemetry.zFast > telemetry.zSlow -> 1.0
-                telemetry.zFast < telemetry.zSlow -> -1.0
-                else -> 0.0
-            }
+        val zlemaTrendNumeric = when {
+            resolvedZFast > resolvedZSlow + 1e-10 -> 1.0
+            resolvedZFast < resolvedZSlow - 1e-10 -> -1.0
+            telemetry.trend == SignalDirection.UP -> 1.0
+            telemetry.trend == SignalDirection.DOWN -> -1.0
+            else -> dirNumeric
         }
         map["zlema_trend_dir"] = zlemaTrendNumeric
         map["net_delta_5"] = telemetry.netDelta5.finiteOr(hvFilter.netDelta5)
         map["sr_wall_clear"] = if (hvFilter.srObstaclePassed) 1.0 else 0.0
         map["sr_ahead_dist"] = hvFilter.srClearanceAhead.finiteOr(telemetry.srDistance.finiteOr(999.0))
+        map["sr_min_clearance"] = hvFilter.srMinClearanceRequired.finiteOr(
+            if (telemetry.latestPrice in 0.01..15.0) 0.00025 else 0.25
+        )
         map["candle_range_ratio"] = hvFilter.candleRangeRatio.finiteOr(1.0)
         map["vol_compressed"] = if (hvFilter.isCompressed) 1.0 else 0.0
         map["vol_exhausted"] = if (hvFilter.isExhausted) 1.0 else 0.0
         map["vol_regime_ok"] = if (hvFilter.volatilityFilterPassed) 1.0 else 0.0
+        map["opportunity_dir"] = when (hvFilter.opportunityDirection) {
+            SignalDirection.UP -> 1.0
+            SignalDirection.DOWN -> -1.0
+            SignalDirection.NONE -> zlemaTrendNumeric
+        }
+        map["continuation_ready"] = if (hvFilter.continuationReady) 1.0 else 0.0
+        map["sr_bounce_ready"] = if (hvFilter.srBounceReady) 1.0 else 0.0
+        map["mean_rev_ready"] = if (hvFilter.meanReversionReady) 1.0 else 0.0
+        map["any_setup_ready"] = if (hvFilter.allSixFiltersPassed) 1.0 else 0.0
+        map["playbook_type"] = when (hvFilter.activePlaybook) {
+            "CONTINUATION" -> 1.0
+            "SR_BOUNCE" -> 2.0
+            "MEAN_REVERSION" -> 3.0
+            else -> 0.0
+        }
+        map["opportunity_score"] = hvFilter.opportunityScore.finiteOr(0.0)
+        map["support_dist"] = hvFilter.supportDistance.finiteOr(999.0)
+        map["resistance_dist"] = hvFilter.resistanceDistance.finiteOr(999.0)
 
         // HV Window Structural Co-Pilot Built-In Variables
         map["hv_score"] = hvWin.score.finiteOr(0.0)
@@ -1112,7 +1131,7 @@ object StrategyScriptCompiler {
         for (i in script.variables.indices) {
             val v = script.variables[i]
             val value = if (v.compiledExpr != null) {
-                v.compiledExpr.eval(symbols).finiteOr(0.0)
+                v.compiledExpr.eval(symbols, temporalEngine).finiteOr(0.0)
             } else {
                 runCatching { evaluateMathExpression(v.rawExpression, symbols) }
                     .getOrDefault(0.0)
@@ -1123,11 +1142,11 @@ object StrategyScriptCompiler {
 
         // 2. Evaluate [SIGNAL_UP] and [SIGNAL_DOWN] via pre-compiled AST nodes
         val upPassed = script.signalUpRules.isNotEmpty() && script.signalUpRules.all { rule ->
-            rule.compiledBool?.eval(symbols)
+            rule.compiledBool?.eval(symbols, temporalEngine)
                 ?: runCatching { evaluateBooleanCondition(rule.rawCondition, symbols) }.getOrDefault(false)
         }
         val downPassed = script.signalDownRules.isNotEmpty() && script.signalDownRules.all { rule ->
-            rule.compiledBool?.eval(symbols)
+            rule.compiledBool?.eval(symbols, temporalEngine)
                 ?: runCatching { evaluateBooleanCondition(rule.rawCondition, symbols) }.getOrDefault(false)
         }
 
@@ -1145,7 +1164,7 @@ object StrategyScriptCompiler {
         val gateDiagnostics = ArrayList<FilterDiagnostic>(script.gates.size)
         for (idx in script.gates.indices) {
             val gate = script.gates[idx]
-            val rawPassed = gate.compiledBool?.eval(symbols)
+            val rawPassed = gate.compiledBool?.eval(symbols, temporalEngine)
                 ?: runCatching { evaluateBooleanCondition(gate.rawCondition, symbols) }.getOrDefault(false)
             // Apply X13 Temporal Hold Latch only to L2 signal gates (never to L1 hard-rejection, HighVoltage strict filters, or HV Window gates)
             val isHardRejectionGate = gate.name.contains("L1:", ignoreCase = true) ||
@@ -1294,8 +1313,8 @@ object StrategyScriptCompiler {
             return CompiledBoolExpr.And(andParts.map { compileBooleanAst(it, knownVars, strictUnknownCheck) })
         }
 
-        if (trimmed.startsWith("not ") || trimmed.startsWith("!")) {
-            val inner = if (trimmed.startsWith("not ")) trimmed.removePrefix("not ").trim() else trimmed.removePrefix("!").trim()
+        if (trimmed.startsWith("not ", ignoreCase = true) || trimmed.startsWith("!")) {
+            val inner = if (trimmed.startsWith("not ", ignoreCase = true)) trimmed.substring(4).trim() else trimmed.removePrefix("!").trim()
             return CompiledBoolExpr.Not(compileBooleanAst(inner, knownVars, strictUnknownCheck))
         }
 
