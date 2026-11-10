@@ -71,6 +71,7 @@ class TerminalViewModel(
     private val contextEnhancer = ContextEnhancer()
     private val regimeEngine = RegimeDetectionEngine()
     private val modularStrategyEngine = ModularStrategyEngine()
+    @Volatile private var lastPersistedShadowSampleCount: Int = 0
 
     private val tickHistory = ArrayDeque<Tick>(305)
     private val activeOpenTrades = CopyOnWriteArrayList<ActiveOpenTrade>()
@@ -144,6 +145,10 @@ class TerminalViewModel(
 
         backgroundEngineScope.launch(Dispatchers.IO) {
             repository.ensureSeeded()
+            val savedLearningState = runCatching { repository.readSniperLearningState() }.getOrDefault("")
+            if (savedLearningState.isNotBlank() && modularStrategyEngine.restoreLearningState(savedLearningState)) {
+                lastPersistedShadowSampleCount = modularStrategyEngine.learnedSampleCount()
+            }
             val initialPrefs = runCatching { repository.sessionFlow.first() }.getOrNull()
             if (initialPrefs != null) {
                 if (initialPrefs.hourlySniperMode) {
@@ -1154,6 +1159,16 @@ class TerminalViewModel(
             temporalTelemetry = evaluation.temporalTelemetry
         )
         _telemetry.value = updatedState
+
+        // Persist only when a new, fully settled shadow label updates the learner.
+        val learnedSamples = modularStrategyEngine.learnedSampleCount()
+        if (learnedSamples > lastPersistedShadowSampleCount) {
+            val learningSnapshot = modularStrategyEngine.exportLearningState()
+            lastPersistedShadowSampleCount = learnedSamples
+            backgroundEngineScope.launch(Dispatchers.IO) {
+                runCatching { repository.saveSniperLearningState(learningSnapshot) }
+            }
+        }
 
         // 8. Automated Execution Gate:
         //    - Requires _botRunning.value == true (Autopilot Guard not in AVOID standby)
