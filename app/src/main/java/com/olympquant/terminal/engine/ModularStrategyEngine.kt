@@ -102,7 +102,7 @@ class ModularStrategyEngine {
 
     @Synchronized
     private fun getOrCompileScript(scriptCode: String): DslCompileResult {
-        val codeToCompile = scriptCode.ifBlank { DefaultStrategyScripts.DEFAULT_OQS_SCRIPT }
+        val codeToCompile = scriptCode.ifBlank { DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT }
         val hash = codeToCompile.hashCode()
         val existing = cachedCompileResult
         if (existing != null && cachedScriptHash == hash) {
@@ -512,8 +512,8 @@ class ModularStrategyEngine {
             val ftrlWinProbPercent = if (candidateDir != SignalDirection.NONE && rushSnr >= 1.05 && purityPercent >= 55.0) {
                 predictFtrlWinProbability(featureVector) * 100.0
             } else {
-                // During flat noise oscillation, discount probability so UI reflects low continuation odds
-                (predictFtrlWinProbability(featureVector) * 55.0).coerceAtMost(48.0)
+                // No unsupported low-probability prior: an untrained model remains neutral.
+                predictFtrlWinProbability(featureVector) * 100.0
             }
 
             // Enqueue virtual shadow rush at the active timeframe horizon so the model learns online
@@ -589,7 +589,7 @@ class ModularStrategyEngine {
         val probPct = if (rushSnr >= 1.25 && purityPercent >= 68.0) {
             predictFtrlWinProbability(featureVector) * 100.0
         } else {
-            42.0
+            50.0
         }
         return RawTickRushMetrics(
             rushDirection = candidateDir,
