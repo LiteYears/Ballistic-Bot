@@ -164,21 +164,10 @@ fun OlympQuantRoot(vm: TerminalViewModel) {
     var currentTab by rememberSaveable { mutableStateOf(WorkstationTab.TERMINAL) }
     val haptics = LocalHapticFeedback.current
     val activeBalance = if (sessionPrefs.accountGroup == "real") sessionPrefs.realBalance else sessionPrefs.demoBalance
-    val loadedStrategy = remember(strategies, sessionPrefs.selectedTimeframeSec) {
-        val base = strategies.firstOrNull { it.isEnabled }
+    val loadedStrategy = remember(strategies) {
+        strategies.firstOrNull { it.isEnabled }
             ?: strategies.firstOrNull()
-            ?: HardLockedMandate.highVoltageStrategyConfig(durationSec = sessionPrefs.selectedTimeframeSec)
-        val tfSec = com.olympquant.terminal.domain.TradeTimeframe.fromSeconds(
-            sessionPrefs.selectedTimeframeSec.takeIf { it > 0 } ?: base.durationSeconds
-        ).seconds
-        if (base.durationSeconds != tfSec) {
-            base.copy(
-                durationSeconds = tfSec,
-                scriptCode = com.olympquant.terminal.engine.DefaultStrategyScripts.withDurationSec(base.scriptCode, tfSec)
-            )
-        } else {
-            base
-        }
+            ?: HardLockedMandate.lockedStrategyConfig()
     }
 
     if (currentTab != WorkstationTab.TERMINAL) {
