@@ -194,7 +194,8 @@ class ModularStrategyEngine {
         val rush = extractRawTickRushMetrics(telemetry)
         val temporalSnapshot = temporalEngine.pushObservationFrame(telemetry, rush, wsLatencyMs)
         val enrichedTelemetry = telemetry.copy(temporalTelemetry = temporalSnapshot)
-        val compiled = getOrCompileScript(strategy.scriptCode)
+        // Execution is hard-locked to the canonical Sniper M script; the DSL compiler remains reusable for diagnostics/tests.
+        val compiled = getOrCompileScript(DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT)
         val parsedScript = compiled.parsedScript
 
         if (!compiled.isValid || parsedScript == null) {
