@@ -195,16 +195,6 @@ object HardLockedMandate {
         isEnabled = true
     )
 
-    fun highVoltageStrategyConfig(durationSec: Int = LOCKED_DURATION_SEC): StrategyConfig = fromScript(
-        id = 1L,
-        scriptCode = DefaultStrategyScripts.withDurationSec(
-            DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT,
-            durationSec
-        ),
-        isPreset = true,
-        isEnabled = true
-    )
-
     fun fromScript(
         id: Long,
         scriptCode: String,
