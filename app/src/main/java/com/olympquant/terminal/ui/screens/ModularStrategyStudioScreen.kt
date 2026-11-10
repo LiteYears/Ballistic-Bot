@@ -1112,7 +1112,7 @@ fun ModularStrategyStudioScreen(
                             }
                         }
                     },
-                    enabled = compiledPreview.isValid,
+                    enabled = false,
                     colors = ButtonDefaults.buttonColors(
                         containerColor = BullishGreen,
                         disabledContainerColor = SlateBorder
@@ -1120,13 +1120,12 @@ fun ModularStrategyStudioScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .heightIn(min = 48.dp)
-                        .testTag("compile_and_load_oqs_button"),
-                    enabled = false
+                        .testTag("compile_and_load_oqs_button")
                 ) {
                     Icon(Icons.Default.Terminal, contentDescription = null, tint = DeepObsidian, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
                     Text(
-                        text = "COMPILE & LOAD STRATEGY (.OQS)",
+                        text = "SNIPER M SOURCE LOCKED",
                         style = MaterialTheme.typography.labelLarge,
                         color = DeepObsidian,
                         fontWeight = FontWeight.Bold,
@@ -1163,28 +1162,19 @@ fun ModularStrategyStudioScreen(
                     }
 
                     OutlinedButton(
-                        onClick = {
-                            val clip = clipboardManager.getText()?.text
-                            if (!clip.isNullOrBlank()) {
-                                editorText = clip
-                                statusBanner = "Pasted .oqs script from clipboard — Review & tap COMPILE & LOAD."
-                                statusIsError = false
-                            } else {
-                                statusBanner = "Clipboard is empty."
-                                statusIsError = true
-                            }
-                        },
+                        onClick = {},
+                        enabled = false,
                         modifier = Modifier
                             .weight(1f)
                             .heightIn(min = 44.dp)
                             .testTag("paste_oqs_script_button")
                     ) {
-                        Icon(Icons.Default.ContentPaste, contentDescription = "Paste Script", tint = TextPrimary, modifier = Modifier.size(15.dp))
+                        Icon(Icons.Default.ContentPaste, contentDescription = "Script editing disabled", tint = TextMuted, modifier = Modifier.size(15.dp))
                         Spacer(Modifier.width(6.dp))
                         Text(
-                            text = "PASTE SCRIPT",
+                            text = "EDITING LOCKED",
                             style = MaterialTheme.typography.labelMedium,
-                            color = TextPrimary,
+                            color = TextMuted,
                             fontWeight = FontWeight.Bold,
                             maxLines = 1
                         )
