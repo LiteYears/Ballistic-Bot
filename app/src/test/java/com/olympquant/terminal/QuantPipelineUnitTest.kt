@@ -182,7 +182,7 @@ class QuantPipelineUnitTest {
     @Test
     fun `test OQS Strategy Script Compiler, uniform 6-block structure, and custom loaded strategy execution`() {
         val defaultCompiled = com.olympquant.terminal.engine.StrategyScriptCompiler.compile(
-            DefaultStrategyScripts.DEFAULT_OQS_SCRIPT
+            DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT
         )
         assertTrue(defaultCompiled.isValid)
         assertNotNull(defaultCompiled.parsedScript)
@@ -290,7 +290,7 @@ class QuantPipelineUnitTest {
     @Test
     fun `test X13 Temporal Intelligence Engine rolling windows hysteresis N-of-M persistence and 3-layer architecture`() {
         val x13Compiled = com.olympquant.terminal.engine.StrategyScriptCompiler.compile(
-            DefaultStrategyScripts.X13_TEMPORAL_OQS_SCRIPT
+            DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT
         )
         assertTrue(x13Compiled.isValid)
         assertNotNull(x13Compiled.parsedScript)
@@ -735,7 +735,7 @@ class QuantPipelineUnitTest {
         val snapshotSymbols = strategyEngine.getLiveSymbolSnapshot(
             telemetry = fxTelemetry.copy(orderFlowImbalance = 44.5),
             wsLatencyMs = 28L,
-            scriptCode = DefaultStrategyScripts.HIGH_VOLTAGE_OQS_SCRIPT
+            scriptCode = DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT
         )
         val countAfter = strategyEngine.temporalEngine.rollingMean("rush_snr", 4)
         assertEquals("getLiveSymbolSnapshot must not mutate rolling window state", countBefore, countAfter, 1e-9)
@@ -886,30 +886,13 @@ class QuantPipelineUnitTest {
         )
         assertFalse("Momentum opposing smoothed tick direction must not execute", unalignedSmoothEval.readyToExecute)
 
-        // 4. Verify Timeframe-Aware Shadow Learning: 15s timeframe settles after 15,000ms (not 5,000ms)
-        val freshEngine = ModularStrategyEngine()
-        val noiseTicks = (0 until 14).map { i ->
-            val offset = if (i % 2 == 0) 0.15 else -0.15
-            Tick(pair = "LATAM_X", price = 4500.0 + offset, timeMs = baseTimeMs + i * 240L)
-        }
-        val lastNoiseTs = noiseTicks.last().timeMs
-        val lastNoiseP = noiseTicks.last().price
-        val rushTicks = noiseTicks + listOf(0.42, 0.88, 1.38, 1.92).mapIndexed { idx, cum ->
-            Tick(pair = "LATAM_X", price = lastNoiseP + cum, timeMs = lastNoiseTs + (idx + 1) * 140L)
-        }
-        // Enqueue shadow rush with 15s timeframe
-        freshEngine.extractRawTickRushMetrics(
-            MarketTelemetryState(
-                pair = "LATAM_X",
-                latestPrice = rushTicks.last().price,
-                latestTimeMs = rushTicks.last().timeMs,
-                tickCount = rushTicks.size,
-                recentTicks = rushTicks,
-                selectedTimeframeSec = 15
-            )
+        // 4. Sniper M always labels the exact five-second horizon, independent of UI timeframe.
+        // A tick arriving at +6s brackets the +5s target; interpolation must settle at +6s arrival.
+        val tickAt6s = Tick(
+            pair = "LATAM_X",
+            price = rushTicks.last().price + 0.8,
+            timeMs = rushTicks.last().timeMs + 6_000L
         )
-        // At +6,000ms (< 15,000ms), 15s shadow rush must NOT have settled yet
-        val tickAt6s = Tick(pair = "LATAM_X", price = rushTicks.last().price + 0.8, timeMs = rushTicks.last().timeMs + 6_000L)
         val metricsAt6s = freshEngine.extractRawTickRushMetrics(
             MarketTelemetryState(
                 pair = "LATAM_X",
@@ -920,21 +903,8 @@ class QuantPipelineUnitTest {
                 selectedTimeframeSec = 15
             )
         )
-        assertEquals("15s shadow trade must not settle at 6s", 0, metricsAt6s.shadowSamplesLearned)
+        assertTrue("Sniper M must settle a bracketed five-second shadow at the first post-horizon tick", metricsAt6s.shadowSamplesLearned >= 1)
 
-        // At +15,500ms (>= 15,000ms), 15s shadow rush settles and updates FTRL weights
-        val tickAt15s = Tick(pair = "LATAM_X", price = rushTicks.last().price + 1.4, timeMs = rushTicks.last().timeMs + 15_500L)
-        val metricsAt15s = freshEngine.extractRawTickRushMetrics(
-            MarketTelemetryState(
-                pair = "LATAM_X",
-                latestPrice = tickAt15s.price,
-                latestTimeMs = tickAt15s.timeMs,
-                tickCount = rushTicks.size + 2,
-                recentTicks = rushTicks + tickAt6s + tickAt15s,
-                selectedTimeframeSec = 15
-            )
-        )
-        assertTrue("15s shadow trade must settle after 15,000ms", metricsAt15s.shadowSamplesLearned >= 1)
     }
 
     @Test
