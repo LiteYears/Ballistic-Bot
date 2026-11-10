@@ -29,9 +29,6 @@ import kotlin.math.sqrt
 object DefaultStrategyScripts {
 
     const val SNIPER_M_STRATEGY_NAME = "Sniper M"
-    const val DEFAULT_STRATEGY_NAME = SNIPER_M_STRATEGY_NAME
-    const val HIGH_VOLTAGE_STRATEGY_NAME = SNIPER_M_STRATEGY_NAME
-    const val X13_TEMPORAL_STRATEGY_NAME = SNIPER_M_STRATEGY_NAME
 
     val SNIPER_M_OQS_SCRIPT: String = """
 # ============================================================================
@@ -94,10 +91,6 @@ gate "2. Tick Stream Surge (SNR >= 1.25x & Speed >= 1.15 T/s)" : rush_snr >= 1.2
 gate "3. Clean Surge Purity (>= 65% & No 1-Tick Glitch)" : tick_purity >= 65.0 and tip_aligned == 1 and single_tick_dominance <= 65.0 and ws_latency_ms <= 250
 """.trimIndent()
 
-    val DEFAULT_OQS_SCRIPT: String = SNIPER_M_OQS_SCRIPT
-    val HIGH_VOLTAGE_OQS_SCRIPT: String = SNIPER_M_OQS_SCRIPT
-    val X13_TEMPORAL_OQS_SCRIPT: String = SNIPER_M_OQS_SCRIPT
-
     fun withDurationSec(scriptCode: String, durationSec: Int): String {
         val validSec = durationSec.coerceIn(5, 900)
         val regex = Regex("""(?m)^(\s*duration_sec\s*=\s*)\d+(.*)$""")
@@ -108,66 +101,6 @@ gate "3. Clean Surge Purity (>= 65% & No 1-Tick Glitch)" : tick_purity >= 65.0 a
         }
     }
 
-    fun buildNewStrategyTemplate(customName: String, durationSec: Int = 5): String {
-        val cleanName = customName.trim().ifEmpty { SNIPER_M_STRATEGY_NAME }.replace("\"", "")
-        val validSec = durationSec.coerceIn(5, 900)
-        return """
-# ============================================================================
-# OLYMPQUANT — SNIPER M TEMPLATE (.oqs)
-# ============================================================================
-
-[META]
-name = "$cleanName"
-version = "8.0"
-author = "OlympQuant Core"
-description = "Analyzes raw tick stream data, smooths it with a zero-lag filter, follows directional momentum, and places a trade when an active tick stream surge aligns with the smoothed direction."
-
-[EXECUTION]
-duration_sec = $validSec
-stake_mode = "PERCENT_BALANCE"
-stake_value = 5.0
-min_stake_usd = 1.0
-max_stake_usd = 4000.0
-cooldown_ms = 4000
-min_payout_pct = 75
-min_confidence = 58.0
-max_daily_trades = 10
-max_consecutive_losses = 3
-
-[VARIABLES]
-let smooth_spread = z_fast - z_slow
-let surge_snr = max(rush_snr, roll_mean(rush_snr, 3))
-let surge_purity = max(tick_purity, roll_mean(tick_purity, 4))
-let surge_power = (surge_snr * 0.65) + (tick_convexity * 0.35)
-
-[SIGNAL_UP]
-rush_dir == UP
-zlema_trend_dir == UP
-rush_snr >= 1.25
-tick_purity >= 65.0
-tip_aligned == 1
-cleared_noise_mean == 1
-tick_convexity >= 0.55
-tick_speed >= 1.15
-single_tick_dominance <= 65.0
-
-[SIGNAL_DOWN]
-rush_dir == DOWN
-zlema_trend_dir == DOWN
-rush_snr >= 1.25
-tick_purity >= 65.0
-tip_aligned == 1
-cleared_noise_mean == 1
-tick_convexity >= 0.55
-tick_speed >= 1.15
-single_tick_dominance <= 65.0
-
-[GATES]
-gate "1. Smoothed Tick Direction & Momentum" : (rush_dir == UP and zlema_trend_dir == UP) or (rush_dir == DOWN and zlema_trend_dir == DOWN)
-gate "2. Tick Stream Surge (SNR >= 1.25x & Speed >= 1.15 T/s)" : rush_snr >= 1.25 and tick_speed >= 1.15 and cleared_noise_mean == 1 and tick_convexity >= 0.55
-gate "3. Clean Surge Purity (>= 65% & No 1-Tick Glitch)" : tick_purity >= 65.0 and tip_aligned == 1 and single_tick_dominance <= 65.0 and ws_latency_ms <= 250
-""".trimIndent()
-    }
 
     @Immutable
     data class VariableDoc(
