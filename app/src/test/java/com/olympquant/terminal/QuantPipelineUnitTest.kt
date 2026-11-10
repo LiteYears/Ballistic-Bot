@@ -26,6 +26,26 @@ import org.junit.Test
 class QuantPipelineUnitTest {
 
     @Test
+    fun `test FTRL starts neutral and restores only validated persisted state`() {
+        val original = ModularStrategyEngine()
+        val features = DoubleArray(11).also {
+            it[0] = 1.0
+            it[1] = 1.0
+            it[2] = 0.5
+        }
+        assertEquals(0.5, original.predictFtrlWinProbability(features), 1e-9)
+
+        original.updateFtrlWeightsOnline(features, 1.0)
+        val expectedProbability = original.predictFtrlWinProbability(features)
+        val snapshot = original.exportLearningState()
+
+        val restored = ModularStrategyEngine()
+        assertTrue(restored.restoreLearningState(snapshot))
+        assertEquals(expectedProbability, restored.predictFtrlWinProbability(features), 1e-9)
+        assertFalse(restored.restoreLearningState("corrupt|state"))
+    }
+
+    @Test
     fun `test HardLockedMandate stake sizing enforces 1 min, 5 percent balance, and 4000 max`() {
         assertEquals(1.0, HardLockedMandate.computeLockedStake(0.0), 1e-6)
         assertEquals(1.0, HardLockedMandate.computeLockedStake(10.0), 1e-6)
@@ -180,20 +200,14 @@ class QuantPipelineUnitTest {
     }
 
     @Test
-    fun `test OQS Strategy Script Compiler, uniform 6-block structure, and custom loaded strategy execution`() {
+    fun `test OQS parser diagnostics while live execution remains hard-locked to Sniper M`() {
         val defaultCompiled = com.olympquant.terminal.engine.StrategyScriptCompiler.compile(
-            DefaultStrategyScripts.DEFAULT_OQS_SCRIPT
+            DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT
         )
         assertTrue(defaultCompiled.isValid)
         assertNotNull(defaultCompiled.parsedScript)
         assertEquals("Sniper M", defaultCompiled.parsedScript!!.name)
         assertEquals(5, defaultCompiled.parsedScript!!.execution.durationSec)
-
-        // Verify template generator follows the exact same 6-block structure
-        val templateCode = DefaultStrategyScripts.buildNewStrategyTemplate("Alpha_Custom_10s")
-        val templateCompiled = com.olympquant.terminal.engine.StrategyScriptCompiler.compile(templateCode)
-        assertTrue(templateCompiled.isValid)
-        assertEquals("Alpha_Custom_10s", templateCompiled.parsedScript!!.name)
 
         // Verify custom user-programmed strategy with custom [EXECUTION], [VARIABLES], [SIGNAL_UP], [SIGNAL_DOWN], and [GATES]
         val customOqs = """
@@ -263,17 +277,16 @@ class QuantPipelineUnitTest {
             zSlow = 4500.2
         )
 
+        // A custom script can still be parsed for diagnostics, but the live engine must ignore it.
         val engine = ModularStrategyEngine()
         val eval = engine.evaluateStrategy(
             strategy = customConfig,
             telemetry = telemetry,
             wsLatencyMs = 45L
         )
-        assertEquals("User_Custom_Reversal_15s", eval.strategyName)
-        assertEquals(SignalDirection.UP, eval.finalSignal)
-        assertEquals(2, eval.filterDiagnostics.size)
-        assertEquals("Custom Ratio Gate", eval.filterDiagnostics[0].gateTitle)
-        assertTrue(eval.readyToExecute)
+        assertEquals("Sniper M", eval.strategyName)
+        assertEquals(58.0, eval.minConfidenceRequired, 1e-6)
+        assertTrue("Live execution must retain Sniper M's five-second script", eval.triggerReason.contains("5s"))
 
         // Verify syntax error reporting when a mandatory block or unknown variable is used
         val brokenOqs = """
@@ -290,7 +303,7 @@ class QuantPipelineUnitTest {
     @Test
     fun `test X13 Temporal Intelligence Engine rolling windows hysteresis N-of-M persistence and 3-layer architecture`() {
         val x13Compiled = com.olympquant.terminal.engine.StrategyScriptCompiler.compile(
-            DefaultStrategyScripts.X13_TEMPORAL_OQS_SCRIPT
+            DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT
         )
         assertTrue(x13Compiled.isValid)
         assertNotNull(x13Compiled.parsedScript)
@@ -298,7 +311,7 @@ class QuantPipelineUnitTest {
 
         val x13Strategy = HardLockedMandate.fromScript(
             id = 1L,
-            scriptCode = DefaultStrategyScripts.X13_TEMPORAL_OQS_SCRIPT,
+            scriptCode = DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT,
             isPreset = true,
             isEnabled = true
         )
@@ -479,20 +492,14 @@ class QuantPipelineUnitTest {
     }
 
     @Test
-    fun `test HighVoltage5s 6 strict mathematical filters, HV Window states, TIGHT_CHOP and CRAZY_WHIPSAW traps, and Trade Timeframe Expansion`() {
-        // 1. Verify Trade Timeframe Expansion (5s, 15s, 30s, 45s, 1m / 60s)
-        val timeframes = com.olympquant.terminal.domain.TradeTimeframe.entries
-        assertEquals(listOf(5, 15, 30, 45, 60), timeframes.map { it.seconds })
-        assertEquals(listOf("5s", "15s", "30s", "45s", "1m"), timeframes.map { it.label })
-
-        for (tf in timeframes) {
-            val hvConfig = HardLockedMandate.highVoltageStrategyConfig(durationSec = tf.seconds)
-            assertEquals("Sniper M", hvConfig.name)
-            assertEquals(tf.seconds, hvConfig.durationSeconds)
-            val compiled = StrategyScriptCompiler.compile(hvConfig.scriptCode)
-            assertTrue("Sniper M script for ${tf.label} must compile cleanly: ${compiled.errors}", compiled.isValid)
-            assertEquals(tf.seconds, compiled.parsedScript?.execution?.durationSec)
-        }
+    fun `test Sniper M five-second lock, strict mathematical filters, HV Window states, and chop/whipsaw guards`() {
+        // 1. Sniper M has one immutable five-second execution horizon.
+        val lockedConfig = HardLockedMandate.lockedStrategyConfig()
+        assertEquals("Sniper M", lockedConfig.name)
+        assertEquals(5, lockedConfig.durationSeconds)
+        val compiledLocked = StrategyScriptCompiler.compile(lockedConfig.scriptCode)
+        assertTrue("Canonical Sniper M script must compile cleanly: ${compiledLocked.errors}", compiledLocked.isValid)
+        assertEquals(5, compiledLocked.parsedScript?.execution?.durationSec)
 
         // 2. Verify Clean Breakout Momentum -> HV Window EXCELLENT (>=75%) and all 6 HighVoltage filters PASS
         val candleEngine = CandleEngine()
@@ -539,7 +546,7 @@ class QuantPipelineUnitTest {
 
         // Evaluate HighVoltage5s_HVWindow strategy across expanded 30s timeframe:
         val strategyEngine = ModularStrategyEngine()
-        val hv30sStrategy = HardLockedMandate.highVoltageStrategyConfig(durationSec = 30)
+        val hv30sStrategy = HardLockedMandate.lockedStrategyConfig()
         val cleanTelemetry = MarketTelemetryState(
             pair = "LATAM_X",
             latestPrice = cleanBreakoutTicks.last().price,
@@ -711,7 +718,7 @@ class QuantPipelineUnitTest {
             selectedTimeframeSec = 5
         )
         val fxEval = strategyEngine.evaluateStrategy(
-            strategy = HardLockedMandate.highVoltageStrategyConfig(durationSec = 5),
+            strategy = HardLockedMandate.lockedStrategyConfig(),
             telemetry = fxTelemetry,
             wsLatencyMs = 28L
         )
@@ -735,7 +742,7 @@ class QuantPipelineUnitTest {
         val snapshotSymbols = strategyEngine.getLiveSymbolSnapshot(
             telemetry = fxTelemetry.copy(orderFlowImbalance = 44.5),
             wsLatencyMs = 28L,
-            scriptCode = DefaultStrategyScripts.HIGH_VOLTAGE_OQS_SCRIPT
+            scriptCode = DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT
         )
         val countAfter = strategyEngine.temporalEngine.rollingMean("rush_snr", 4)
         assertEquals("getLiveSymbolSnapshot must not mutate rolling window state", countBefore, countAfter, 1e-9)
@@ -810,12 +817,12 @@ class QuantPipelineUnitTest {
     }
 
     @Test
-    fun `test Audited Mathematical Guards block context traps low consistency climax exhaustion and settle shadow learning at selected timeframe`() {
+    fun `test Audited Mathematical Guards block context traps and settle Sniper M shadow learning at five seconds`() {
         val baseTimeMs = 1700000000000L
         val candleEngine = CandleEngine()
         val indicatorEngine = IndicatorEngine()
         val strategyEngine = ModularStrategyEngine()
-        val hvStrategy = HardLockedMandate.highVoltageStrategyConfig(durationSec = 15)
+        val hvStrategy = HardLockedMandate.lockedStrategyConfig()
 
         // 1. Build clean breakout baseline
         val cleanTicks = mutableListOf<Tick>()
@@ -886,30 +893,13 @@ class QuantPipelineUnitTest {
         )
         assertFalse("Momentum opposing smoothed tick direction must not execute", unalignedSmoothEval.readyToExecute)
 
-        // 4. Verify Timeframe-Aware Shadow Learning: 15s timeframe settles after 15,000ms (not 5,000ms)
-        val freshEngine = ModularStrategyEngine()
-        val noiseTicks = (0 until 14).map { i ->
-            val offset = if (i % 2 == 0) 0.15 else -0.15
-            Tick(pair = "LATAM_X", price = 4500.0 + offset, timeMs = baseTimeMs + i * 240L)
-        }
-        val lastNoiseTs = noiseTicks.last().timeMs
-        val lastNoiseP = noiseTicks.last().price
-        val rushTicks = noiseTicks + listOf(0.42, 0.88, 1.38, 1.92).mapIndexed { idx, cum ->
-            Tick(pair = "LATAM_X", price = lastNoiseP + cum, timeMs = lastNoiseTs + (idx + 1) * 140L)
-        }
-        // Enqueue shadow rush with 15s timeframe
-        freshEngine.extractRawTickRushMetrics(
-            MarketTelemetryState(
-                pair = "LATAM_X",
-                latestPrice = rushTicks.last().price,
-                latestTimeMs = rushTicks.last().timeMs,
-                tickCount = rushTicks.size,
-                recentTicks = rushTicks,
-                selectedTimeframeSec = 15
-            )
+        // 4. Sniper M always labels the exact five-second horizon, independent of UI timeframe.
+        // A tick arriving at +6s brackets the +5s target; interpolation must settle at +6s arrival.
+        val tickAt6s = Tick(
+            pair = "LATAM_X",
+            price = rushTicks.last().price + 0.8,
+            timeMs = rushTicks.last().timeMs + 6_000L
         )
-        // At +6,000ms (< 15,000ms), 15s shadow rush must NOT have settled yet
-        val tickAt6s = Tick(pair = "LATAM_X", price = rushTicks.last().price + 0.8, timeMs = rushTicks.last().timeMs + 6_000L)
         val metricsAt6s = freshEngine.extractRawTickRushMetrics(
             MarketTelemetryState(
                 pair = "LATAM_X",
@@ -920,21 +910,8 @@ class QuantPipelineUnitTest {
                 selectedTimeframeSec = 15
             )
         )
-        assertEquals("15s shadow trade must not settle at 6s", 0, metricsAt6s.shadowSamplesLearned)
+        assertTrue("Sniper M must settle a bracketed five-second shadow at the first post-horizon tick", metricsAt6s.shadowSamplesLearned >= 1)
 
-        // At +15,500ms (>= 15,000ms), 15s shadow rush settles and updates FTRL weights
-        val tickAt15s = Tick(pair = "LATAM_X", price = rushTicks.last().price + 1.4, timeMs = rushTicks.last().timeMs + 15_500L)
-        val metricsAt15s = freshEngine.extractRawTickRushMetrics(
-            MarketTelemetryState(
-                pair = "LATAM_X",
-                latestPrice = tickAt15s.price,
-                latestTimeMs = tickAt15s.timeMs,
-                tickCount = rushTicks.size + 2,
-                recentTicks = rushTicks + tickAt6s + tickAt15s,
-                selectedTimeframeSec = 15
-            )
-        )
-        assertTrue("15s shadow trade must settle after 15,000ms", metricsAt15s.shadowSamplesLearned >= 1)
     }
 
     @Test

@@ -195,16 +195,6 @@ object HardLockedMandate {
         isEnabled = true
     )
 
-    fun highVoltageStrategyConfig(durationSec: Int = LOCKED_DURATION_SEC): StrategyConfig = fromScript(
-        id = 1L,
-        scriptCode = DefaultStrategyScripts.withDurationSec(
-            DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT,
-            durationSec
-        ),
-        isPreset = true,
-        isEnabled = true
-    )
-
     fun fromScript(
         id: Long,
         scriptCode: String,
@@ -448,7 +438,7 @@ data class StrategyConfig(
     val triggerThreshold: Double,
     val regimeAdaptiveMode: RegimeAdaptiveMode,
     val filters: List<StrategyFilterRule>,
-    val scriptCode: String = DefaultStrategyScripts.DEFAULT_OQS_SCRIPT,
+    val scriptCode: String = DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT,
     val stakeMode: String = "PERCENT_BALANCE",
     val stakeValue: Double = HardLockedMandate.BALANCE_STAKE_PERCENT,
     val minStakeUsd: Double = HardLockedMandate.MIN_STAKE_USD,
@@ -499,17 +489,17 @@ data class TemporalTelemetrySnapshot(
     val snrHysteresisActive: Boolean = false,
     val persistenceCount5: Int = 0,
     val noiseClean: Boolean = true,
-    val upWinRatePercent: Double = 66.0,
-    val downWinRatePercent: Double = 66.0,
-    val regimeWinRatePercent: Double = 66.0,
+    val upWinRatePercent: Double = 50.0,
+    val downWinRatePercent: Double = 50.0,
+    val regimeWinRatePercent: Double = 50.0,
     val regimeSnrThreshold: Double = 1.32,
     val regimePurityThreshold: Double = 70.0,
-    val gateStabilityPercent: Double = 92.5,
-    val falsePositiveRatePercent: Double = 6.8,
-    val impulseDetectionRatePercent: Double = 84.0,
-    val signalLatencyMs: Long = 165L,
-    val calibrationAccuracyPercent: Double = 83.2,
-    val oosExpectancyPercent: Double = 18.4
+    val gateStabilityPercent: Double = 0.0,
+    val falsePositiveRatePercent: Double = 0.0,
+    val impulseDetectionRatePercent: Double = 0.0,
+    val signalLatencyMs: Long = 0L,
+    val calibrationAccuracyPercent: Double = 0.0,
+    val oosExpectancyPercent: Double = 0.0
 )
 
 @Immutable

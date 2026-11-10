@@ -29,9 +29,6 @@ import kotlin.math.sqrt
 object DefaultStrategyScripts {
 
     const val SNIPER_M_STRATEGY_NAME = "Sniper M"
-    const val DEFAULT_STRATEGY_NAME = SNIPER_M_STRATEGY_NAME
-    const val HIGH_VOLTAGE_STRATEGY_NAME = SNIPER_M_STRATEGY_NAME
-    const val X13_TEMPORAL_STRATEGY_NAME = SNIPER_M_STRATEGY_NAME
 
     val SNIPER_M_OQS_SCRIPT: String = """
 # ============================================================================
@@ -60,12 +57,6 @@ min_confidence = 58.0
 max_daily_trades = 10
 max_consecutive_losses = 3
 
-[VARIABLES]
-let smooth_spread = z_fast - z_slow
-let surge_snr = max(rush_snr, roll_mean(rush_snr, 3))
-let surge_purity = max(tick_purity, roll_mean(tick_purity, 4))
-let surge_power = (surge_snr * 0.65) + (tick_convexity * 0.35)
-
 [SIGNAL_UP]
 rush_dir == UP
 zlema_trend_dir == UP
@@ -93,81 +84,6 @@ gate "1. Smoothed Tick Direction & Momentum" : (rush_dir == UP and zlema_trend_d
 gate "2. Tick Stream Surge (SNR >= 1.25x & Speed >= 1.15 T/s)" : rush_snr >= 1.25 and tick_speed >= 1.15 and cleared_noise_mean == 1 and tick_convexity >= 0.55
 gate "3. Clean Surge Purity (>= 65% & No 1-Tick Glitch)" : tick_purity >= 65.0 and tip_aligned == 1 and single_tick_dominance <= 65.0 and ws_latency_ms <= 250
 """.trimIndent()
-
-    val DEFAULT_OQS_SCRIPT: String = SNIPER_M_OQS_SCRIPT
-    val HIGH_VOLTAGE_OQS_SCRIPT: String = SNIPER_M_OQS_SCRIPT
-    val X13_TEMPORAL_OQS_SCRIPT: String = SNIPER_M_OQS_SCRIPT
-
-    fun withDurationSec(scriptCode: String, durationSec: Int): String {
-        val validSec = durationSec.coerceIn(5, 900)
-        val regex = Regex("""(?m)^(\s*duration_sec\s*=\s*)\d+(.*)$""")
-        return if (regex.containsMatchIn(scriptCode)) {
-            regex.replace(scriptCode, "$1$validSec$2")
-        } else {
-            scriptCode
-        }
-    }
-
-    fun buildNewStrategyTemplate(customName: String, durationSec: Int = 5): String {
-        val cleanName = customName.trim().ifEmpty { SNIPER_M_STRATEGY_NAME }.replace("\"", "")
-        val validSec = durationSec.coerceIn(5, 900)
-        return """
-# ============================================================================
-# OLYMPQUANT — SNIPER M TEMPLATE (.oqs)
-# ============================================================================
-
-[META]
-name = "$cleanName"
-version = "8.0"
-author = "OlympQuant Core"
-description = "Analyzes raw tick stream data, smooths it with a zero-lag filter, follows directional momentum, and places a trade when an active tick stream surge aligns with the smoothed direction."
-
-[EXECUTION]
-duration_sec = $validSec
-stake_mode = "PERCENT_BALANCE"
-stake_value = 5.0
-min_stake_usd = 1.0
-max_stake_usd = 4000.0
-cooldown_ms = 4000
-min_payout_pct = 75
-min_confidence = 58.0
-max_daily_trades = 10
-max_consecutive_losses = 3
-
-[VARIABLES]
-let smooth_spread = z_fast - z_slow
-let surge_snr = max(rush_snr, roll_mean(rush_snr, 3))
-let surge_purity = max(tick_purity, roll_mean(tick_purity, 4))
-let surge_power = (surge_snr * 0.65) + (tick_convexity * 0.35)
-
-[SIGNAL_UP]
-rush_dir == UP
-zlema_trend_dir == UP
-rush_snr >= 1.25
-tick_purity >= 65.0
-tip_aligned == 1
-cleared_noise_mean == 1
-tick_convexity >= 0.55
-tick_speed >= 1.15
-single_tick_dominance <= 65.0
-
-[SIGNAL_DOWN]
-rush_dir == DOWN
-zlema_trend_dir == DOWN
-rush_snr >= 1.25
-tick_purity >= 65.0
-tip_aligned == 1
-cleared_noise_mean == 1
-tick_convexity >= 0.55
-tick_speed >= 1.15
-single_tick_dominance <= 65.0
-
-[GATES]
-gate "1. Smoothed Tick Direction & Momentum" : (rush_dir == UP and zlema_trend_dir == UP) or (rush_dir == DOWN and zlema_trend_dir == DOWN)
-gate "2. Tick Stream Surge (SNR >= 1.25x & Speed >= 1.15 T/s)" : rush_snr >= 1.25 and tick_speed >= 1.15 and cleared_noise_mean == 1 and tick_convexity >= 0.55
-gate "3. Clean Surge Purity (>= 65% & No 1-Tick Glitch)" : tick_purity >= 65.0 and tip_aligned == 1 and single_tick_dominance <= 65.0 and ws_latency_ms <= 250
-""".trimIndent()
-    }
 
     @Immutable
     data class VariableDoc(
@@ -177,100 +93,38 @@ gate "3. Clean Surge Purity (>= 65% & No 1-Tick Glitch)" : tick_purity >= 65.0 a
     )
 
     val BUILTIN_VARIABLE_DOCS: List<VariableDoc> = listOf(
-        VariableDoc("zlema_trend_dir", "UP/DOWN", "HighVoltage Filter 1: ZLEMA Fast(10) vs Slow(30) trend (UP=1, DOWN=-1, NONE=0)"),
-        VariableDoc("tick_speed", "T/s", "HighVoltage Filter 2: 3-second tick speed in ticks/sec (minVelocity >= 1.5)"),
-        VariableDoc("rel_pos", "%", "HighVoltage Filter 3: 50-tick range breakout position (UP >= 80%, DOWN <= 20%)"),
-        VariableDoc("net_delta_5", "px", "HighVoltage Filter 4: Net price displacement over last 6 ticks (>0 UP, <0 DOWN)"),
-        VariableDoc("sr_wall_clear", "0/1", "HighVoltage Filter 5: 1 if no S/R wall within scale-adjusted clearance ahead of trade"),
-        VariableDoc("sr_ahead_dist", "px", "HighVoltage Filter 5: Distance in points to nearest S/R wall ahead of trade"),
-        VariableDoc("sr_min_clearance", "px", "HighVoltage Filter 5: Scale-adjusted minimum S/R clearance (0.25 idx / 0.00025 FX)"),
-        VariableDoc("candle_range_ratio", "x", "HighVoltage Filter 6: Current candle range divided by 10-candle avg range"),
-        VariableDoc("vol_compressed", "0/1", "HighVoltage Filter 6: 1 if current candle range < 40% of 10-candle average"),
-        VariableDoc("vol_exhausted", "0/1", "HighVoltage Filter 6: 1 if candle range is abnormally exhausted (>265%)"),
-        VariableDoc("vol_regime_ok", "0/1", "HighVoltage Filter 6: 1 if candle volatility is neither compressed nor exhausted"),
-        VariableDoc("opportunity_dir", "UP/DOWN", "Omni-Playbook Direction (UP=1, DOWN=-1, NONE=0) across Continuation, S/R Bounce, and Mean Reversion"),
-        VariableDoc("continuation_ready", "0/1", "1 if all 6 strict Trend/Momentum Continuation filters are satisfied"),
-        VariableDoc("sr_bounce_ready", "0/1", "1 if price is actively bouncing off Support (UP) or rejecting off Resistance (DOWN)"),
-        VariableDoc("mean_rev_ready", "0/1", "1 if price is snapping back from Overbought (>=82% -> DOWN) or Oversold (<=18% -> UP) extreme"),
-        VariableDoc("any_setup_ready", "0/1", "1 if Continuation, Support/Resistance Bounce, or Mean Reversion is ready to execute"),
-        VariableDoc("playbook_type", "0..3", "Active Playbook ID (1 = CONTINUATION, 2 = SR_BOUNCE, 3 = MEAN_REVERSION, 0 = SCANNING)"),
-        VariableDoc("opportunity_score", "%", "Quality score (0..100%) of the active Continuation, S/R Bounce, or Mean-Reversion setup"),
-        VariableDoc("support_dist", "px", "Distance in points above nearest Support / Swing Low / Grid floor"),
-        VariableDoc("resistance_dist", "px", "Distance in points below nearest Resistance / Swing High / Grid ceiling"),
-        VariableDoc("hv_score", "%", "HV Window Co-Pilot: Zero-lag fast-decay EMA (α=0.08) score (≥75 Excellent, 50-74 Mod, <50 Avoid)"),
-        VariableDoc("hv_raw_score", "%", "HV Window Co-Pilot: Instantaneous unsmoothed structural score (0..100%)"),
-        VariableDoc("hv_state", "0..2", "HV Window State (2 = EXCELLENT ≥75%, 1 = MODERATE 50-74%, 0 = AVOID <50%)"),
-        VariableDoc("hv_tight_chop", "0/1", "HV Window Trap: 1 if 15s/30s/45s/60s anchor range < 0.20 pts (TIGHT_CHOP)"),
-        VariableDoc("hv_crazy_whipsaw", "0/1", "HV Window Trap: 1 if active + 4 completed candles show collapse wicks > 55%"),
-        VariableDoc("hv_wick_ratio", "%", "HV Window: Dominant wick collapse ratio (%) across active + 4 completed candles"),
-        VariableDoc("hv_body_ratio", "%", "HV Window: Average solid body ratio (%) across active + 4 completed candles"),
-        VariableDoc("hv_anchor_range_60s", "px", "HV Window: Total price range across 15s, 30s, 45s, and 60s anchors"),
-        VariableDoc("hv_mtf_aligned", "0..4", "HV Window: Count of 15s/30s/45s/60s anchors aligned with ZLEMA trend"),
-        VariableDoc("hv_stability_sec", "s", "HV Window: Seconds continuously held ≥ 72% (target 15–20s before bot launch)"),
-        VariableDoc("trade_duration_sec", "s", "Expanded Trade Timeframe duration in seconds (5, 15, 30, 45, or 60)"),
-        VariableDoc("rush_dir", "UP/DOWN", "Primary 4-tick rush direction (UP = 1, DOWN = -1, NONE = 0)"),
-        VariableDoc("rush_snr", "x", "4-tick net displacement divided by baseline noise step * sqrt(4)"),
-        VariableDoc("tick_purity", "%", "One-way directional purity (0..100%) across the 4-tick window"),
-        VariableDoc("tick_streak", "ticks", "Consecutive ticks moving in the active rush direction"),
-        VariableDoc("tip_aligned", "0/1", "1 if the latest tick accelerated in the rush direction without hesitation"),
-        VariableDoc("cleared_noise_mean", "0/1", "1 if latest price broke outside the 8-tick oscillation center"),
-        VariableDoc("single_tick_dominance", "%", "Largest single tick step as % of 4-tick move (high = freak spike trap)"),
-        VariableDoc("tick_convexity", "x", "Recent 2-tick step size vs prior 2-tick step size (>1.0 = accelerating)"),
-        VariableDoc("arrival_compression", "x", "Recent inter-tick time interval vs prior interval (<1.0 = speeding up)"),
-        VariableDoc("pullback_recovery", "0..1", "6-tick forward thrust ratio vs counter-ticks"),
-        VariableDoc("local_zscore_15", "σ", "15-tick local price Z-score (overextension gauge)"),
-        VariableDoc("ftrl_win_prob", "%", "Online FTRL-Proximal ML predicted 5-second continuation probability"),
-        VariableDoc("calibrated_win_prob", "%", "X13 Calibrated 5s win probability with cold-start & regime calibration"),
-        VariableDoc("eligibility_passed", "0/1", "X13 Layer 1 Market Eligibility hard-rejection pass flag"),
-        VariableDoc("signal_layer_score", "%", "X13 Layer 2 Signal Intelligence weighted score (0..100%)"),
-        VariableDoc("validation_layer_score", "%", "X13 Layer 3 Prediction Validation score (0..100%)"),
-        VariableDoc("snapshot_sync", "0/1", "1 if atomic market snapshot is synchronized and non-stale"),
-        VariableDoc("tick_age_ms", "ms", "Age of latest tick observation in milliseconds"),
-        VariableDoc("roll_snr_3", "x", "3-observation rolling mean of rush_snr"),
-        VariableDoc("roll_purity_4", "%", "4-observation rolling mean of tick_purity"),
-        VariableDoc("roll_ofi_median_5", "%", "5-observation outlier-resistant rolling median of OFI"),
-        VariableDoc("roll_impulse_4", "%", "4-observation rolling mean of micro_impulse_score"),
-        VariableDoc("hyst_momentum", "0/1", "Schmitt-trigger hysteresis state on momentum (enter>=65, exit<50)"),
-        VariableDoc("hyst_purity", "0/1", "Schmitt-trigger hysteresis state on tick purity (enter>=72, exit<62)"),
-        VariableDoc("hyst_snr", "0/1", "Schmitt-trigger hysteresis state on rush SNR (enter>=1.32, exit<1.12)"),
-        VariableDoc("persist_count_5", "0..5", "N-of-5 directional persistence count across last 5 evaluations"),
-        VariableDoc("noise_clean", "0/1", "1 if X13 Noise Classifier confirms no spike trap or OFI divergence"),
-        VariableDoc("regime_type", "0..3", "X13 Adaptive Regime (0=Consolidation, 1=Trend, 2=Expansion, 3=Transition)"),
-        VariableDoc("regime_stable", "0/1", "1 if regime is stable and not in an uncertain transition"),
-        VariableDoc("regime_snr_thresh", "x", "Regime-adaptive SNR threshold (1.24 Trend, 1.28 Expansion, 1.42 Chop)"),
-        VariableDoc("regime_purity_thresh", "%", "Regime-adaptive Purity threshold (66% Trend, 68% Expansion, 74% Chop)"),
-        VariableDoc("up_win_rate", "%", "Empirical walk-forward 5s accuracy for UP signals"),
-        VariableDoc("down_win_rate", "%", "Empirical walk-forward 5s accuracy for DOWN signals"),
-        VariableDoc("regime_win_rate", "%", "Empirical walk-forward 5s accuracy in the active market regime"),
-        VariableDoc("gate_stability_pct", "%", "X13 Gate Stability index (100% minus gate flicker rate)"),
-        VariableDoc("oos_expectancy_pct", "%", "Walk-forward Out-of-Sample Expected Value (%) at current payout"),
-        VariableDoc("shadow_win_rate", "%", "Rolling 5s virtual shadow-trade continuation win rate"),
-        VariableDoc("shadow_samples", "count", "Total 5s virtual shadow rushes learned online in session"),
-        VariableDoc("avg_noise_step", "px", "Baseline single-tick noise oscillation step size"),
-        VariableDoc("net_delta_4", "px", "Signed 4-tick price displacement"),
-        VariableDoc("last_step_ratio", "x", "Latest tick step divided by average noise step"),
-        VariableDoc("price", "px", "Latest raw tick quote price"),
-        VariableDoc("ofi", "%", "Order Flow Imbalance (-100..+100%)"),
-        VariableDoc("tick_intensity", "x", "Tick arrival intensity ratio vs baseline"),
-        VariableDoc("micro_impulse_score", "%", "Composite microstructure ballistic score (0..100%)"),
-        VariableDoc("micro_efficiency", "%", "10-tick Kaufman directional efficiency (0..100%)"),
-        VariableDoc("micro_acceleration", "px", "Second-order tick acceleration"),
-        VariableDoc("z_fast", "px", "Zero-Lag EMA Fast (period 10)"),
-        VariableDoc("z_slow", "px", "Zero-Lag EMA Slow (period 30)"),
-        VariableDoc("zlema_spread", "px", "Signed spread (z_fast - z_slow)"),
-        VariableDoc("volatility", "px", "Rolling tick return standard deviation"),
-        VariableDoc("consistency", "%", "Directional tick consistency (0..100%)"),
-        VariableDoc("persistence", "ticks", "Signed macro tick persistence"),
-        VariableDoc("slope_ratio", "x", "Linear regression slope / volatility"),
-        VariableDoc("hvoi_score", "%", "HV Window / HVOI smoothed session suitability score"),
-        VariableDoc("sr_distance", "px", "Distance to nearest Support/Resistance zone"),
-        VariableDoc("hmm_state", "0..7", "8-state Gaussian HMM regime"),
-        VariableDoc("hmm_confidence", "%", "Gaussian HMM state posterior confidence (0..100%)"),
-        VariableDoc("ws_latency_ms", "ms", "Live WebSocket round-trip latency in milliseconds"),
-        VariableDoc("payout_pct", "%", "Current broker payout percentage for the active asset"),
-        VariableDoc("sentiment_pct", "%", "Live crowd bullish sentiment percentage (0..100%)"),
-        VariableDoc("ofi_imbalance", "%", "Alias for `ofi`: Order Flow Imbalance (-100..+100%)"),
-        VariableDoc("velocity", "T/s", "Alias for `tick_speed`: 3-second tick velocity in ticks/sec")
+        VariableDoc("rush_dir", "UP/DOWN", "Direction of the latest four-tick net move"),
+        VariableDoc("rush_snr", "x", "Four-tick displacement relative to the recent noise baseline"),
+        VariableDoc("tick_purity", "%", "Directional efficiency across the active four-tick burst"),
+        VariableDoc("tick_streak", "ticks", "Consecutive ticks aligned with the current burst"),
+        VariableDoc("tip_aligned", "0/1", "Latest tick and smoothed tip agree with burst direction"),
+        VariableDoc("cleared_noise_mean", "0/1", "Price has cleared the preceding oscillation center"),
+        VariableDoc("single_tick_dominance", "%", "Largest single tick's share of the active burst path"),
+        VariableDoc("tick_convexity", "x", "Recent tick-step acceleration relative to earlier steps"),
+        VariableDoc("arrival_compression", "x", "Recent tick-arrival interval relative to earlier intervals"),
+        VariableDoc("pullback_recovery", "0..1", "Forward movement share across the recent six-tick path"),
+        VariableDoc("local_zscore_15", "σ", "Latest price displacement relative to the recent 15-tick distribution"),
+        VariableDoc("ftrl_win_prob", "%", "FTRL continuation estimate, displayed only after 30 settled labels"),
+        VariableDoc("calibrated_win_prob", "%", "Neutral until the model has 30 settled five-second labels"),
+        VariableDoc("shadow_win_rate", "%", "Rolling outcome rate from timestamp-settled five-second shadow samples"),
+        VariableDoc("shadow_samples", "count", "Number of settled five-second shadow samples"),
+        VariableDoc("avg_noise_step", "px", "Winsorized baseline single-tick noise step"),
+        VariableDoc("net_delta_4", "px", "Signed net price displacement across the latest four ticks"),
+        VariableDoc("last_step_ratio", "x", "Latest tick-step size divided by the baseline noise step"),
+        VariableDoc("price", "px", "Latest raw market quote"),
+        VariableDoc("tick_speed", "T/s", "Observed tick arrival speed"),
+        VariableDoc("z_fast", "px", "Fast zero-lag EMA used for directional smoothing"),
+        VariableDoc("z_slow", "px", "Slow zero-lag EMA baseline"),
+        VariableDoc("zlema_trend_dir", "UP/DOWN", "Smoothed trend direction from fast versus slow ZLEMA"),
+        VariableDoc("ws_latency_ms", "ms", "Current WebSocket round-trip latency"),
+        VariableDoc("payout_pct", "%", "Current broker payout percentage"),
+        VariableDoc("snapshot_sync", "0/1", "Latest market snapshot is synchronized and fresh"),
+        VariableDoc("tick_age_ms", "ms", "Age of the latest market tick"),
+        VariableDoc("noise_clean", "0/1", "Temporal noise guard found no isolated-spike or order-flow divergence"),
+        VariableDoc("regime_type", "0..3", "Observed regime: consolidation, trend, impulse, or transition"),
+        VariableDoc("regime_stable", "0/1", "Current regime is not in an uncertain transition"),
+        VariableDoc("signal_layer_score", "%", "Signal-structure score, not a win-probability estimate"),
+        VariableDoc("validation_layer_score", "%", "Validation telemetry; zero until sufficient outcome samples exist")
     )
 }
 
@@ -962,7 +816,7 @@ object StrategyScriptCompiler {
         map["arrival_compression"] = rush.arrivalCompressionRatio.finiteOr(1.0)
         map["pullback_recovery"] = rush.microPullbackRecovery.finiteOr(0.0)
         map["local_zscore_15"] = rush.localZScore15.finiteOr(0.0)
-        map["ftrl_win_prob"] = rush.ftrlWinProbPercent.finiteOr(0.0)
+        map["ftrl_win_prob"] = if (rush.shadowSamplesLearned >= 30) rush.ftrlWinProbPercent.finiteOr(50.0) else 50.0
         map["shadow_win_rate"] = rush.rollingShadowWinRatePercent.finiteOr(0.0)
         map["shadow_samples"] = rush.shadowSamplesLearned.toDouble()
         map["avg_noise_step"] = rush.avgNoiseStep.finiteOr(1e-5)
@@ -970,7 +824,7 @@ object StrategyScriptCompiler {
         map["last_step_ratio"] = rush.lastStepRatio.finiteOr(0.0)
 
         // X13 Temporal Intelligence Built-In Variables
-        map["calibrated_win_prob"] = max(rush.ftrlWinProbPercent, temporal.calibratedWinProbPercent).finiteOr(50.0)
+        map["calibrated_win_prob"] = temporal.calibratedWinProbPercent.finiteOr(50.0)
         map["eligibility_passed"] = if (temporal.eligibilityLayerPassed) 1.0 else 0.0
         map["signal_layer_score"] = temporal.signalLayerScore.finiteOr(0.0)
         map["validation_layer_score"] = temporal.validationLayerScore.finiteOr(0.0)
@@ -989,11 +843,11 @@ object StrategyScriptCompiler {
         map["regime_stable"] = if (temporal.regimeTransitionStable) 1.0 else 0.0
         map["regime_snr_thresh"] = temporal.regimeSnrThreshold.finiteOr(1.32)
         map["regime_purity_thresh"] = temporal.regimePurityThreshold.finiteOr(70.0)
-        map["up_win_rate"] = temporal.upWinRatePercent.finiteOr(66.0)
-        map["down_win_rate"] = temporal.downWinRatePercent.finiteOr(66.0)
-        map["regime_win_rate"] = temporal.regimeWinRatePercent.finiteOr(66.0)
-        map["gate_stability_pct"] = temporal.gateStabilityPercent.finiteOr(92.5)
-        map["oos_expectancy_pct"] = temporal.oosExpectancyPercent.finiteOr(18.0)
+        map["up_win_rate"] = temporal.upWinRatePercent.finiteOr(50.0)
+        map["down_win_rate"] = temporal.downWinRatePercent.finiteOr(50.0)
+        map["regime_win_rate"] = temporal.regimeWinRatePercent.finiteOr(50.0)
+        map["gate_stability_pct"] = temporal.gateStabilityPercent.finiteOr(0.0)
+        map["oos_expectancy_pct"] = temporal.oosExpectancyPercent.finiteOr(0.0)
 
         // Pre-populate rolling & hysteresis lookup keys for DSL functions `roll_mean(...)`, `roll_median(...)`, `ema(...)`, `hysteresis(...)`
         if (temporalEngine != null) {

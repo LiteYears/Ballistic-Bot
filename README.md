@@ -15,8 +15,10 @@
   - **SRMemoryEngine & LevelEngine**: Consolidated Support/Resistance memory corridors with adaptive width $\max(0.20, 4.0 \times \text{AvgCandleRange})$ and Psychological Round-Number Grid bounce detection.
   - **IndicatorEngine & ContextEnhancer**: ZLEMA Fast (10) & Slow (30), 15-tick Consistency, 40-tick Persistence, 3-second Micro-Velocity, Scale-Invariant Slope Ratio ($\text{slope}/\text{volatility}$), 50-tick `relPos` breakout percentile, and exponentially time-decayed ($\lambda = 0.82$) **HVOI** suitability scoring.
   - **RegimeDetectionEngine**: 8-State, 12-Feature Gaussian Hidden Markov Model (`Expansion`, `Reversal`, `Calm`, `Trending`) with $10^{-9}$ variance floor and scaled forward induction.
-- **Modular Strategy Studio**:
-  - Ships with 6 audited preset strategies (`RevangeWise5s`, `HighVoltage5s`, `RideTheHorse`, `Flash Impulse 5s`, `PsychGrid Round-Number Bounce`, and `Simple30s Candle Dominance`).
-  - Users can create, clone, edit, toggle, and remove custom modular strategies with configurable entry triggers, HMM regime adaptation modes (`OFF`, `SKIP_BAD`, `REVERSE_BAD`, `ADAPTIVE_ALL`), and 10 tunable gatekeeper filter modules.
+- **Sniper M v8.0 (single-strategy engine)**:
+  - One canonical five-second raw-tick burst-continuation strategy. The smoothed ZLEMA direction, SNR, directional purity, tip alignment, acceleration, tick speed, and single-tick anti-spike guard remain the entry logic.
+  - Strategy selection, custom strategy creation, script editing, and timeframe expansion are locked out; the Studio exposes the canonical Sniper M source and live diagnostics only.
+  - Signal quality is a separate deterministic score, not a claimed win probability. FTRL starts neutral, shadow outcomes are settled at the exact five-second horizon using timestamp-bracketed interpolation, and the learner state is validated and persisted in DataStore.
+  - Learned win-probability and calibration telemetry remain neutral until at least 30 settled shadow labels are available.
 - **Professional Trading Journal**:
   - Logs every trade with its complete entry telemetry snapshot in Room and computes live Win Rate, Net P&L, Expected Value (EV), and Profit Factor with JSON export.

@@ -222,7 +222,7 @@ private fun SectionHeader(title: String, modifier: Modifier = Modifier) {
 fun ModularStrategyStudioScreen(
     telemetry: MarketTelemetryState,
     activeBalance: Double,
-    strategies: List<StrategyConfig> = listOf(HardLockedMandate.highVoltageStrategyConfig()),
+    strategies: List<StrategyConfig> = listOf(HardLockedMandate.lockedStrategyConfig()),
     wsLatencyMs: Long = 0L,
     selectedTimeframeSec: Int = 5,
     onSelectTimeframe: (Int) -> Unit = {},
@@ -236,7 +236,7 @@ fun ModularStrategyStudioScreen(
     val loadedStrategy = remember(strategies) {
         strategies.firstOrNull { it.isEnabled }
             ?: strategies.firstOrNull()
-            ?: HardLockedMandate.highVoltageStrategyConfig()
+            ?: HardLockedMandate.lockedStrategyConfig()
     }
     val activeTf = TradeTimeframe.fromSeconds(
         selectedTimeframeSec.takeIf { it > 0 } ?: loadedStrategy.durationSeconds
@@ -248,17 +248,15 @@ fun ModularStrategyStudioScreen(
     }
 
     var editorText by rememberSaveable(selectedStrategy.id) {
-        mutableStateOf(selectedStrategy.scriptCode.ifBlank { DefaultStrategyScripts.HIGH_VOLTAGE_OQS_SCRIPT })
+        mutableStateOf(selectedStrategy.scriptCode.ifBlank { DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT })
     }
     var statusBanner by remember { mutableStateOf<String?>(null) }
     var statusIsError by remember { mutableStateOf(false) }
     var copyConfirmationMessage by remember { mutableStateOf<String?>(null) }
-    var showNewStrategyDialog by remember { mutableStateOf(false) }
-    var newStrategyNameInput by remember { mutableStateOf("My_HighVoltage_${activeTf.label}") }
     var showVariableReference by rememberSaveable { mutableStateOf(false) }
 
     LaunchedEffect(selectedStrategy.id, selectedStrategy.scriptCode) {
-        val targetCode = selectedStrategy.scriptCode.ifBlank { DefaultStrategyScripts.HIGH_VOLTAGE_OQS_SCRIPT }
+        val targetCode = selectedStrategy.scriptCode.ifBlank { DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT }
         if (editorText != targetCode) {
             editorText = targetCode
         }
@@ -358,55 +356,6 @@ fun ModularStrategyStudioScreen(
     val effectiveStake = loadedStrategy.computeEffectiveStake(activeBalance)
     val activeEvaluation = telemetry.activeEvaluations.firstOrNull()
 
-    if (showNewStrategyDialog) {
-        AlertDialog(
-            onDismissRequest = { showNewStrategyDialog = false },
-            title = { Text("Create New .OQS Strategy", color = TextPrimary) },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(
-                        text = "Generates a complete HighVoltage + HV Window .oqs strategy script pre-configured with all 6 strict filters.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = TextSecondary
-                    )
-                    OutlinedTextField(
-                        value = newStrategyNameInput,
-                        onValueChange = { newStrategyNameInput = it },
-                        label = { Text("Strategy Identifier") },
-                        singleLine = true,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .testTag("new_strategy_name_input")
-                    )
-                }
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        val cleaned = newStrategyNameInput.trim().ifBlank { "Custom_HighVoltage_5s" }
-                        showNewStrategyDialog = false
-                        onCreateStrategyFromTemplate(cleaned) { created ->
-                            selectedStrategyId = created.id
-                            editorText = created.scriptCode
-                            statusBanner = "Created & Loaded Strategy: ${created.name}"
-                            statusIsError = false
-                        }
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = BullishGreen),
-                    modifier = Modifier.testTag("confirm_create_strategy_button")
-                ) {
-                    Text("CREATE & LOAD", color = DeepObsidian, fontWeight = FontWeight.Bold)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showNewStrategyDialog = false }) {
-                    Text("Cancel", color = TextSecondary)
-                }
-            },
-            containerColor = SlateSurface
-        )
-    }
-
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
@@ -455,20 +404,6 @@ fun ModularStrategyStudioScreen(
                         }
 
                         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            OutlinedButton(
-                                onClick = {
-                                    newStrategyNameInput = "Custom_HV_${activeTf.label}_${strategies.size + 1}"
-                                    showNewStrategyDialog = true
-                                },
-                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                                modifier = Modifier
-                                    .heightIn(min = 34.dp)
-                                    .testTag("new_strategy_template_button")
-                            ) {
-                                Icon(Icons.Default.Add, contentDescription = null, tint = ElectricCyan, modifier = Modifier.size(14.dp))
-                                Spacer(Modifier.width(4.dp))
-                                Text("NEW .OQS", style = MaterialTheme.typography.labelSmall, color = ElectricCyan)
-                            }
                             OutlinedButton(
                                 onClick = {
                                     onResetDefaultStrategy { defaultCfg ->
@@ -616,7 +551,7 @@ fun ModularStrategyStudioScreen(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
-                                text = "TIMEFRAME EXPANSION (.OQS SYNC)",
+                                text = "FIXED STRATEGY EXPIRY",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = ElectricCyan,
                                 fontWeight = FontWeight.Bold,
@@ -638,12 +573,11 @@ fun ModularStrategyStudioScreen(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
-                            TradeTimeframe.entries.forEach { tf ->
+                            TradeTimeframe.entries.filter { it.seconds == 5 }.forEach { tf ->
                                 val isSelected = tf == activeTf
                                 Surface(
                                     onClick = {
                                         onSelectTimeframe(tf.seconds)
-                                        editorText = DefaultStrategyScripts.withDurationSec(editorText, tf.seconds)
                                     },
                                     shape = RoundedCornerShape(6.dp),
                                     color = if (isSelected) ElectricCyan.copy(alpha = 0.2f) else SlateSurface,
@@ -710,7 +644,7 @@ fun ModularStrategyStudioScreen(
                                 .padding(end = 8.dp)
                         )
                         Text(
-                            text = "Tap to Edit • Play to Load",
+                            text = "Single locked strategy • Read-only",
                             style = MaterialTheme.typography.labelSmall,
                             color = TextMuted,
                             maxLines = 1
@@ -1177,7 +1111,7 @@ fun ModularStrategyStudioScreen(
                             }
                         }
                     },
-                    enabled = compiledPreview.isValid,
+                    enabled = false,
                     colors = ButtonDefaults.buttonColors(
                         containerColor = BullishGreen,
                         disabledContainerColor = SlateBorder
@@ -1190,7 +1124,7 @@ fun ModularStrategyStudioScreen(
                     Icon(Icons.Default.Terminal, contentDescription = null, tint = DeepObsidian, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
                     Text(
-                        text = "COMPILE & LOAD STRATEGY (.OQS)",
+                        text = "SNIPER M SOURCE LOCKED",
                         style = MaterialTheme.typography.labelLarge,
                         color = DeepObsidian,
                         fontWeight = FontWeight.Bold,
@@ -1227,28 +1161,19 @@ fun ModularStrategyStudioScreen(
                     }
 
                     OutlinedButton(
-                        onClick = {
-                            val clip = clipboardManager.getText()?.text
-                            if (!clip.isNullOrBlank()) {
-                                editorText = clip
-                                statusBanner = "Pasted .oqs script from clipboard — Review & tap COMPILE & LOAD."
-                                statusIsError = false
-                            } else {
-                                statusBanner = "Clipboard is empty."
-                                statusIsError = true
-                            }
-                        },
+                        onClick = {},
+                        enabled = false,
                         modifier = Modifier
                             .weight(1f)
                             .heightIn(min = 44.dp)
                             .testTag("paste_oqs_script_button")
                     ) {
-                        Icon(Icons.Default.ContentPaste, contentDescription = "Paste Script", tint = TextPrimary, modifier = Modifier.size(15.dp))
+                        Icon(Icons.Default.ContentPaste, contentDescription = "Script editing disabled", tint = TextMuted, modifier = Modifier.size(15.dp))
                         Spacer(Modifier.width(6.dp))
                         Text(
-                            text = "PASTE SCRIPT",
+                            text = "EDITING LOCKED",
                             style = MaterialTheme.typography.labelMedium,
-                            color = TextPrimary,
+                            color = TextMuted,
                             fontWeight = FontWeight.Bold,
                             maxLines = 1
                         )
@@ -1273,7 +1198,7 @@ fun ModularStrategyStudioScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         SectionHeader(
-                            title = "SOURCE EDITOR (${selectedStrategy.name}.oqs)",
+                            title = "READ-ONLY SNIPER M SOURCE",
                             modifier = Modifier
                                 .weight(1f)
                                 .padding(end = 8.dp)
@@ -1380,7 +1305,8 @@ fun ModularStrategyStudioScreen(
 
                         BasicTextField(
                             value = editorText,
-                            onValueChange = { editorText = it },
+                            onValueChange = {},
+                            readOnly = true,
                             textStyle = TextStyle(
                                 fontFamily = JetBrainsMonoFamily,
                                 fontSize = 12.sp,

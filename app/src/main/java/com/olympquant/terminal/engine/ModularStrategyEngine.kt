@@ -14,7 +14,6 @@ import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.sign
 import kotlin.math.sqrt
 
 /**
@@ -32,7 +31,7 @@ class ModularStrategyEngine {
         val direction: SignalDirection,
         val features: DoubleArray,
         val regime: TemporalRegimeType = TemporalRegimeType.EXPANSION_IMPULSE,
-        val predictedProb: Double = 0.65,
+        val predictedProb: Double = 0.5,
         val wasSpikeNoise: Boolean = false,
         val horizonMs: Long = 5000L
     )
@@ -66,23 +65,6 @@ class ModularStrategyEngine {
         private const val FTRL_L2 = 0.12
         private const val FORGETTING_GAMMA = 0.985
 
-        // Microstructure-informed warm-start prior weights:
-        // [0]=Bias, [1]=RushSNR_4, [2]=TickConvexity, [3]=ArrivalCompression,
-        // [4]=SmoothDominance(Anti-Spike), [5]=MicroPullbackRecovery, [6]=LocalZScore_15,
-        // [7]=RollingShadowWinRate_5s, [8]=SNR*Convexity, [9]=SNR*SmoothDominance, [10]=Convexity*Compression
-        private val PRIOR_WEIGHTS = doubleArrayOf(
-            0.34, // w0: Intercept
-            0.56, // w1: RushSNR_4
-            0.42, // w2: TickConvexity
-            0.28, // w3: ArrivalCompressionRatio
-            0.54, // w4: SmoothStepDistribution (penalizes single-tick spike traps)
-            0.30, // w5: MicroPullbackRecovery
-            0.26, // w6: LocalZScore_15 headroom
-            0.44, // w7: RollingShadowWinRate_5s
-            0.34, // w8: Non-linear Cross (RushSNR * TickConvexity)
-            0.48, // w9: Non-linear Cross (RushSNR * SmoothStepDistribution)
-            0.25  // w10: Non-linear Cross (TickConvexity * ArrivalCompression)
-        )
     }
 
     private val ftrlZ = DoubleArray(FEATURE_DIM)
@@ -90,7 +72,7 @@ class ModularStrategyEngine {
     private val ftrlW = DoubleArray(FEATURE_DIM)
     private val pendingShadowRushes = ArrayDeque<PendingShadowRush>(64)
     private var lastShadowEnqueueTimeMs: Long = 0L
-    private var rollingShadowWinRate: Double = 0.66
+    private var rollingShadowWinRate: Double = 0.5
     private var shadowSamplesCount: Int = 0
     val temporalEngine = TemporalIntelligenceEngine()
 
@@ -105,23 +87,64 @@ class ModularStrategyEngine {
     fun reset() {
         pendingShadowRushes.clear()
         lastShadowEnqueueTimeMs = 0L
-        rollingShadowWinRate = 0.66
+        rollingShadowWinRate = 0.5
         shadowSamplesCount = 0
         cachedScriptHash = 0
         cachedCompileResult = null
         temporalEngine.reset()
         for (i in 0 until FEATURE_DIM) {
-            ftrlN[i] = 1.0
-            val denom = ((FTRL_BETA + sqrt(ftrlN[i])) / FTRL_ALPHA) + FTRL_L2
-            val prior = PRIOR_WEIGHTS[i]
-            ftrlZ[i] = -(prior * denom + sign(prior) * FTRL_L1)
-            ftrlW[i] = prior
+            // Neutral cold start: no hand-authored weights or assumed edge.
+            ftrlZ[i] = 0.0
+            ftrlN[i] = 0.0
+            ftrlW[i] = 0.0
         }
     }
 
     @Synchronized
+    internal fun exportLearningState(): String {
+        return buildString {
+            append("SNIPER_FTRL_V1|")
+            append(shadowSamplesCount)
+            append('|')
+            append(rollingShadowWinRate)
+            for (value in ftrlZ) {
+                append('|')
+                append(value)
+            }
+            for (value in ftrlN) {
+                append('|')
+                append(value)
+            }
+        }
+    }
+
+    @Synchronized
+    internal fun restoreLearningState(serialized: String): Boolean {
+        val parts = serialized.split('|')
+        if (parts.size != 3 + FEATURE_DIM * 2 || parts[0] != "SNIPER_FTRL_V1") return false
+        val samples = parts[1].toIntOrNull()?.takeIf { it >= 0 } ?: return false
+        val rollingRate = parts[2].toDoubleOrNull()?.takeIf { it.isFinite() && it in 0.0..1.0 } ?: return false
+        val zValues = parts.subList(3, 3 + FEATURE_DIM).map { it.toDoubleOrNull() ?: return false }
+        val nValues = parts.subList(3 + FEATURE_DIM, parts.size).map { it.toDoubleOrNull() ?: return false }
+        if (zValues.any { !it.isFinite() || abs(it) > 1.0e12 }) return false
+        if (nValues.any { !it.isFinite() || it < 0.0 || it > 1.0e12 }) return false
+
+        shadowSamplesCount = samples
+        rollingShadowWinRate = rollingRate
+        for (i in 0 until FEATURE_DIM) {
+            ftrlZ[i] = zValues[i]
+            ftrlN[i] = nValues[i]
+        }
+        predictFtrlWinProbability(DoubleArray(FEATURE_DIM))
+        return true
+    }
+
+    @Synchronized
+    internal fun learnedSampleCount(): Int = shadowSamplesCount
+
+    @Synchronized
     private fun getOrCompileScript(scriptCode: String): DslCompileResult {
-        val codeToCompile = scriptCode.ifBlank { DefaultStrategyScripts.DEFAULT_OQS_SCRIPT }
+        val codeToCompile = scriptCode.ifBlank { DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT }
         val hash = codeToCompile.hashCode()
         val existing = cachedCompileResult
         if (existing != null && cachedScriptHash == hash) {
@@ -137,7 +160,7 @@ class ModularStrategyEngine {
     fun getLiveSymbolSnapshot(
         telemetry: MarketTelemetryState,
         wsLatencyMs: Long,
-        scriptCode: String = DefaultStrategyScripts.DEFAULT_OQS_SCRIPT
+        scriptCode: String = DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT
     ): Map<String, Double> {
         val rush = extractRawTickRushMetrics(telemetry, mutateState = false)
         val temporalSnapshot = temporalEngine.pushObservationFrame(telemetry, rush, wsLatencyMs, mutateState = false)
@@ -171,7 +194,8 @@ class ModularStrategyEngine {
         val rush = extractRawTickRushMetrics(telemetry)
         val temporalSnapshot = temporalEngine.pushObservationFrame(telemetry, rush, wsLatencyMs)
         val enrichedTelemetry = telemetry.copy(temporalTelemetry = temporalSnapshot)
-        val compiled = getOrCompileScript(strategy.scriptCode)
+        // Execution is hard-locked to the canonical Sniper M script; the DSL compiler remains reusable for diagnostics/tests.
+        val compiled = getOrCompileScript(DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT)
         val parsedScript = compiled.parsedScript
 
         if (!compiled.isValid || parsedScript == null) {
@@ -232,29 +256,21 @@ class ModularStrategyEngine {
             contextPassed &&
             telemetry.hardStopReason == null
 
-        // Pure Sniper M surge confidence calculation (incorporates SNR, purity, convexity acceleration, and arrival compression)
-        val convexityBoost = ((rush.tickConvexity - 0.85).coerceIn(-0.3, 0.8)) * 8.0
-        val compressionBoost = ((1.05 - rush.arrivalCompressionRatio).coerceIn(-0.2, 0.5)) * 6.0
-        val surgeConfidenceBoost = if (rawSignal != SignalDirection.NONE && allFiltersPassed) {
-            (66.0 +
-                min(18.0, (rush.rushSnr - 1.0).coerceAtLeast(0.0) * 12.0) +
-                min(10.0, (rush.purityPercent - 60.0).coerceAtLeast(0.0) * 0.25) +
-                convexityBoost +
-                compressionBoost)
-                .finiteOr(74.0)
+        // This is a deterministic signal-quality index, NOT a win-probability estimate.
+        // The FTRL/temporal probability remains telemetry-only until it has enough real labels.
+        val effectiveConfidence = if (rawSignal != SignalDirection.NONE && allFiltersPassed) {
+            (
+                45.0 +
+                    min(18.0, (rush.rushSnr - 1.0).coerceAtLeast(0.0) * 12.0) +
+                    min(15.0, (rush.purityPercent - 50.0).coerceAtLeast(0.0) * 0.35) +
+                    ((rush.tickConvexity - 0.55).coerceIn(0.0, 1.5) * 5.0) +
+                    ((rush.tickSpeedTps - 1.15).coerceAtLeast(0.0).coerceAtMost(2.0) * 2.0) +
+                    (if (rush.tipAligned) 8.0 else 0.0) +
+                    ((1.05 - rush.arrivalCompressionRatio).coerceIn(0.0, 0.5) * 4.0)
+                ).finiteOr(0.0).coerceIn(0.0, 100.0)
         } else {
             0.0
         }
-        val rawBaseConfidence = max(
-            max(
-                rush.ftrlWinProbPercent.finiteOr(0.0),
-                if (rawSignal != SignalDirection.NONE) temporalSnapshot.calibratedWinProbPercent.finiteOr(0.0) else 0.0
-            ),
-            surgeConfidenceBoost
-        ).coerceIn(0.0, 100.0)
-
-        val contextPenalty = telemetry.contextBlockReasons.size * 25.0
-        val effectiveConfidence = (rawBaseConfidence - contextPenalty).finiteOr(0.0).coerceIn(0.0, 100.0)
         val confidencePassed = effectiveConfidence >= effectiveMinConfidence
         val enoughTicks = telemetry.tickCount >= 8 || telemetry.recentTicks.size >= 8
         val readyToExecute = enoughTicks &&
@@ -309,7 +325,7 @@ class ModularStrategyEngine {
 
             // Step A: Resolve any matured virtual shadow rushes and update FTRL-Proximal weights online!
             if (mutateState) {
-                settleMaturedShadowRushes(latestTimeMs, latestTick.price)
+                settleMaturedShadowRushes(latestTimeMs, ticks)
             }
 
             val k = min(4, lastIdx)
@@ -536,12 +552,7 @@ class ModularStrategyEngine {
             )
 
             // Predict 5-second continuation probability P(Win 5s) via FTRL-Proximal dot product
-            val ftrlWinProbPercent = if (candidateDir != SignalDirection.NONE && rushSnr >= 1.05 && purityPercent >= 55.0) {
-                predictFtrlWinProbability(featureVector) * 100.0
-            } else {
-                // During flat noise oscillation, discount probability so UI reflects low continuation odds
-                (predictFtrlWinProbability(featureVector) * 55.0).coerceAtMost(48.0)
-            }
+            val ftrlWinProbPercent = predictFtrlWinProbability(featureVector) * 100.0
 
             // Enqueue virtual shadow rush at the active timeframe horizon so the model learns online
             if (
@@ -555,7 +566,7 @@ class ModularStrategyEngine {
                 if (pendingShadowRushes.size >= 48) {
                     pendingShadowRushes.removeFirst()
                 }
-                val horizonMs = (telemetry.selectedTimeframeSec.coerceIn(5, 60)) * 1000L
+                val horizonMs = 5_000L // Sniper M is a fixed five-second continuation model.
                 pendingShadowRushes.addLast(
                     PendingShadowRush(
                         entryTimeMs = latestTimeMs,
@@ -616,7 +627,7 @@ class ModularStrategyEngine {
         val probPct = if (rushSnr >= 1.25 && purityPercent >= 68.0) {
             predictFtrlWinProbability(featureVector) * 100.0
         } else {
-            42.0
+            50.0
         }
         return RawTickRushMetrics(
             rushDirection = candidateDir,
@@ -659,7 +670,7 @@ class ModularStrategyEngine {
         } else {
             -((localZScore15 - 2.85) * 1.4).finiteOr(0.0).coerceIn(0.0, 2.5)
         }
-        val f7 = ((shadowWinRate - 0.52) / 0.20).finiteOr(0.0).coerceIn(-2.0, 2.0)
+        val f7 = ((shadowWinRate - 0.50) / 0.20).finiteOr(0.0).coerceIn(-2.0, 2.0)
 
         // Non-linear cross-feature interactions
         val f8 = (f1 * f2).coerceIn(-2.5, 3.0)
@@ -669,25 +680,58 @@ class ModularStrategyEngine {
         return doubleArrayOf(1.0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10)
     }
 
-    private fun settleMaturedShadowRushes(currentTimeMs: Long, currentPrice: Double) {
+    private fun settleMaturedShadowRushes(currentTimeMs: Long, ticks: List<com.olympquant.terminal.domain.Tick>) {
         if (pendingShadowRushes.isNotEmpty() && currentTimeMs < pendingShadowRushes.first().entryTimeMs) {
-            // Stream clock rewound (e.g., replay or simulation reset)
+            // Stream clock rewound (e.g., replay or simulation reset).
             pendingShadowRushes.clear()
             lastShadowEnqueueTimeMs = 0L
             return
         }
+
         while (pendingShadowRushes.isNotEmpty()) {
             val oldest = pendingShadowRushes.first()
-            if (currentTimeMs - oldest.entryTimeMs < oldest.horizonMs) break
+            val targetTimeMs = oldest.entryTimeMs + oldest.horizonMs
+            if (currentTimeMs < targetTimeMs) break
+
+            // Use the price at the exact horizon, interpolated between the two
+            // surrounding timestamped ticks. Never label using a later tick.
+            var horizonPrice: Double? = null
+            for (i in 1 until ticks.size) {
+                val before = ticks[i - 1]
+                val after = ticks[i]
+                if (before.timeMs <= targetTimeMs && after.timeMs >= targetTimeMs &&
+                    before.timeMs > 0L && after.timeMs > 0L &&
+                    before.price.isFinite() && after.price.isFinite()
+                ) {
+                    val span = after.timeMs - before.timeMs
+                    horizonPrice = if (span <= 0L) {
+                        after.price
+                    } else {
+                        val fraction = ((targetTimeMs - before.timeMs).toDouble() / span.toDouble())
+                            .coerceIn(0.0, 1.0)
+                        before.price + (after.price - before.price) * fraction
+                    }
+                    break
+                }
+            }
+
+            // If the rolling tick buffer has already advanced beyond the target, discard
+            // the unverifiable sample without training on a fabricated later price.
+            if (horizonPrice == null && ticks.firstOrNull()?.timeMs?.let { it > targetTimeMs } == true) {
+                pendingShadowRushes.removeFirst()
+                continue
+            }
+            // If the buffer has not yet supplied the after-horizon tick, defer.
+            val settledPrice = horizonPrice ?: break
             pendingShadowRushes.removeFirst()
 
-            val isContinuationWin = (oldest.direction == SignalDirection.UP && currentPrice > oldest.entryPrice) ||
-                (oldest.direction == SignalDirection.DOWN && currentPrice < oldest.entryPrice)
-            val isTie = abs(currentPrice - oldest.entryPrice) < 1e-9
+            val isContinuationWin = (oldest.direction == SignalDirection.UP && settledPrice > oldest.entryPrice) ||
+                (oldest.direction == SignalDirection.DOWN && settledPrice < oldest.entryPrice)
+            val isTie = abs(settledPrice - oldest.entryPrice) < 1e-9
             if (!isTie) {
                 val labelY = if (isContinuationWin) 1.0 else 0.0
                 updateFtrlWeightsOnline(oldest.features, labelY)
-                rollingShadowWinRate = (0.85 * rollingShadowWinRate + 0.15 * labelY).coerceIn(0.15, 0.92)
+                rollingShadowWinRate = (0.85 * rollingShadowWinRate + 0.15 * labelY).coerceIn(0.0, 1.0)
                 shadowSamplesCount++
                 temporalEngine.recordShadowOutcome(
                     direction = oldest.direction,

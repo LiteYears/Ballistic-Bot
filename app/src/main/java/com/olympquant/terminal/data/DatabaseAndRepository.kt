@@ -25,6 +25,7 @@ import com.olympquant.terminal.domain.StrategyConfig
 import com.olympquant.terminal.domain.TerminalDensityMode
 import com.olympquant.terminal.domain.TradeTimeframe
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import java.security.MessageDigest
 
@@ -219,6 +220,7 @@ class OlympQuantRepository(
         val SELECTED_TIMEFRAME_SEC = intPreferencesKey("selected_timeframe_sec")
         val AUTO_PAUSE_ON_HV_AVOID = booleanPreferencesKey("auto_pause_on_hv_avoid")
         val HOURLY_SNIPER_MODE = booleanPreferencesKey("hourly_sniper_mode")
+        val SNIPER_LEARNING_STATE = stringPreferencesKey("sniper_m_ftrl_state_v1")
     }
 
     val sessionFlow: Flow<SessionPreferences> = context.dataStore.data.map { prefs ->
@@ -285,89 +287,77 @@ class OlympQuantRepository(
                     com.olympquant.terminal.engine.DefaultStrategyScripts.SNIPER_M_STRATEGY_NAME,
                     ignoreCase = true
                 ) &&
-                existing.first().filtersJson.contains("version = \"8.0\"")
+                existing.first().filtersJson == com.olympquant.terminal.engine.DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT
 
             if (!hasOnlySniperM) {
-                val activeDuration = existing.firstOrNull { it.isEnabled }?.durationSeconds ?: 5
                 dao.clearAllStrategies()
-                val sniperConfig = HardLockedMandate.fromScript(
-                    id = 1L,
-                    scriptCode = com.olympquant.terminal.engine.DefaultStrategyScripts.withDurationSec(
-                        com.olympquant.terminal.engine.DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT,
-                        activeDuration
-                    ),
-                    isPreset = true,
-                    isEnabled = true
-                )
+                val sniperConfig = HardLockedMandate.lockedStrategyConfig()
                 dao.insertStrategy(sniperConfig.toEntity(id = 1L, isEnabled = true))
-                dao.setExclusiveLoadedStrategy(1L)
-            } else if (!existing.first().isEnabled) {
-                dao.setExclusiveLoadedStrategy(existing.first().id)
+            }
+            dao.setExclusiveLoadedStrategy(1L)
+            context.dataStore.edit { prefs ->
+                prefs[Keys.SELECTED_TIMEFRAME_SEC] = 5
             }
         }
     }
 
+    /**
+     * Sniper M is the only supported strategy. This compatibility method deliberately
+     * returns the locked configuration rather than creating a second strategy.
+     */
     suspend fun createStrategyFromTemplate(customName: String, durationSec: Int = 5): StrategyConfig {
-        val script = com.olympquant.terminal.engine.DefaultStrategyScripts.buildNewStrategyTemplate(
-            customName = customName,
-            durationSec = TradeTimeframe.fromSeconds(durationSec).seconds
-        )
-        val parsed = HardLockedMandate.fromScript(
-            id = 0L,
-            scriptCode = script,
-            isPreset = false,
-            isEnabled = true
-        )
-        val newId = dao.insertStrategy(parsed.toEntity(id = 0L, isEnabled = true))
-        dao.setExclusiveLoadedStrategy(newId)
-        return parsed.copy(id = newId, isEnabled = true)
+        ensureSeeded()
+        return HardLockedMandate.lockedStrategyConfig()
     }
 
     suspend fun saveAndLoadStrategyScript(strategyId: Long, scriptCode: String): Result<StrategyConfig> {
-        val compiled = com.olympquant.terminal.engine.StrategyScriptCompiler.compile(scriptCode)
-        if (!compiled.isValid || compiled.parsedScript == null) {
-            val err = compiled.errors.firstOrNull()
-            val msg = if (err != null) {
-                "Line ${err.line} [${err.section}]: ${err.message}"
-            } else {
-                "Invalid .oqs strategy script"
-            }
-            return Result.failure(IllegalArgumentException(msg))
+        val canonical = com.olympquant.terminal.engine.DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT
+        if (scriptCode.trim() != canonical.trim()) {
+            return Result.failure(
+                IllegalArgumentException("Sniper M is locked. Custom and alternate strategies are disabled.")
+            )
         }
-        val existing = dao.getStrategyById(strategyId)
-        val isPreset = existing?.isPreset ?: (strategyId == 1L)
-        val config = HardLockedMandate.fromScript(
-            id = if (strategyId > 0L) strategyId else 0L,
-            scriptCode = scriptCode,
-            isPreset = isPreset,
-            isEnabled = true
-        )
-        val savedId = dao.insertStrategy(config.toEntity(id = config.id, isEnabled = true))
-        dao.setExclusiveLoadedStrategy(savedId)
-        context.dataStore.edit { prefs ->
-            prefs[Keys.SELECTED_TIMEFRAME_SEC] = TradeTimeframe.fromSeconds(config.durationSeconds).seconds
+        return runCatching {
+            resetToDefaultStrategy()
         }
-        return Result.success(config.copy(id = savedId, isEnabled = true))
     }
 
     suspend fun updateSelectedTimeframe(durationSec: Int) {
-        val validSec = TradeTimeframe.fromSeconds(durationSec).seconds
+        // Sniper M shadow learning and execution are calibrated for a fixed 5-second horizon.
         context.dataStore.edit { prefs ->
-            prefs[Keys.SELECTED_TIMEFRAME_SEC] = validSec
+            prefs[Keys.SELECTED_TIMEFRAME_SEC] = 5
         }
-        val all = dao.getAllStrategies()
-        val active = all.firstOrNull { it.isEnabled } ?: all.firstOrNull() ?: return
-        val updatedScript = com.olympquant.terminal.engine.DefaultStrategyScripts.withDurationSec(
-            scriptCode = active.filtersJson.ifBlank { com.olympquant.terminal.engine.DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT },
-            durationSec = validSec
-        )
-        val updatedConfig = HardLockedMandate.fromScript(
-            id = active.id,
-            scriptCode = updatedScript,
-            isPreset = active.isPreset,
-            isEnabled = true
-        )
-        dao.insertStrategy(updatedConfig.toEntity(id = active.id, isEnabled = true))
+        ensureSeeded()
+    }
+
+    suspend fun loadStrategy(strategyId: Long) {
+        ensureSeeded()
+        dao.setExclusiveLoadedStrategy(1L)
+    }
+
+    suspend fun deleteStrategy(strategyId: Long) {
+        resetToDefaultStrategy()
+    }
+
+    suspend fun resetToDefaultStrategy(): StrategyConfig {
+        dao.clearAllStrategies()
+        val sniperDefault = HardLockedMandate.lockedStrategyConfig()
+        val id = dao.insertStrategy(sniperDefault.toEntity(id = 1L, isEnabled = true))
+        dao.setExclusiveLoadedStrategy(id)
+        context.dataStore.edit { prefs ->
+            prefs[Keys.SELECTED_TIMEFRAME_SEC] = 5
+        }
+        return sniperDefault.copy(id = id, isEnabled = true)
+    }
+
+    suspend fun readSniperLearningState(): String {
+        return context.dataStore.data.first()[Keys.SNIPER_LEARNING_STATE].orEmpty()
+    }
+
+    suspend fun saveSniperLearningState(serializedState: String) {
+        context.dataStore.edit { prefs ->
+            prefs[Keys.SNIPER_LEARNING_STATE] = serializedState
+        }
     }
 
     suspend fun updateAutoPauseOnHvAvoid(enabled: Boolean) {
@@ -380,40 +370,6 @@ class OlympQuantRepository(
         context.dataStore.edit { prefs ->
             prefs[Keys.HOURLY_SNIPER_MODE] = enabled
         }
-    }
-
-    suspend fun loadStrategy(strategyId: Long) {
-        dao.setExclusiveLoadedStrategy(strategyId)
-        val loaded = dao.getStrategyById(strategyId)
-        if (loaded != null) {
-            context.dataStore.edit { prefs ->
-                prefs[Keys.SELECTED_TIMEFRAME_SEC] = TradeTimeframe.fromSeconds(loaded.durationSeconds).seconds
-            }
-        }
-    }
-
-    suspend fun deleteStrategy(strategyId: Long) {
-        val all = dao.getAllStrategies()
-        if (all.size <= 1) {
-            resetToDefaultStrategy()
-            return
-        }
-        dao.deleteStrategyById(strategyId)
-        val remaining = dao.getAllStrategies()
-        if (remaining.isNotEmpty() && remaining.none { it.isEnabled }) {
-            dao.setExclusiveLoadedStrategy(remaining.first().id)
-        }
-    }
-
-    suspend fun resetToDefaultStrategy(): StrategyConfig {
-        dao.clearAllStrategies()
-        val sniperDefault = HardLockedMandate.highVoltageStrategyConfig(durationSec = 5)
-        val id = dao.insertStrategy(sniperDefault.toEntity(id = 1L, isEnabled = true))
-        dao.setExclusiveLoadedStrategy(id)
-        context.dataStore.edit { prefs ->
-            prefs[Keys.SELECTED_TIMEFRAME_SEC] = 5
-        }
-        return sniperDefault.copy(id = id, isEnabled = true)
     }
 
     private fun StrategyConfig.toEntity(id: Long, isEnabled: Boolean): StrategyEntity = StrategyEntity(
