@@ -213,29 +213,21 @@ class ModularStrategyEngine {
             contextPassed &&
             telemetry.hardStopReason == null
 
-        // Pure Sniper M surge confidence calculation (incorporates SNR, purity, convexity acceleration, and arrival compression)
-        val convexityBoost = ((rush.tickConvexity - 0.85).coerceIn(-0.3, 0.8)) * 8.0
-        val compressionBoost = ((1.05 - rush.arrivalCompressionRatio).coerceIn(-0.2, 0.5)) * 6.0
-        val surgeConfidenceBoost = if (rawSignal != SignalDirection.NONE && allFiltersPassed) {
-            (66.0 +
-                min(18.0, (rush.rushSnr - 1.0).coerceAtLeast(0.0) * 12.0) +
-                min(10.0, (rush.purityPercent - 60.0).coerceAtLeast(0.0) * 0.25) +
-                convexityBoost +
-                compressionBoost)
-                .finiteOr(74.0)
+        // This is a deterministic signal-quality index, NOT a win-probability estimate.
+        // The FTRL/temporal probability remains telemetry-only until it has enough real labels.
+        val effectiveConfidence = if (rawSignal != SignalDirection.NONE && allFiltersPassed) {
+            (
+                45.0 +
+                    min(18.0, (rush.rushSnr - 1.0).coerceAtLeast(0.0) * 12.0) +
+                    min(15.0, (rush.purityPercent - 50.0).coerceAtLeast(0.0) * 0.35) +
+                    ((rush.tickConvexity - 0.55).coerceIn(0.0, 1.5) * 5.0) +
+                    ((rush.tickSpeedTps - 1.15).coerceAtLeast(0.0).coerceAtMost(2.0) * 2.0) +
+                    (if (rush.tipAligned) 8.0 else 0.0) +
+                    ((1.05 - rush.arrivalCompressionRatio).coerceIn(0.0, 0.5) * 4.0)
+                ).finiteOr(0.0).coerceIn(0.0, 100.0)
         } else {
             0.0
         }
-        val rawBaseConfidence = max(
-            max(
-                rush.ftrlWinProbPercent.finiteOr(0.0),
-                if (rawSignal != SignalDirection.NONE) temporalSnapshot.calibratedWinProbPercent.finiteOr(0.0) else 0.0
-            ),
-            surgeConfidenceBoost
-        ).coerceIn(0.0, 100.0)
-
-        val contextPenalty = telemetry.contextBlockReasons.size * 25.0
-        val effectiveConfidence = (rawBaseConfidence - contextPenalty).finiteOr(0.0).coerceIn(0.0, 100.0)
         val confidencePassed = effectiveConfidence >= effectiveMinConfidence
         val enoughTicks = telemetry.tickCount >= 8 || telemetry.recentTicks.size >= 8
         val readyToExecute = enoughTicks &&
@@ -685,7 +677,13 @@ class ModularStrategyEngine {
                 }
             }
 
-            // If the tick buffer does not contain a complete bracket, defer.
+            // If the rolling tick buffer has already advanced beyond the target, discard
+            // the unverifiable sample without training on a fabricated later price.
+            if (horizonPrice == null && ticks.firstOrNull()?.timeMs?.let { it > targetTimeMs } == true) {
+                pendingShadowRushes.removeFirst()
+                continue
+            }
+            // If the buffer has not yet supplied the after-horizon tick, defer.
             val settledPrice = horizonPrice ?: break
             pendingShadowRushes.removeFirst()
 
