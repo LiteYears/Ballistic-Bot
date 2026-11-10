@@ -954,7 +954,7 @@ class TerminalViewModel(
         val prefs = sessionPrefs.value
         _telemetry.value = MarketTelemetryState(
             pair = pair,
-            selectedTimeframeSec = TradeTimeframe.fromSeconds(prefs.selectedTimeframeSec).seconds,
+            selectedTimeframeSec = 5,
             autopilotArmed = _autopilotArmed.value,
             autopilotStandby = _autopilotStandby.value,
             hourlySniperMode = prefs.hourlySniperMode
@@ -1010,9 +1010,7 @@ class TerminalViewModel(
 
         val prefs = sessionPrefs.value
         val activeStrategy = currentLoadedStrategy()
-        val selectedTfSec = TradeTimeframe.fromSeconds(
-            prefs.selectedTimeframeSec.takeIf { it > 0 } ?: activeStrategy.durationSeconds
-        ).seconds
+        val selectedTfSec = 5
         val orderFlowImbalance = wsClient.orderFlowImbalance.value
         val tickIntensityRatio = wsClient.tickIntensityRatio.value
         val assetPayoutPct = wsClient.assetPayoutPercent.value
