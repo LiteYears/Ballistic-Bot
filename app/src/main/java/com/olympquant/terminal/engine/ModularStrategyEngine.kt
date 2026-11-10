@@ -118,7 +118,7 @@ class ModularStrategyEngine {
     fun getLiveSymbolSnapshot(
         telemetry: MarketTelemetryState,
         wsLatencyMs: Long,
-        scriptCode: String = DefaultStrategyScripts.DEFAULT_OQS_SCRIPT
+        scriptCode: String = DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT
     ): Map<String, Double> {
         val rush = extractRawTickRushMetrics(telemetry, mutateState = false)
         val temporalSnapshot = temporalEngine.pushObservationFrame(telemetry, rush, wsLatencyMs, mutateState = false)
@@ -509,12 +509,7 @@ class ModularStrategyEngine {
             )
 
             // Predict 5-second continuation probability P(Win 5s) via FTRL-Proximal dot product
-            val ftrlWinProbPercent = if (candidateDir != SignalDirection.NONE && rushSnr >= 1.05 && purityPercent >= 55.0) {
-                predictFtrlWinProbability(featureVector) * 100.0
-            } else {
-                // No unsupported low-probability prior: an untrained model remains neutral.
-                predictFtrlWinProbability(featureVector) * 100.0
-            }
+            val ftrlWinProbPercent = predictFtrlWinProbability(featureVector) * 100.0
 
             // Enqueue virtual shadow rush at the active timeframe horizon so the model learns online
             if (
