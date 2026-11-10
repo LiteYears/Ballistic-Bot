@@ -448,7 +448,7 @@ data class StrategyConfig(
     val triggerThreshold: Double,
     val regimeAdaptiveMode: RegimeAdaptiveMode,
     val filters: List<StrategyFilterRule>,
-    val scriptCode: String = DefaultStrategyScripts.DEFAULT_OQS_SCRIPT,
+    val scriptCode: String = DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT,
     val stakeMode: String = "PERCENT_BALANCE",
     val stakeValue: Double = HardLockedMandate.BALANCE_STAKE_PERCENT,
     val minStakeUsd: Double = HardLockedMandate.MIN_STAKE_USD,
