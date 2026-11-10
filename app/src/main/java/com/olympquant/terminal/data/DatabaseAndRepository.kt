@@ -360,40 +360,6 @@ class OlympQuantRepository(
         }
     }
 
-    suspend fun loadStrategy(strategyId: Long) {
-        dao.setExclusiveLoadedStrategy(strategyId)
-        val loaded = dao.getStrategyById(strategyId)
-        if (loaded != null) {
-            context.dataStore.edit { prefs ->
-                prefs[Keys.SELECTED_TIMEFRAME_SEC] = TradeTimeframe.fromSeconds(loaded.durationSeconds).seconds
-            }
-        }
-    }
-
-    suspend fun deleteStrategy(strategyId: Long) {
-        val all = dao.getAllStrategies()
-        if (all.size <= 1) {
-            resetToDefaultStrategy()
-            return
-        }
-        dao.deleteStrategyById(strategyId)
-        val remaining = dao.getAllStrategies()
-        if (remaining.isNotEmpty() && remaining.none { it.isEnabled }) {
-            dao.setExclusiveLoadedStrategy(remaining.first().id)
-        }
-    }
-
-    suspend fun resetToDefaultStrategy(): StrategyConfig {
-        dao.clearAllStrategies()
-        val sniperDefault = HardLockedMandate.highVoltageStrategyConfig(durationSec = 5)
-        val id = dao.insertStrategy(sniperDefault.toEntity(id = 1L, isEnabled = true))
-        dao.setExclusiveLoadedStrategy(id)
-        context.dataStore.edit { prefs ->
-            prefs[Keys.SELECTED_TIMEFRAME_SEC] = 5
-        }
-        return sniperDefault.copy(id = id, isEnabled = true)
-    }
-
     private fun StrategyConfig.toEntity(id: Long, isEnabled: Boolean): StrategyEntity = StrategyEntity(
         id = id,
         name = this.name,
