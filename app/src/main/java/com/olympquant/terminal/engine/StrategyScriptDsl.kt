@@ -85,17 +85,6 @@ gate "2. Tick Stream Surge (SNR >= 1.25x & Speed >= 1.15 T/s)" : rush_snr >= 1.2
 gate "3. Clean Surge Purity (>= 65% & No 1-Tick Glitch)" : tick_purity >= 65.0 and tip_aligned == 1 and single_tick_dominance <= 65.0 and ws_latency_ms <= 250
 """.trimIndent()
 
-    fun withDurationSec(scriptCode: String, durationSec: Int): String {
-        val validSec = durationSec.coerceIn(5, 900)
-        val regex = Regex("""(?m)^(\s*duration_sec\s*=\s*)\d+(.*)$""")
-        return if (regex.containsMatchIn(scriptCode)) {
-            regex.replace(scriptCode, "$1$validSec$2")
-        } else {
-            scriptCode
-        }
-    }
-
-
     @Immutable
     data class VariableDoc(
         val name: String,
