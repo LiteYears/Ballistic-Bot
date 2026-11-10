@@ -57,12 +57,6 @@ min_confidence = 58.0
 max_daily_trades = 10
 max_consecutive_losses = 3
 
-[VARIABLES]
-let smooth_spread = z_fast - z_slow
-let surge_snr = max(rush_snr, roll_mean(rush_snr, 3))
-let surge_purity = max(tick_purity, roll_mean(tick_purity, 4))
-let surge_power = (surge_snr * 0.65) + (tick_convexity * 0.35)
-
 [SIGNAL_UP]
 rush_dir == UP
 zlema_trend_dir == UP
