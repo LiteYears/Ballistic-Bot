@@ -473,20 +473,14 @@ class QuantPipelineUnitTest {
     }
 
     @Test
-    fun `test HighVoltage5s 6 strict mathematical filters, HV Window states, TIGHT_CHOP and CRAZY_WHIPSAW traps, and Trade Timeframe Expansion`() {
-        // 1. Verify Trade Timeframe Expansion (5s, 15s, 30s, 45s, 1m / 60s)
-        val timeframes = com.olympquant.terminal.domain.TradeTimeframe.entries
-        assertEquals(listOf(5, 15, 30, 45, 60), timeframes.map { it.seconds })
-        assertEquals(listOf("5s", "15s", "30s", "45s", "1m"), timeframes.map { it.label })
-
-        for (tf in timeframes) {
-            val hvConfig = HardLockedMandate.highVoltageStrategyConfig(durationSec = tf.seconds)
-            assertEquals("Sniper M", hvConfig.name)
-            assertEquals(tf.seconds, hvConfig.durationSeconds)
-            val compiled = StrategyScriptCompiler.compile(hvConfig.scriptCode)
-            assertTrue("Sniper M script for ${tf.label} must compile cleanly: ${compiled.errors}", compiled.isValid)
-            assertEquals(tf.seconds, compiled.parsedScript?.execution?.durationSec)
-        }
+    fun `test Sniper M five-second lock, strict mathematical filters, HV Window states, and chop/whipsaw guards`() {
+        // 1. Sniper M has one immutable five-second execution horizon.
+        val lockedConfig = HardLockedMandate.lockedStrategyConfig()
+        assertEquals("Sniper M", lockedConfig.name)
+        assertEquals(5, lockedConfig.durationSeconds)
+        val compiledLocked = StrategyScriptCompiler.compile(lockedConfig.scriptCode)
+        assertTrue("Canonical Sniper M script must compile cleanly: ${compiledLocked.errors}", compiledLocked.isValid)
+        assertEquals(5, compiledLocked.parsedScript?.execution?.durationSec)
 
         // 2. Verify Clean Breakout Momentum -> HV Window EXCELLENT (>=75%) and all 6 HighVoltage filters PASS
         val candleEngine = CandleEngine()
@@ -533,7 +527,7 @@ class QuantPipelineUnitTest {
 
         // Evaluate HighVoltage5s_HVWindow strategy across expanded 30s timeframe:
         val strategyEngine = ModularStrategyEngine()
-        val hv30sStrategy = HardLockedMandate.highVoltageStrategyConfig(durationSec = 30)
+        val hv30sStrategy = HardLockedMandate.lockedStrategyConfig()
         val cleanTelemetry = MarketTelemetryState(
             pair = "LATAM_X",
             latestPrice = cleanBreakoutTicks.last().price,
@@ -705,7 +699,7 @@ class QuantPipelineUnitTest {
             selectedTimeframeSec = 5
         )
         val fxEval = strategyEngine.evaluateStrategy(
-            strategy = HardLockedMandate.highVoltageStrategyConfig(durationSec = 5),
+            strategy = HardLockedMandate.lockedStrategyConfig(),
             telemetry = fxTelemetry,
             wsLatencyMs = 28L
         )
@@ -804,12 +798,12 @@ class QuantPipelineUnitTest {
     }
 
     @Test
-    fun `test Audited Mathematical Guards block context traps low consistency climax exhaustion and settle shadow learning at selected timeframe`() {
+    fun `test Audited Mathematical Guards block context traps and settle Sniper M shadow learning at five seconds`() {
         val baseTimeMs = 1700000000000L
         val candleEngine = CandleEngine()
         val indicatorEngine = IndicatorEngine()
         val strategyEngine = ModularStrategyEngine()
-        val hvStrategy = HardLockedMandate.highVoltageStrategyConfig(durationSec = 15)
+        val hvStrategy = HardLockedMandate.lockedStrategyConfig()
 
         // 1. Build clean breakout baseline
         val cleanTicks = mutableListOf<Tick>()
