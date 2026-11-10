@@ -130,7 +130,7 @@ private enum class ChartRenderMode(val label: String) {
 fun TerminalWorkstationScreen(
     sessionPrefs: SessionPreferences,
     telemetry: MarketTelemetryState,
-    loadedStrategy: StrategyConfig = HardLockedMandate.highVoltageStrategyConfig(),
+    loadedStrategy: StrategyConfig = HardLockedMandate.lockedStrategyConfig(),
     connectionStatus: WsConnectionStatus,
     wsLatencyMs: Long,
     botRunning: Boolean,
@@ -790,7 +790,7 @@ private fun ExecutionControlDeckCard(
                             )
                             Spacer(Modifier.width(5.dp))
                             Text(
-                                text = "TRADE TIMEFRAME EXPANSION",
+                                text = "SNIPER M FIXED EXPIRY",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = ElectricCyan,
                                 fontWeight = FontWeight.Bold
@@ -808,7 +808,7 @@ private fun ExecutionControlDeckCard(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        TradeTimeframe.entries.forEach { tf ->
+                        TradeTimeframe.entries.filter { it.seconds == 5 }.forEach { tf ->
                             val isSelected = tf == selectedTf
                             Surface(
                                 onClick = { onSelectTimeframe(tf.seconds) },
