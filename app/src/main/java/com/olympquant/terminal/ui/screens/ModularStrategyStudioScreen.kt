@@ -253,10 +253,10 @@ fun ModularStrategyStudioScreen(
     var statusBanner by remember { mutableStateOf<String?>(null) }
     var statusIsError by remember { mutableStateOf(false) }
     var copyConfirmationMessage by remember { mutableStateOf<String?>(null) }
-        var showVariableReference by rememberSaveable { mutableStateOf(false) }
+    var showVariableReference by rememberSaveable { mutableStateOf(false) }
 
     LaunchedEffect(selectedStrategy.id, selectedStrategy.scriptCode) {
-        val targetCode = selectedStrategy.scriptCode.ifBlank { DefaultStrategyScripts.HIGH_VOLTAGE_OQS_SCRIPT }
+        val targetCode = selectedStrategy.scriptCode.ifBlank { DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT }
         if (editorText != targetCode) {
             editorText = targetCode
         }
