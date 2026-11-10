@@ -59,6 +59,8 @@ class ModularStrategyEngine {
 
     companion object {
         private const val FEATURE_DIM = 11
+        private const val MIN_ADAPTIVE_LABELS = 30
+        private const val MIN_FTRL_WIN_PROBABILITY = 0.53
         private const val FTRL_ALPHA = 0.14
         private const val FTRL_BETA = 1.0
         private const val FTRL_L1 = 0.015
@@ -256,9 +258,8 @@ class ModularStrategyEngine {
             contextPassed &&
             telemetry.hardStopReason == null
 
-        // This is a deterministic signal-quality index, NOT a win-probability estimate.
-        // The FTRL/temporal probability remains telemetry-only until it has enough real labels.
-        val effectiveConfidence = if (rawSignal != SignalDirection.NONE && allFiltersPassed) {
+        // Deterministic signal-quality score remains separate from the learned win probability.
+        val rawSignalQuality = if (rawSignal != SignalDirection.NONE && allFiltersPassed) {
             (
                 45.0 +
                     min(18.0, (rush.rushSnr - 1.0).coerceAtLeast(0.0) * 12.0) +
@@ -271,7 +272,18 @@ class ModularStrategyEngine {
         } else {
             0.0
         }
-        val confidencePassed = effectiveConfidence >= effectiveMinConfidence
+        // After 30 independently spaced, correctly matured shadow labels, FTRL becomes a live
+        // meta-filter. Before that cold-start threshold, the established Sniper M logic is unchanged.
+        val adaptiveModelReady = shadowSamplesCount >= MIN_ADAPTIVE_LABELS
+        val learnedWinProbability = (rush.ftrlWinProbPercent / 100.0).finiteOr(0.5).coerceIn(0.01, 0.99)
+        val adaptiveModelPassed = !adaptiveModelReady || learnedWinProbability >= MIN_FTRL_WIN_PROBABILITY
+        val effectiveConfidence = if (adaptiveModelReady) {
+            (rawSignalQuality + ((learnedWinProbability - 0.5) * 20.0).coerceIn(-10.0, 8.0))
+                .finiteOr(0.0).coerceIn(0.0, 100.0)
+        } else {
+            rawSignalQuality
+        }
+        val confidencePassed = effectiveConfidence >= effectiveMinConfidence && adaptiveModelPassed
         val enoughTicks = telemetry.tickCount >= 8 || telemetry.recentTicks.size >= 8
         val readyToExecute = enoughTicks &&
             temporalSnapshot.snapshotSynchronized &&
@@ -287,6 +299,8 @@ class ModularStrategyEngine {
 
         val triggerReason = if (!contextPassed && rawSignal != SignalDirection.NONE) {
             "BLOCKED [${rawSignal.name}]: ${telemetry.contextBlockReasons.first()}"
+        } else if (rawSignal != SignalDirection.NONE && allFiltersPassed && adaptiveModelReady && !adaptiveModelPassed) {
+            "Sniper M [${rawSignal.name}] blocked by runtime learner: P(5s continuation)=${"%.1f".format(learnedWinProbability * 100.0)}% < ${(MIN_FTRL_WIN_PROBABILITY * 100.0).toInt()}%"
         } else if (rawSignal != SignalDirection.NONE && allFiltersPassed) {
             "Sniper M [SURGE ${rawSignal.name} ${parsedScript.execution.durationSec}s]: Smooth=$smoothedDirLabel • Surge=${"%.2f".format(rush.rushSnr)}x • Convex=${"%.2f".format(rush.tickConvexity)}x • Speed=${"%.2f".format(rush.tickSpeedTps)}T/s • Purity=${"%.0f".format(rush.purityPercent)}%"
         } else {
@@ -560,7 +574,7 @@ class ModularStrategyEngine {
                 candidateDir != SignalDirection.NONE &&
                 rushSnr >= 1.22 &&
                 purityPercent >= 62.0 &&
-                latestTimeMs - lastShadowEnqueueTimeMs >= 900L
+                latestTimeMs - lastShadowEnqueueTimeMs >= 5_000L
             ) {
                 lastShadowEnqueueTimeMs = latestTimeMs
                 if (pendingShadowRushes.size >= 48) {
