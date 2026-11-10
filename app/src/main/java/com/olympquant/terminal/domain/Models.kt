@@ -498,8 +498,8 @@ data class TemporalTelemetrySnapshot(
     val falsePositiveRatePercent: Double = 0.0,
     val impulseDetectionRatePercent: Double = 0.0,
     val signalLatencyMs: Long = 0L,
-    val calibrationAccuracyPercent: Double = 83.2,
-    val oosExpectancyPercent: Double = 18.4
+    val calibrationAccuracyPercent: Double = 0.0,
+    val oosExpectancyPercent: Double = 0.0
 )
 
 @Immutable
