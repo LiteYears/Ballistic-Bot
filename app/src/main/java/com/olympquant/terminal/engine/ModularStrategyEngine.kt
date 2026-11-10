@@ -627,7 +627,7 @@ class ModularStrategyEngine {
         } else {
             -((localZScore15 - 2.85) * 1.4).finiteOr(0.0).coerceIn(0.0, 2.5)
         }
-        val f7 = ((shadowWinRate - 0.52) / 0.20).finiteOr(0.0).coerceIn(-2.0, 2.0)
+        val f7 = ((shadowWinRate - 0.50) / 0.20).finiteOr(0.0).coerceIn(-2.0, 2.0)
 
         // Non-linear cross-feature interactions
         val f8 = (f1 * f2).coerceIn(-2.5, 3.0)
