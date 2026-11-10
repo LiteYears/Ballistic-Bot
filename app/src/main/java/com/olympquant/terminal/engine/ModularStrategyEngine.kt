@@ -14,7 +14,6 @@ import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.sign
 import kotlin.math.sqrt
 
 /**
@@ -32,7 +31,7 @@ class ModularStrategyEngine {
         val direction: SignalDirection,
         val features: DoubleArray,
         val regime: TemporalRegimeType = TemporalRegimeType.EXPANSION_IMPULSE,
-        val predictedProb: Double = 0.65,
+        val predictedProb: Double = 0.5,
         val wasSpikeNoise: Boolean = false,
         val horizonMs: Long = 5000L
     )
@@ -66,23 +65,6 @@ class ModularStrategyEngine {
         private const val FTRL_L2 = 0.12
         private const val FORGETTING_GAMMA = 0.985
 
-        // Microstructure-informed warm-start prior weights:
-        // [0]=Bias, [1]=RushSNR_4, [2]=TickConvexity, [3]=ArrivalCompression,
-        // [4]=SmoothDominance(Anti-Spike), [5]=MicroPullbackRecovery, [6]=LocalZScore_15,
-        // [7]=RollingShadowWinRate_5s, [8]=SNR*Convexity, [9]=SNR*SmoothDominance, [10]=Convexity*Compression
-        private val PRIOR_WEIGHTS = doubleArrayOf(
-            0.34, // w0: Intercept
-            0.56, // w1: RushSNR_4
-            0.42, // w2: TickConvexity
-            0.28, // w3: ArrivalCompressionRatio
-            0.54, // w4: SmoothStepDistribution (penalizes single-tick spike traps)
-            0.30, // w5: MicroPullbackRecovery
-            0.26, // w6: LocalZScore_15 headroom
-            0.44, // w7: RollingShadowWinRate_5s
-            0.34, // w8: Non-linear Cross (RushSNR * TickConvexity)
-            0.48, // w9: Non-linear Cross (RushSNR * SmoothStepDistribution)
-            0.25  // w10: Non-linear Cross (TickConvexity * ArrivalCompression)
-        )
     }
 
     private val ftrlZ = DoubleArray(FEATURE_DIM)
@@ -90,7 +72,7 @@ class ModularStrategyEngine {
     private val ftrlW = DoubleArray(FEATURE_DIM)
     private val pendingShadowRushes = ArrayDeque<PendingShadowRush>(64)
     private var lastShadowEnqueueTimeMs: Long = 0L
-    private var rollingShadowWinRate: Double = 0.66
+    private var rollingShadowWinRate: Double = 0.5
     private var shadowSamplesCount: Int = 0
     val temporalEngine = TemporalIntelligenceEngine()
 
@@ -105,17 +87,16 @@ class ModularStrategyEngine {
     fun reset() {
         pendingShadowRushes.clear()
         lastShadowEnqueueTimeMs = 0L
-        rollingShadowWinRate = 0.66
+        rollingShadowWinRate = 0.5
         shadowSamplesCount = 0
         cachedScriptHash = 0
         cachedCompileResult = null
         temporalEngine.reset()
         for (i in 0 until FEATURE_DIM) {
-            ftrlN[i] = 1.0
-            val denom = ((FTRL_BETA + sqrt(ftrlN[i])) / FTRL_ALPHA) + FTRL_L2
-            val prior = PRIOR_WEIGHTS[i]
-            ftrlZ[i] = -(prior * denom + sign(prior) * FTRL_L1)
-            ftrlW[i] = prior
+            // Neutral cold start: no hand-authored weights or assumed edge.
+            ftrlZ[i] = 0.0
+            ftrlN[i] = 0.0
+            ftrlW[i] = 0.0
         }
     }
 
@@ -309,7 +290,7 @@ class ModularStrategyEngine {
 
             // Step A: Resolve any matured virtual shadow rushes and update FTRL-Proximal weights online!
             if (mutateState) {
-                settleMaturedShadowRushes(latestTimeMs, latestTick.price)
+                settleMaturedShadowRushes(latestTimeMs, ticks)
             }
 
             val k = min(4, lastIdx)
@@ -555,7 +536,7 @@ class ModularStrategyEngine {
                 if (pendingShadowRushes.size >= 48) {
                     pendingShadowRushes.removeFirst()
                 }
-                val horizonMs = (telemetry.selectedTimeframeSec.coerceIn(5, 60)) * 1000L
+                val horizonMs = 5_000L // Sniper M is a fixed five-second continuation model.
                 pendingShadowRushes.addLast(
                     PendingShadowRush(
                         entryTimeMs = latestTimeMs,
@@ -669,25 +650,52 @@ class ModularStrategyEngine {
         return doubleArrayOf(1.0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10)
     }
 
-    private fun settleMaturedShadowRushes(currentTimeMs: Long, currentPrice: Double) {
+    private fun settleMaturedShadowRushes(currentTimeMs: Long, ticks: List<com.olympquant.terminal.domain.Tick>) {
         if (pendingShadowRushes.isNotEmpty() && currentTimeMs < pendingShadowRushes.first().entryTimeMs) {
-            // Stream clock rewound (e.g., replay or simulation reset)
+            // Stream clock rewound (e.g., replay or simulation reset).
             pendingShadowRushes.clear()
             lastShadowEnqueueTimeMs = 0L
             return
         }
+
         while (pendingShadowRushes.isNotEmpty()) {
             val oldest = pendingShadowRushes.first()
-            if (currentTimeMs - oldest.entryTimeMs < oldest.horizonMs) break
+            val targetTimeMs = oldest.entryTimeMs + oldest.horizonMs
+            if (currentTimeMs < targetTimeMs) break
+
+            // Use the price at the exact horizon, interpolated between the two
+            // surrounding timestamped ticks. Never label using a later tick.
+            var horizonPrice: Double? = null
+            for (i in 1 until ticks.size) {
+                val before = ticks[i - 1]
+                val after = ticks[i]
+                if (before.timeMs <= targetTimeMs && after.timeMs >= targetTimeMs &&
+                    before.timeMs > 0L && after.timeMs > 0L &&
+                    before.price.isFinite() && after.price.isFinite()
+                ) {
+                    val span = after.timeMs - before.timeMs
+                    horizonPrice = if (span <= 0L) {
+                        after.price
+                    } else {
+                        val fraction = ((targetTimeMs - before.timeMs).toDouble() / span.toDouble())
+                            .coerceIn(0.0, 1.0)
+                        before.price + (after.price - before.price) * fraction
+                    }
+                    break
+                }
+            }
+
+            // If the tick buffer does not contain a complete bracket, defer.
+            val settledPrice = horizonPrice ?: break
             pendingShadowRushes.removeFirst()
 
-            val isContinuationWin = (oldest.direction == SignalDirection.UP && currentPrice > oldest.entryPrice) ||
-                (oldest.direction == SignalDirection.DOWN && currentPrice < oldest.entryPrice)
-            val isTie = abs(currentPrice - oldest.entryPrice) < 1e-9
+            val isContinuationWin = (oldest.direction == SignalDirection.UP && settledPrice > oldest.entryPrice) ||
+                (oldest.direction == SignalDirection.DOWN && settledPrice < oldest.entryPrice)
+            val isTie = abs(settledPrice - oldest.entryPrice) < 1e-9
             if (!isTie) {
                 val labelY = if (isContinuationWin) 1.0 else 0.0
                 updateFtrlWeightsOnline(oldest.features, labelY)
-                rollingShadowWinRate = (0.85 * rollingShadowWinRate + 0.15 * labelY).coerceIn(0.15, 0.92)
+                rollingShadowWinRate = (0.85 * rollingShadowWinRate + 0.15 * labelY).coerceIn(0.0, 1.0)
                 shadowSamplesCount++
                 temporalEngine.recordShadowOutcome(
                     direction = oldest.direction,
