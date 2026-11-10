@@ -578,7 +578,6 @@ fun ModularStrategyStudioScreen(
                                 Surface(
                                     onClick = {
                                         onSelectTimeframe(tf.seconds)
-                                        editorText = DefaultStrategyScripts.withDurationSec(editorText, tf.seconds)
                                     },
                                     shape = RoundedCornerShape(6.dp),
                                     color = if (isSelected) ElectricCyan.copy(alpha = 0.2f) else SlateSurface,
