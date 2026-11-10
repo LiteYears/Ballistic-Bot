@@ -65,6 +65,11 @@ class TemporalIntelligenceEngine {
     private val regimeShadowWins = IntArray(4)
     private val regimeShadowTotal = IntArray(4)
 
+    // Bounded walk-forward outcomes by regime and direction (last 32 labels per bucket).
+    private val recentRegimeDirectionOutcomes = Array(4) { Array(2) { IntArray(32) } }
+    private val recentRegimeDirectionHead = Array(4) { IntArray(2) }
+    private val recentRegimeDirectionCount = Array(4) { IntArray(2) }
+
     // Walk-forward calibration & false-positive / impulse-detection tracking
     private var brierErrorEma: Double = 0.25 // Neutral Brier baseline before observations
     private var falsePositiveShadows: Int = 0
@@ -94,6 +99,13 @@ class TemporalIntelligenceEngine {
         downShadowTotal = 0
         Arrays.fill(regimeShadowWins, 0)
         Arrays.fill(regimeShadowTotal, 0)
+        for (regime in 0 until 4) {
+            for (direction in 0 until 2) {
+                Arrays.fill(recentRegimeDirectionOutcomes[regime][direction], 0)
+                recentRegimeDirectionHead[regime][direction] = 0
+                recentRegimeDirectionCount[regime][direction] = 0
+            }
+        }
         brierErrorEma = 0.25
         falsePositiveShadows = 0
         totalNoiseEventsClassified = 0
@@ -130,6 +142,19 @@ class TemporalIntelligenceEngine {
         regimeShadowTotal[rIdx]++
         if (won) regimeShadowWins[rIdx]++
 
+        val directionIndex = when (direction) {
+            SignalDirection.UP -> 0
+            SignalDirection.DOWN -> 1
+            SignalDirection.NONE -> -1
+        }
+        if (directionIndex >= 0) {
+            val head = recentRegimeDirectionHead[rIdx][directionIndex]
+            recentRegimeDirectionOutcomes[rIdx][directionIndex][head] = if (won) 1 else 0
+            recentRegimeDirectionHead[rIdx][directionIndex] = (head + 1) % 32
+            recentRegimeDirectionCount[rIdx][directionIndex] =
+                (recentRegimeDirectionCount[rIdx][directionIndex] + 1).coerceAtMost(32)
+        }
+
         if (wasSpikeNoise) {
             totalNoiseEventsClassified++
             if (!won) falsePositiveShadows++
@@ -137,6 +162,39 @@ class TemporalIntelligenceEngine {
             totalGenuineImpulses++
             if (won) detectedGenuineImpulses++
         }
+    }
+
+    @Synchronized
+    fun recentRegimeDirectionSampleCount(
+        regime: TemporalRegimeType,
+        direction: SignalDirection
+    ): Int {
+        val directionIndex = when (direction) {
+            SignalDirection.UP -> 0
+            SignalDirection.DOWN -> 1
+            SignalDirection.NONE -> return 0
+        }
+        return recentRegimeDirectionCount[regime.ordinal.coerceIn(0, 3)][directionIndex]
+    }
+
+    @Synchronized
+    fun recentRegimeDirectionWinRate(
+        regime: TemporalRegimeType,
+        direction: SignalDirection
+    ): Double? {
+        val directionIndex = when (direction) {
+            SignalDirection.UP -> 0
+            SignalDirection.DOWN -> 1
+            SignalDirection.NONE -> return null
+        }
+        val regimeIndex = regime.ordinal.coerceIn(0, 3)
+        val count = recentRegimeDirectionCount[regimeIndex][directionIndex]
+        if (count == 0) return null
+        var wins = 0
+        for (value in recentRegimeDirectionOutcomes[regimeIndex][directionIndex]) {
+            wins += value
+        }
+        return (wins.toDouble() / count.toDouble()).coerceIn(0.0, 1.0)
     }
 
     @Synchronized
