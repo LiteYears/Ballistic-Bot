@@ -66,7 +66,7 @@ class TemporalIntelligenceEngine {
     private val regimeShadowTotal = IntArray(4)
 
     // Walk-forward calibration & false-positive / impulse-detection tracking
-    private var brierErrorEma: Double = 0.14 // Initialized to calibrated baseline
+    private var brierErrorEma: Double = 0.25 // Neutral Brier baseline before observations
     private var falsePositiveShadows: Int = 0
     private var totalNoiseEventsClassified: Int = 0
     private var detectedGenuineImpulses: Int = 0
@@ -94,7 +94,7 @@ class TemporalIntelligenceEngine {
         downShadowTotal = 0
         Arrays.fill(regimeShadowWins, 0)
         Arrays.fill(regimeShadowTotal, 0)
-        brierErrorEma = 0.14
+        brierErrorEma = 0.25
         falsePositiveShadows = 0
         totalNoiseEventsClassified = 0
         detectedGenuineImpulses = 0
@@ -294,7 +294,7 @@ class TemporalIntelligenceEngine {
         val upWinRatePct = if (upShadowTotal >= 3) {
             (upShadowWins.toDouble() / upShadowTotal.toDouble()) * 100.0
         } else {
-            66.0
+            50.0
         }
         val downWinRatePct = if (downShadowTotal >= 3) {
             (downShadowWins.toDouble() / downShadowTotal.toDouble()) * 100.0
@@ -314,22 +314,13 @@ class TemporalIntelligenceEngine {
             SignalDirection.NONE -> 50.0
         }
 
-        // Cold-start protection: An untrained FTRL model (shadowSamplesLearned < 8) must NOT veto a strong impulse!
-        val coldStartWeight = (rush.shadowSamplesLearned.toDouble() / 10.0).coerceIn(0.25, 1.0)
-        val impulseStructuralConfidence = (
-            (min(rush.rushSnr / 1.85, 1.35) * 44.0) +
-                (max(rush.purityPercent, rollingPurityMean4) * 0.34) +
-                (if (rush.tipAligned) 10.0 else 0.0) +
-                (if (noiseClean) 8.0 else -18.0)
-            ).coerceIn(25.0, 92.0)
-
-        val calibratedWinProbPct = (
-            (rush.ftrlWinProbPercent * coldStartWeight) +
-                (impulseStructuralConfidence * (1.0 - coldStartWeight))
-            ).let { blended ->
-                // Incorporate empirical directional & regime accuracy
-                (blended * 0.78 + directionalWinRate * 0.12 + regimeWinRatePct * 0.10).coerceIn(15.0, 95.0)
-            }
+        // Do not present heuristic signal strength or small-sample rates as a win probability.
+        // Until the online model has enough settled 5s labels, report an honest neutral estimate.
+        val calibratedWinProbPct = if (rush.shadowSamplesLearned >= 30) {
+            rush.ftrlWinProbPercent.finiteOr(50.0).coerceIn(1.0, 99.0)
+        } else {
+            50.0
+        }
 
         // 7. 3-Layer Signal Architecture Scores
         // Layer 1: Market Eligibility (Hard rejection on noise/latency/payout/stale snapshot)
@@ -369,20 +360,24 @@ class TemporalIntelligenceEngine {
             val flickerRatio = totalGateFlips.toDouble() / totalGateEvaluations.toDouble()
             ((1.0 - flickerRatio * 0.65) * 100.0).coerceIn(55.0, 99.5)
         } else {
-            92.5
+            0.0
         }
         val falsePositiveRatePct = if (totalNoiseEventsClassified > 0) {
             ((falsePositiveShadows.toDouble() / max(1, totalNoiseEventsClassified + 6).toDouble()) * 100.0)
-                .coerceIn(2.0, 45.0)
+                .coerceIn(0.0, 100.0)
         } else {
-            6.8
+            0.0
         }
         val impulseDetectionRatePct = if (totalGenuineImpulses > 0) {
             ((detectedGenuineImpulses.toDouble() / totalGenuineImpulses.toDouble()) * 100.0).coerceIn(55.0, 98.0)
         } else {
-            84.0
+            0.0
         }
-        val calibrationAccuracyPct = ((1.0 - sqrt(brierErrorEma) * 0.45) * 100.0).coerceIn(60.0, 96.0)
+        val calibrationAccuracyPct = if (rush.shadowSamplesLearned >= 30) {
+            ((1.0 - sqrt(brierErrorEma) * 0.45) * 100.0).coerceIn(0.0, 100.0)
+        } else {
+            0.0
+        }
         val payoutYield = (telemetry.assetPayoutPercent.coerceIn(70, 95)) / 100.0
         val winProbFrac = (calibratedWinProbPct / 100.0).coerceIn(0.1, 0.95)
         val oosExpectancyPct = ((winProbFrac * payoutYield) - (1.0 - winProbFrac)) * 100.0
