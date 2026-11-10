@@ -878,7 +878,7 @@ object StrategyScriptCompiler {
         map["arrival_compression"] = rush.arrivalCompressionRatio.finiteOr(1.0)
         map["pullback_recovery"] = rush.microPullbackRecovery.finiteOr(0.0)
         map["local_zscore_15"] = rush.localZScore15.finiteOr(0.0)
-        map["ftrl_win_prob"] = rush.ftrlWinProbPercent.finiteOr(0.0)
+        map["ftrl_win_prob"] = if (rush.shadowSamplesLearned >= 30) rush.ftrlWinProbPercent.finiteOr(50.0) else 50.0
         map["shadow_win_rate"] = rush.rollingShadowWinRatePercent.finiteOr(0.0)
         map["shadow_samples"] = rush.shadowSamplesLearned.toDouble()
         map["avg_noise_step"] = rush.avgNoiseStep.finiteOr(1e-5)
@@ -886,7 +886,7 @@ object StrategyScriptCompiler {
         map["last_step_ratio"] = rush.lastStepRatio.finiteOr(0.0)
 
         // X13 Temporal Intelligence Built-In Variables
-        map["calibrated_win_prob"] = max(rush.ftrlWinProbPercent, temporal.calibratedWinProbPercent).finiteOr(50.0)
+        map["calibrated_win_prob"] = temporal.calibratedWinProbPercent.finiteOr(50.0)
         map["eligibility_passed"] = if (temporal.eligibilityLayerPassed) 1.0 else 0.0
         map["signal_layer_score"] = temporal.signalLayerScore.finiteOr(0.0)
         map["validation_layer_score"] = temporal.validationLayerScore.finiteOr(0.0)
