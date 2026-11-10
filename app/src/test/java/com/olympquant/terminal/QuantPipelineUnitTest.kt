@@ -26,6 +26,26 @@ import org.junit.Test
 class QuantPipelineUnitTest {
 
     @Test
+    fun `test FTRL starts neutral and restores only validated persisted state`() {
+        val original = ModularStrategyEngine()
+        val features = DoubleArray(11).also {
+            it[0] = 1.0
+            it[1] = 1.0
+            it[2] = 0.5
+        }
+        assertEquals(0.5, original.predictFtrlWinProbability(features), 1e-9)
+
+        original.updateFtrlWeightsOnline(features, 1.0)
+        val expectedProbability = original.predictFtrlWinProbability(features)
+        val snapshot = original.exportLearningState()
+
+        val restored = ModularStrategyEngine()
+        assertTrue(restored.restoreLearningState(snapshot))
+        assertEquals(expectedProbability, restored.predictFtrlWinProbability(features), 1e-9)
+        assertFalse(restored.restoreLearningState("corrupt|state"))
+    }
+
+    @Test
     fun `test HardLockedMandate stake sizing enforces 1 min, 5 percent balance, and 4000 max`() {
         assertEquals(1.0, HardLockedMandate.computeLockedStake(0.0), 1e-6)
         assertEquals(1.0, HardLockedMandate.computeLockedStake(10.0), 1e-6)
