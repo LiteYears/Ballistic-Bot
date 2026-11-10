@@ -25,6 +25,7 @@ import com.olympquant.terminal.domain.StrategyConfig
 import com.olympquant.terminal.domain.TerminalDensityMode
 import com.olympquant.terminal.domain.TradeTimeframe
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import java.security.MessageDigest
 
@@ -219,6 +220,7 @@ class OlympQuantRepository(
         val SELECTED_TIMEFRAME_SEC = intPreferencesKey("selected_timeframe_sec")
         val AUTO_PAUSE_ON_HV_AVOID = booleanPreferencesKey("auto_pause_on_hv_avoid")
         val HOURLY_SNIPER_MODE = booleanPreferencesKey("hourly_sniper_mode")
+        val SNIPER_LEARNING_STATE = stringPreferencesKey("sniper_m_ftrl_state_v1")
     }
 
     val sessionFlow: Flow<SessionPreferences> = context.dataStore.data.map { prefs ->
@@ -346,6 +348,16 @@ class OlympQuantRepository(
             prefs[Keys.SELECTED_TIMEFRAME_SEC] = 5
         }
         return sniperDefault.copy(id = id, isEnabled = true)
+    }
+
+    suspend fun readSniperLearningState(): String {
+        return context.dataStore.data.first()[Keys.SNIPER_LEARNING_STATE].orEmpty()
+    }
+
+    suspend fun saveSniperLearningState(serializedState: String) {
+        context.dataStore.edit { prefs ->
+            prefs[Keys.SNIPER_LEARNING_STATE] = serializedState
+        }
     }
 
     suspend fun updateAutoPauseOnHvAvoid(enabled: Boolean) {
