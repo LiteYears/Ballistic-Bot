@@ -308,12 +308,6 @@ class TemporalIntelligenceEngine {
             50.0
         }
 
-        val directionalWinRate = when (rush.rushDirection) {
-            SignalDirection.UP -> upWinRatePct
-            SignalDirection.DOWN -> downWinRatePct
-            SignalDirection.NONE -> 50.0
-        }
-
         // Do not present heuristic signal strength or small-sample rates as a win probability.
         // Until the online model has enough settled 5s labels, report an honest neutral estimate.
         val calibratedWinProbPct = if (rush.shadowSamplesLearned >= 30) {
@@ -361,18 +355,18 @@ class TemporalIntelligenceEngine {
         // Section 6 Validation Telemetry Metrics
         val gateStabilityPct = if (totalGateEvaluations > 8L) {
             val flickerRatio = totalGateFlips.toDouble() / totalGateEvaluations.toDouble()
-            ((1.0 - flickerRatio * 0.65) * 100.0).coerceIn(55.0, 99.5)
+            ((1.0 - flickerRatio * 0.65) * 100.0).coerceIn(0.0, 100.0)
         } else {
             0.0
         }
         val falsePositiveRatePct = if (totalNoiseEventsClassified > 0) {
-            ((falsePositiveShadows.toDouble() / max(1, totalNoiseEventsClassified + 6).toDouble()) * 100.0)
+            ((falsePositiveShadows.toDouble() / totalNoiseEventsClassified.toDouble()) * 100.0)
                 .coerceIn(0.0, 100.0)
         } else {
             0.0
         }
         val impulseDetectionRatePct = if (totalGenuineImpulses > 0) {
-            ((detectedGenuineImpulses.toDouble() / totalGenuineImpulses.toDouble()) * 100.0).coerceIn(55.0, 98.0)
+            ((detectedGenuineImpulses.toDouble() / totalGenuineImpulses.toDouble()) * 100.0).coerceIn(0.0, 100.0)
         } else {
             0.0
         }
