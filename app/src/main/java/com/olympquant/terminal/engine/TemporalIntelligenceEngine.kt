@@ -74,9 +74,9 @@ class TemporalIntelligenceEngine {
 
     // Regime transition tracking
     private var lastRegimeType: TemporalRegimeType = TemporalRegimeType.CONSOLIDATION
-    private var regimeStableTicks: Int = 4
+    private var regimeStableTicks: Int = 0
     private var currentImpulseStartMs: Long = 0L
-    private var lastSignalLatencyMs: Long = 165L
+    private var lastSignalLatencyMs: Long = 0L
 
     @Synchronized
     fun reset() {
@@ -100,9 +100,9 @@ class TemporalIntelligenceEngine {
         detectedGenuineImpulses = 0
         totalGenuineImpulses = 0
         lastRegimeType = TemporalRegimeType.CONSOLIDATION
-        regimeStableTicks = 4
+        regimeStableTicks = 0
         currentImpulseStartMs = 0L
-        lastSignalLatencyMs = 165L
+        lastSignalLatencyMs = 0L
     }
 
     @Synchronized
@@ -291,18 +291,18 @@ class TemporalIntelligenceEngine {
         }
 
         // 6. Calibrated Prediction Engine (Directional & Regime-Stratified + Cold-Start Guard)
-        val upWinRatePct = if (upShadowTotal >= 3) {
+        val upWinRatePct = if (upShadowTotal >= 30) {
             (upShadowWins.toDouble() / upShadowTotal.toDouble()) * 100.0
         } else {
             50.0
         }
-        val downWinRatePct = if (downShadowTotal >= 3) {
+        val downWinRatePct = if (downShadowTotal >= 30) {
             (downShadowWins.toDouble() / downShadowTotal.toDouble()) * 100.0
         } else {
             50.0
         }
         val rIdx = detectedRegime.ordinal.coerceIn(0, 3)
-        val regimeWinRatePct = if (regimeShadowTotal[rIdx] >= 3) {
+        val regimeWinRatePct = if (regimeShadowTotal[rIdx] >= 30) {
             (regimeShadowWins[rIdx].toDouble() / regimeShadowTotal[rIdx].toDouble()) * 100.0
         } else {
             50.0
@@ -353,7 +353,7 @@ class TemporalIntelligenceEngine {
         }
 
         // Section 6 Validation Telemetry Metrics
-        val gateStabilityPct = if (totalGateEvaluations > 8L) {
+        val gateStabilityPct = if (totalGateEvaluations > 30L) {
             val flickerRatio = totalGateFlips.toDouble() / totalGateEvaluations.toDouble()
             ((1.0 - flickerRatio * 0.65) * 100.0).coerceIn(0.0, 100.0)
         } else {
