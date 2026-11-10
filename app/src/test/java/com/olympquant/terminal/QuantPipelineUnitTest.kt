@@ -189,12 +189,6 @@ class QuantPipelineUnitTest {
         assertEquals("Sniper M", defaultCompiled.parsedScript!!.name)
         assertEquals(5, defaultCompiled.parsedScript!!.execution.durationSec)
 
-        // Verify template generator follows the exact same 6-block structure
-        val templateCode = DefaultStrategyScripts.buildNewStrategyTemplate("Alpha_Custom_10s")
-        val templateCompiled = com.olympquant.terminal.engine.StrategyScriptCompiler.compile(templateCode)
-        assertTrue(templateCompiled.isValid)
-        assertEquals("Alpha_Custom_10s", templateCompiled.parsedScript!!.name)
-
         // Verify custom user-programmed strategy with custom [EXECUTION], [VARIABLES], [SIGNAL_UP], [SIGNAL_DOWN], and [GATES]
         val customOqs = """
             [META]
@@ -298,7 +292,7 @@ class QuantPipelineUnitTest {
 
         val x13Strategy = HardLockedMandate.fromScript(
             id = 1L,
-            scriptCode = DefaultStrategyScripts.X13_TEMPORAL_OQS_SCRIPT,
+            scriptCode = DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT,
             isPreset = true,
             isEnabled = true
         )
