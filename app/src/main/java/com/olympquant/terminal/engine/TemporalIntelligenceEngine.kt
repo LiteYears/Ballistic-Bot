@@ -299,13 +299,13 @@ class TemporalIntelligenceEngine {
         val downWinRatePct = if (downShadowTotal >= 3) {
             (downShadowWins.toDouble() / downShadowTotal.toDouble()) * 100.0
         } else {
-            66.0
+            50.0
         }
         val rIdx = detectedRegime.ordinal.coerceIn(0, 3)
         val regimeWinRatePct = if (regimeShadowTotal[rIdx] >= 3) {
             (regimeShadowWins[rIdx].toDouble() / regimeShadowTotal[rIdx].toDouble()) * 100.0
         } else {
-            66.0
+            50.0
         }
 
         val directionalWinRate = when (rush.rushDirection) {
@@ -349,11 +349,14 @@ class TemporalIntelligenceEngine {
             ).finiteOr(0.0).coerceIn(0.0, 100.0)
 
         // Layer 3: Prediction Validation (Confidence assessment)
-        val validationLayerScore = (
-            calibratedWinProbPct * 0.70 +
+        val validationLayerScore = if (rush.shadowSamplesLearned >= 30) {
+            (calibratedWinProbPct * 0.70 +
                 (if (regimeTransitionStable) 15.0 else 5.0) +
                 (min(regimeWinRatePct, 85.0) * 0.18)
             ).finiteOr(0.0).coerceIn(0.0, 100.0)
+        } else {
+            0.0
+        }
 
         // Section 6 Validation Telemetry Metrics
         val gateStabilityPct = if (totalGateEvaluations > 8L) {
@@ -380,7 +383,11 @@ class TemporalIntelligenceEngine {
         }
         val payoutYield = (telemetry.assetPayoutPercent.coerceIn(70, 95)) / 100.0
         val winProbFrac = (calibratedWinProbPct / 100.0).coerceIn(0.1, 0.95)
-        val oosExpectancyPct = ((winProbFrac * payoutYield) - (1.0 - winProbFrac)) * 100.0
+        val oosExpectancyPct = if (rush.shadowSamplesLearned >= 30) {
+            ((winProbFrac * payoutYield) - (1.0 - winProbFrac)) * 100.0
+        } else {
+            0.0
+        }
 
         return TemporalTelemetrySnapshot(
             snapshotSynchronized = snapshotSynchronized,
