@@ -905,11 +905,11 @@ object StrategyScriptCompiler {
         map["regime_stable"] = if (temporal.regimeTransitionStable) 1.0 else 0.0
         map["regime_snr_thresh"] = temporal.regimeSnrThreshold.finiteOr(1.32)
         map["regime_purity_thresh"] = temporal.regimePurityThreshold.finiteOr(70.0)
-        map["up_win_rate"] = temporal.upWinRatePercent.finiteOr(66.0)
-        map["down_win_rate"] = temporal.downWinRatePercent.finiteOr(66.0)
-        map["regime_win_rate"] = temporal.regimeWinRatePercent.finiteOr(66.0)
-        map["gate_stability_pct"] = temporal.gateStabilityPercent.finiteOr(92.5)
-        map["oos_expectancy_pct"] = temporal.oosExpectancyPercent.finiteOr(18.0)
+        map["up_win_rate"] = temporal.upWinRatePercent.finiteOr(50.0)
+        map["down_win_rate"] = temporal.downWinRatePercent.finiteOr(50.0)
+        map["regime_win_rate"] = temporal.regimeWinRatePercent.finiteOr(50.0)
+        map["gate_stability_pct"] = temporal.gateStabilityPercent.finiteOr(0.0)
+        map["oos_expectancy_pct"] = temporal.oosExpectancyPercent.finiteOr(0.0)
 
         // Pre-populate rolling & hysteresis lookup keys for DSL functions `roll_mean(...)`, `roll_median(...)`, `ema(...)`, `hysteresis(...)`
         if (temporalEngine != null) {
