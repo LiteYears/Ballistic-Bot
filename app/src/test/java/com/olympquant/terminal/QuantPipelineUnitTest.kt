@@ -46,6 +46,51 @@ class QuantPipelineUnitTest {
     }
 
     @Test
+    fun `test recent regime-direction performance uses bounded walk-forward outcomes`() {
+        val temporal = com.olympquant.terminal.engine.TemporalIntelligenceEngine()
+        repeat(16) {
+            temporal.recordShadowOutcome(
+                direction = SignalDirection.UP,
+                regime = com.olympquant.terminal.domain.TemporalRegimeType.TREND,
+                predictedProb = 0.5,
+                won = false,
+                wasSpikeNoise = false
+            )
+        }
+        assertEquals(16, temporal.recentRegimeDirectionSampleCount(
+            com.olympquant.terminal.domain.TemporalRegimeType.TREND,
+            SignalDirection.UP
+        ))
+        assertEquals(0.0, temporal.recentRegimeDirectionWinRate(
+            com.olympquant.terminal.domain.TemporalRegimeType.TREND,
+            SignalDirection.UP
+        )!!, 1e-9)
+
+        // The ring is capped at 32; new outcomes replace the oldest observations.
+        repeat(20) {
+            temporal.recordShadowOutcome(
+                direction = SignalDirection.UP,
+                regime = com.olympquant.terminal.domain.TemporalRegimeType.TREND,
+                predictedProb = 0.5,
+                won = true,
+                wasSpikeNoise = false
+            )
+        }
+        assertEquals(32, temporal.recentRegimeDirectionSampleCount(
+            com.olympquant.terminal.domain.TemporalRegimeType.TREND,
+            SignalDirection.UP
+        ))
+        assertEquals(0.625, temporal.recentRegimeDirectionWinRate(
+            com.olympquant.terminal.domain.TemporalRegimeType.TREND,
+            SignalDirection.UP
+        )!!, 1e-9)
+        assertEquals(0, temporal.recentRegimeDirectionSampleCount(
+            com.olympquant.terminal.domain.TemporalRegimeType.CONSOLIDATION,
+            SignalDirection.UP
+        ))
+    }
+
+    @Test
     fun `test HardLockedMandate stake sizing enforces 1 min, 5 percent balance, and 4000 max`() {
         assertEquals(1.0, HardLockedMandate.computeLockedStake(0.0), 1e-6)
         assertEquals(1.0, HardLockedMandate.computeLockedStake(10.0), 1e-6)
