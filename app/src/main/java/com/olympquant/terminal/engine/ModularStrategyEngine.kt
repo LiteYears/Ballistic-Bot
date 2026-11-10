@@ -101,6 +101,48 @@ class ModularStrategyEngine {
     }
 
     @Synchronized
+    internal fun exportLearningState(): String {
+        return buildString {
+            append("SNIPER_FTRL_V1|")
+            append(shadowSamplesCount)
+            append('|')
+            append(rollingShadowWinRate)
+            for (value in ftrlZ) {
+                append('|')
+                append(value)
+            }
+            for (value in ftrlN) {
+                append('|')
+                append(value)
+            }
+        }
+    }
+
+    @Synchronized
+    internal fun restoreLearningState(serialized: String): Boolean {
+        val parts = serialized.split('|')
+        if (parts.size != 3 + FEATURE_DIM * 2 || parts[0] != "SNIPER_FTRL_V1") return false
+        val samples = parts[1].toIntOrNull()?.takeIf { it >= 0 } ?: return false
+        val rollingRate = parts[2].toDoubleOrNull()?.takeIf { it.isFinite() && it in 0.0..1.0 } ?: return false
+        val zValues = parts.subList(3, 3 + FEATURE_DIM).map { it.toDoubleOrNull() ?: return false }
+        val nValues = parts.subList(3 + FEATURE_DIM, parts.size).map { it.toDoubleOrNull() ?: return false }
+        if (zValues.any { !it.isFinite() || abs(it) > 1.0e12 }) return false
+        if (nValues.any { !it.isFinite() || it < 0.0 || it > 1.0e12 }) return false
+
+        shadowSamplesCount = samples
+        rollingShadowWinRate = rollingRate
+        for (i in 0 until FEATURE_DIM) {
+            ftrlZ[i] = zValues[i]
+            ftrlN[i] = nValues[i]
+        }
+        predictFtrlWinProbability(DoubleArray(FEATURE_DIM))
+        return true
+    }
+
+    @Synchronized
+    internal fun learnedSampleCount(): Int = shadowSamplesCount
+
+    @Synchronized
     private fun getOrCompileScript(scriptCode: String): DslCompileResult {
         val codeToCompile = scriptCode.ifBlank { DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT }
         val hash = codeToCompile.hashCode()
