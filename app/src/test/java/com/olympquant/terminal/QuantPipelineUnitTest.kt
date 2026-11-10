@@ -200,7 +200,7 @@ class QuantPipelineUnitTest {
     }
 
     @Test
-    fun `test OQS Strategy Script Compiler, uniform 6-block structure, and custom loaded strategy execution`() {
+    fun `test OQS parser diagnostics while live execution remains hard-locked to Sniper M`() {
         val defaultCompiled = com.olympquant.terminal.engine.StrategyScriptCompiler.compile(
             DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT
         )
@@ -277,17 +277,16 @@ class QuantPipelineUnitTest {
             zSlow = 4500.2
         )
 
+        // A custom script can still be parsed for diagnostics, but the live engine must ignore it.
         val engine = ModularStrategyEngine()
         val eval = engine.evaluateStrategy(
             strategy = customConfig,
             telemetry = telemetry,
             wsLatencyMs = 45L
         )
-        assertEquals("User_Custom_Reversal_15s", eval.strategyName)
-        assertEquals(SignalDirection.UP, eval.finalSignal)
-        assertEquals(2, eval.filterDiagnostics.size)
-        assertEquals("Custom Ratio Gate", eval.filterDiagnostics[0].gateTitle)
-        assertTrue(eval.readyToExecute)
+        assertEquals("Sniper M", eval.strategyName)
+        assertEquals(58.0, eval.minConfidenceRequired, 1e-6)
+        assertTrue("Live execution must retain Sniper M's five-second script", eval.triggerReason.contains("5s"))
 
         // Verify syntax error reporting when a mandatory block or unknown variable is used
         val brokenOqs = """
