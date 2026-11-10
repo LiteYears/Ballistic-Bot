@@ -248,7 +248,7 @@ fun ModularStrategyStudioScreen(
     }
 
     var editorText by rememberSaveable(selectedStrategy.id) {
-        mutableStateOf(selectedStrategy.scriptCode.ifBlank { DefaultStrategyScripts.HIGH_VOLTAGE_OQS_SCRIPT })
+        mutableStateOf(selectedStrategy.scriptCode.ifBlank { DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT })
     }
     var statusBanner by remember { mutableStateOf<String?>(null) }
     var statusIsError by remember { mutableStateOf(false) }
