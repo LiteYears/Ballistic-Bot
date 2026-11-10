@@ -556,13 +556,11 @@ class TerminalViewModel(
     }
 
     fun selectTradeTimeframe(durationSec: Int) {
-        val tf = TradeTimeframe.fromSeconds(durationSec)
-        _telemetry.value = _telemetry.value.copy(selectedTimeframeSec = tf.seconds)
+        // The strategy's horizon is locked to five seconds; ignore legacy timeframe requests.
+        _telemetry.value = _telemetry.value.copy(selectedTimeframeSec = 5)
         viewModelScope.launch(Dispatchers.IO) {
-            repository.updateSelectedTimeframe(tf.seconds)
-            val active = currentLoadedStrategy()
-            _lastExecutionBanner.value =
-                "Trade Timeframe Expanded: ${tf.label} (${tf.title}) • Active on ${active.name}"
+            repository.updateSelectedTimeframe(5)
+            _lastExecutionBanner.value = "Sniper M fixed expiry: 5 seconds"
             pushForegroundNotification(force = true)
         }
     }
@@ -646,18 +644,9 @@ class TerminalViewModel(
 
     fun currentLoadedStrategy(): StrategyConfig {
         val list = strategies.value
-        val base = list.firstOrNull { it.isEnabled }
+        return list.firstOrNull { it.isEnabled }
             ?: list.firstOrNull()
-            ?: HardLockedMandate.highVoltageStrategyConfig(durationSec = sessionPrefs.value.selectedTimeframeSec)
-        val tfSec = TradeTimeframe.fromSeconds(sessionPrefs.value.selectedTimeframeSec.takeIf { it > 0 } ?: base.durationSeconds).seconds
-        return if (base.durationSeconds != tfSec) {
-            base.copy(
-                durationSeconds = tfSec,
-                scriptCode = com.olympquant.terminal.engine.DefaultStrategyScripts.withDurationSec(base.scriptCode, tfSec)
-            )
-        } else {
-            base
-        }
+            ?: HardLockedMandate.lockedStrategyConfig()
     }
 
     fun getLiveSymbolSnapshot(scriptCode: String): Map<String, Double> {
@@ -862,9 +851,7 @@ class TerminalViewModel(
         }
 
         val stake = stats.lockedStakeUsd
-        val duration = TradeTimeframe.fromSeconds(
-            prefs.selectedTimeframeSec.takeIf { it > 0 } ?: activeStrategy.durationSeconds
-        ).seconds
+        val duration = 5
         val accountId = if (prefs.accountGroup == "real") prefs.realAccountId else prefs.demoAccountId
         val snap = _telemetry.value
         val tradeId = now % 1_000_000L
