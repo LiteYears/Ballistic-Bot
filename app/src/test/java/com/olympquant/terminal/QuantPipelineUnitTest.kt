@@ -88,6 +88,40 @@ class QuantPipelineUnitTest {
             com.olympquant.terminal.domain.TemporalRegimeType.CONSOLIDATION,
             SignalDirection.UP
         ))
+
+        // Fingerprint statistics use their own bounded outcome window.
+        repeat(16) {
+            temporal.recordShadowOutcome(
+                direction = SignalDirection.UP,
+                regime = com.olympquant.terminal.domain.TemporalRegimeType.TREND,
+                predictedProb = 0.5,
+                won = false,
+                wasSpikeNoise = true,
+                fingerprint = ModularStrategyEngine.ShadowFingerprint.SPIKE_DOMINANCE
+            )
+        }
+        assertEquals(16, temporal.recentFingerprintSampleCount(
+            ModularStrategyEngine.ShadowFingerprint.SPIKE_DOMINANCE
+        ))
+        assertEquals(0.0, temporal.recentFingerprintWinRate(
+            ModularStrategyEngine.ShadowFingerprint.SPIKE_DOMINANCE
+        )!!, 1e-9)
+        repeat(20) {
+            temporal.recordShadowOutcome(
+                direction = SignalDirection.UP,
+                regime = com.olympquant.terminal.domain.TemporalRegimeType.TREND,
+                predictedProb = 0.5,
+                won = true,
+                wasSpikeNoise = false,
+                fingerprint = ModularStrategyEngine.ShadowFingerprint.SPIKE_DOMINANCE
+            )
+        }
+        assertEquals(32, temporal.recentFingerprintSampleCount(
+            ModularStrategyEngine.ShadowFingerprint.SPIKE_DOMINANCE
+        ))
+        assertEquals(0.625, temporal.recentFingerprintWinRate(
+            ModularStrategyEngine.ShadowFingerprint.SPIKE_DOMINANCE
+        )!!, 1e-9)
     }
 
     @Test
@@ -239,6 +273,24 @@ class QuantPipelineUnitTest {
             )
         )
         assertTrue(postShadowMetrics.shadowSamplesLearned >= 1)
+
+        // A five-second outcome bracketed only by a six-second reconnect gap is unverifiable.
+        val gapEngine = ModularStrategyEngine()
+        gapEngine.extractRawTickRushMetrics(rushTelemetry)
+        val gapOnlyTick = Tick(
+            pair = "LATAM_X",
+            price = rushTicks.last().price + 1.25,
+            timeMs = rushTicks.last().timeMs + 5200L
+        )
+        gapEngine.extractRawTickRushMetrics(
+            rushTelemetry.copy(
+                latestPrice = gapOnlyTick.price,
+                latestTimeMs = gapOnlyTick.timeMs,
+                tickCount = rushTicks.size + 1,
+                recentTicks = rushTicks + gapOnlyTick
+            )
+        )
+        assertEquals(0, gapEngine.learnedSampleCount())
 
         // 5. Verify Hard Stop blocks execution when 10 trades or 3 consecutive losses are reached
         val hardStoppedEval = strategyEngine.evaluateStrategy(
