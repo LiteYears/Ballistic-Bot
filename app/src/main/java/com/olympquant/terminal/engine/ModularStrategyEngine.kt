@@ -329,7 +329,7 @@ class ModularStrategyEngine {
         } else if (rawSignal != SignalDirection.NONE && allFiltersPassed && !regimePerformancePassed) {
             "Sniper M [${rawSignal.name}] paused: recent ${temporalSnapshot.regimeType.name} ${rawSignal.name} hit rate=${"%.1f".format((regimeDirectionWinRate ?: 0.0) * 100.0)}% over ${regimeDirectionSampleCount} labels"
         } else if (rawSignal != SignalDirection.NONE && allFiltersPassed && !fingerprintPerformancePassed) {
-            "Sniper M [${rawSignal.name}] paused: recent ${rush.shadowFingerprint.name} outcomes=${fingerprintSampleCount}, hit rate=${\"%.1f\".format((fingerprintWinRate ?: 0.0) * 100.0)}%"
+            "Sniper M [${rawSignal.name}] paused: recent ${rush.shadowFingerprint.name} outcomes=${fingerprintSampleCount}, hit rate=${"%.1f".format((fingerprintWinRate ?: 0.0) * 100.0)}%"
         } else if (rawSignal != SignalDirection.NONE && allFiltersPassed && adaptiveModelReady && !adaptiveModelPassed) {
             "Sniper M [${rawSignal.name}] blocked by runtime learner: P(5s continuation)=${"%.1f".format(learnedWinProbability * 100.0)}% < ${(MIN_FTRL_WIN_PROBABILITY * 100.0).toInt()}%"
         } else if (rawSignal != SignalDirection.NONE && allFiltersPassed) {
