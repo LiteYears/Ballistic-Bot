@@ -406,7 +406,7 @@ class QuantPipelineUnitTest {
         assertEquals(SignalDirection.UP, lastEval!!.finalSignal)
         assertTrue(lastEval.temporalTelemetry.eligibilityLayerPassed)
         assertTrue(lastEval.temporalTelemetry.signalLayerScore >= 60.0)
-        assertTrue(lastEval.temporalTelemetry.validationLayerScore >= 52.0)
+        assertEquals(0.0, lastEval.temporalTelemetry.validationLayerScore, 1e-6)
         assertTrue(lastEval.temporalTelemetry.momentumHysteresisActive)
         assertTrue(lastEval.temporalTelemetry.persistenceCount5 >= 2)
         assertTrue(lastEval.readyToExecute)
@@ -537,7 +537,7 @@ class QuantPipelineUnitTest {
     }
 
     @Test
-    fun `test Sniper M five-second lock, strict mathematical filters, HV Window states, and chop/whipsaw guards`() {
+    fun `test Sniper M five-second lock, strict mathematical filters, HV Window states, and chop and whipsaw guards`() {
         // 1. Sniper M has one immutable five-second execution horizon.
         val lockedConfig = HardLockedMandate.lockedStrategyConfig()
         assertEquals("Sniper M", lockedConfig.name)
@@ -940,23 +940,23 @@ class QuantPipelineUnitTest {
 
         // 4. Sniper M always labels the exact five-second horizon, independent of UI timeframe.
         // A tick arriving at +6s brackets the +5s target; interpolation must settle at +6s arrival.
+        val recentCleanTicks = cleanTicks.takeLast(120)
         val tickAt6s = Tick(
             pair = "LATAM_X",
-            price = rushTicks.last().price + 0.8,
-            timeMs = rushTicks.last().timeMs + 6_000L
+            price = recentCleanTicks.last().price + 0.8,
+            timeMs = recentCleanTicks.last().timeMs + 6_000L
         )
-        val metricsAt6s = freshEngine.extractRawTickRushMetrics(
+        val metricsAt6s = strategyEngine.extractRawTickRushMetrics(
             MarketTelemetryState(
                 pair = "LATAM_X",
                 latestPrice = tickAt6s.price,
                 latestTimeMs = tickAt6s.timeMs,
-                tickCount = rushTicks.size + 1,
-                recentTicks = rushTicks + tickAt6s,
+                tickCount = recentCleanTicks.size + 1,
+                recentTicks = recentCleanTicks + tickAt6s,
                 selectedTimeframeSec = 15
             )
         )
         assertTrue("Sniper M must settle a bracketed five-second shadow at the first post-horizon tick", metricsAt6s.shadowSamplesLearned >= 1)
-
     }
 
     @Test

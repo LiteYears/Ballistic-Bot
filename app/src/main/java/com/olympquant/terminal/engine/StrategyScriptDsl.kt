@@ -57,6 +57,9 @@ min_confidence = 58.0
 max_daily_trades = 10
 max_consecutive_losses = 3
 
+[VARIABLES]
+let surge_power = rush_snr * (tick_purity / 100.0)
+
 [SIGNAL_UP]
 rush_dir == UP
 zlema_trend_dir == UP
@@ -469,7 +472,7 @@ object StrategyScriptCompiler {
     private val OR_DELIMITERS = listOf(" or ", " || ")
     private val AND_DELIMITERS = listOf(" and ", " && ")
 
-    private val REQUIRED_SECTIONS = listOf(
+    private val ALLOWED_SECTIONS = listOf(
         "META",
         "EXECUTION",
         "VARIABLES",
@@ -478,9 +481,35 @@ object StrategyScriptCompiler {
         "GATES"
     )
 
+    private val REQUIRED_SECTIONS = listOf(
+        "META",
+        "EXECUTION",
+        "SIGNAL_UP",
+        "SIGNAL_DOWN",
+        "GATES"
+    )
+
     private val BUILTIN_IDENTIFIERS: Set<String> =
         DefaultStrategyScripts.BUILTIN_VARIABLE_DOCS.map { it.name }.toSet() +
-            setOf("UP", "DOWN", "NONE", "TRUE", "FALSE", "true", "false")
+            setOf(
+                "UP", "DOWN", "NONE", "TRUE", "FALSE", "true", "false",
+                "ofi", "ofi_imbalance", "velocity", "tick_intensity",
+                "micro_impulse_score", "micro_efficiency", "micro_acceleration",
+                "zlema_spread", "volatility", "consistency", "persistence",
+                "slope_ratio", "rel_pos", "hvoi_score", "sr_distance",
+                "hmm_state", "hmm_confidence", "sentiment_pct", "trade_duration_sec",
+                "net_delta_5", "sr_wall_clear", "sr_ahead_dist", "sr_min_clearance",
+                "candle_range_ratio", "vol_compressed", "vol_exhausted", "vol_regime_ok",
+                "opportunity_dir", "continuation_ready", "sr_bounce_ready", "mean_rev_ready",
+                "any_setup_ready", "playbook_type", "opportunity_score",
+                "support_dist", "resistance_dist",
+                "hv_score", "hv_raw_score", "hv_state", "hv_tight_chop", "hv_crazy_whipsaw",
+                "hv_wick_ratio", "hv_body_ratio", "hv_anchor_range_60s", "hv_mtf_aligned", "hv_stability_sec",
+                "eligibility_passed", "roll_snr_3", "roll_purity_4", "roll_ofi_median_5", "roll_impulse_4",
+                "hyst_momentum", "hyst_purity", "hyst_snr", "persist_count_5",
+                "regime_snr_thresh", "regime_purity_thresh", "up_win_rate", "down_win_rate",
+                "regime_win_rate", "gate_stability_pct", "oos_expectancy_pct"
+            )
 
     fun compile(sourceCode: String): DslCompileResult {
         val errors = mutableListOf<DslSyntaxError>()
@@ -503,12 +532,12 @@ object StrategyScriptCompiler {
 
             if (stripped.startsWith("[") && stripped.endsWith("]")) {
                 val secName = stripped.substring(1, stripped.length - 1).trim().uppercase()
-                if (secName !in REQUIRED_SECTIONS) {
+                if (secName !in ALLOWED_SECTIONS) {
                     errors.add(
                         DslSyntaxError(
                             line = lineNum,
                             section = secName,
-                            message = "Unknown section [$secName]. Allowed: ${REQUIRED_SECTIONS.joinToString { "[$it]" }}"
+                            message = "Unknown section [$secName]. Allowed: ${ALLOWED_SECTIONS.joinToString { "[$it]" }}"
                         )
                     )
                 } else {
