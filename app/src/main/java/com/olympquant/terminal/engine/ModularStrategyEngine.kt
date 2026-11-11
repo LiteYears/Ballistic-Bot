@@ -25,6 +25,8 @@ import kotlin.math.sqrt
  */
 class ModularStrategyEngine {
 
+    internal enum class ShadowFingerprint { SPIKE_DOMINANCE, EXHAUSTION, WEAK_FOLLOW_THROUGH, OTHER }
+
     internal data class PendingShadowRush(
         val entryTimeMs: Long,
         val entryPrice: Double,
@@ -33,6 +35,7 @@ class ModularStrategyEngine {
         val regime: TemporalRegimeType = TemporalRegimeType.EXPANSION_IMPULSE,
         val predictedProb: Double = 0.5,
         val wasSpikeNoise: Boolean = false,
+        val fingerprint: ShadowFingerprint = ShadowFingerprint.OTHER,
         val horizonMs: Long = 5000L
     )
 
@@ -54,7 +57,8 @@ class ModularStrategyEngine {
         val localZScore15: Double,
         val rollingShadowWinRatePercent: Double,
         val shadowSamplesLearned: Int,
-        val ftrlWinProbPercent: Double
+        val ftrlWinProbPercent: Double,
+        val shadowFingerprint: ShadowFingerprint = ShadowFingerprint.OTHER
     )
 
     companion object {
@@ -63,6 +67,9 @@ class ModularStrategyEngine {
         private const val MIN_FTRL_WIN_PROBABILITY = 0.53
         private const val MIN_REGIME_DIRECTION_LABELS = 16
         private const val MIN_REGIME_DIRECTION_WIN_RATE = 0.40
+        private const val MIN_FINGERPRINT_LABELS = 16
+        private const val MIN_FINGERPRINT_WIN_RATE = 0.40
+        private const val MAX_SHADOW_LABEL_BRACKET_GAP_MS = 1_500L
         private const val FTRL_ALPHA = 0.14
         private const val FTRL_BETA = 1.0
         private const val FTRL_L1 = 0.015
@@ -291,13 +298,19 @@ class ModularStrategyEngine {
         )
         val regimePerformancePassed = regimeDirectionSampleCount < MIN_REGIME_DIRECTION_LABELS ||
             (regimeDirectionWinRate ?: 0.5) >= MIN_REGIME_DIRECTION_WIN_RATE
+        val fingerprintSampleCount = temporalEngine.recentFingerprintSampleCount(rush.shadowFingerprint)
+        val fingerprintWinRate = temporalEngine.recentFingerprintWinRate(rush.shadowFingerprint)
+        val fingerprintPerformancePassed = rush.shadowFingerprint == ShadowFingerprint.OTHER ||
+            fingerprintSampleCount < MIN_FINGERPRINT_LABELS ||
+            (fingerprintWinRate ?: 0.5) >= MIN_FINGERPRINT_WIN_RATE
         val effectiveConfidence = if (adaptiveModelReady) {
             (rawSignalQuality + ((learnedWinProbability - 0.5) * 20.0).coerceIn(-10.0, 8.0))
                 .finiteOr(0.0).coerceIn(0.0, 100.0)
         } else {
             rawSignalQuality
         }
-        val confidencePassed = effectiveConfidence >= effectiveMinConfidence && adaptiveModelPassed && regimePerformancePassed
+        val confidencePassed = effectiveConfidence >= effectiveMinConfidence && adaptiveModelPassed &&
+            regimePerformancePassed && fingerprintPerformancePassed
         val enoughTicks = telemetry.tickCount >= 8 || telemetry.recentTicks.size >= 8
         val readyToExecute = enoughTicks &&
             temporalSnapshot.snapshotSynchronized &&
@@ -315,6 +328,8 @@ class ModularStrategyEngine {
             "BLOCKED [${rawSignal.name}]: ${telemetry.contextBlockReasons.first()}"
         } else if (rawSignal != SignalDirection.NONE && allFiltersPassed && !regimePerformancePassed) {
             "Sniper M [${rawSignal.name}] paused: recent ${temporalSnapshot.regimeType.name} ${rawSignal.name} hit rate=${"%.1f".format((regimeDirectionWinRate ?: 0.0) * 100.0)}% over ${regimeDirectionSampleCount} labels"
+        } else if (rawSignal != SignalDirection.NONE && allFiltersPassed && !fingerprintPerformancePassed) {
+            "Sniper M [${rawSignal.name}] paused: recent ${rush.shadowFingerprint.name} outcomes=${fingerprintSampleCount}, hit rate=${\"%.1f\".format((fingerprintWinRate ?: 0.0) * 100.0)}%"
         } else if (rawSignal != SignalDirection.NONE && allFiltersPassed && adaptiveModelReady && !adaptiveModelPassed) {
             "Sniper M [${rawSignal.name}] blocked by runtime learner: P(5s continuation)=${"%.1f".format(learnedWinProbability * 100.0)}% < ${(MIN_FTRL_WIN_PROBABILITY * 100.0).toInt()}%"
         } else if (rawSignal != SignalDirection.NONE && allFiltersPassed) {
@@ -583,6 +598,13 @@ class ModularStrategyEngine {
 
             // Predict 5-second continuation probability P(Win 5s) via FTRL-Proximal dot product
             val ftrlWinProbPercent = predictFtrlWinProbability(featureVector) * 100.0
+            val shadowFingerprint = classifyShadowFingerprint(
+                singleTickDominancePercent = singleTickDominancePercent,
+                consecutiveStreak = consecutiveStreak,
+                localZScore15 = localZScore15,
+                microPullbackRecovery = microPullbackRecovery,
+                tickConvexity = tickConvexity
+            )
 
             // Enqueue virtual shadow rush at the active timeframe horizon so the model learns online
             if (
@@ -605,7 +627,8 @@ class ModularStrategyEngine {
                         features = featureVector,
                         regime = if (rushSnr >= 1.45) TemporalRegimeType.EXPANSION_IMPULSE else TemporalRegimeType.TREND,
                         predictedProb = (ftrlWinProbPercent / 100.0).coerceIn(0.1, 0.95),
-                        wasSpikeNoise = singleTickDominancePercent > 64.0,
+                        wasSpikeNoise = shadowFingerprint == ShadowFingerprint.SPIKE_DOMINANCE,
+                        fingerprint = shadowFingerprint,
                         horizonMs = horizonMs
                     )
                 )
@@ -629,7 +652,8 @@ class ModularStrategyEngine {
                 localZScore15 = localZScore15,
                 rollingShadowWinRatePercent = rollingShadowWinRate * 100.0,
                 shadowSamplesLearned = shadowSamplesCount,
-                ftrlWinProbPercent = ftrlWinProbPercent
+                ftrlWinProbPercent = ftrlWinProbPercent,
+                shadowFingerprint = shadowFingerprint
             )
         }
 
@@ -677,8 +701,22 @@ class ModularStrategyEngine {
             localZScore15 = 1.85,
             rollingShadowWinRatePercent = rollingShadowWinRate * 100.0,
             shadowSamplesLearned = shadowSamplesCount,
-            ftrlWinProbPercent = probPct
+            ftrlWinProbPercent = probPct,
+            shadowFingerprint = ShadowFingerprint.OTHER
         )
+    }
+
+    private fun classifyShadowFingerprint(
+        singleTickDominancePercent: Double,
+        consecutiveStreak: Int,
+        localZScore15: Double,
+        microPullbackRecovery: Double,
+        tickConvexity: Double
+    ): ShadowFingerprint = when {
+        singleTickDominancePercent >= 64.0 && consecutiveStreak < 2 -> ShadowFingerprint.SPIKE_DOMINANCE
+        localZScore15 >= 3.0 && microPullbackRecovery < 0.55 -> ShadowFingerprint.EXHAUSTION
+        tickConvexity < 0.90 && microPullbackRecovery < 0.55 -> ShadowFingerprint.WEAK_FOLLOW_THROUGH
+        else -> ShadowFingerprint.OTHER
     }
 
     private fun buildFtrlFeatureVector(
@@ -725,15 +763,33 @@ class ModularStrategyEngine {
 
             // Use the price at the exact horizon, interpolated between the two
             // surrounding timestamped ticks. Never label using a later tick.
-            var horizonPrice: Double? = null
+            // A shadow label is valid only on a strictly increasing, finite timestamp sequence.
+            // Reconnect gaps and malformed/out-of-order ticks must never become interpolated labels.
+            var timestampsValid = true
+            for (i in 1 until ticks.size) {
+                if (ticks[i - 1].timeMs <= 0L || ticks[i].timeMs <= ticks[i - 1].timeMs ||
+                    !ticks[i - 1].price.isFinite() || !ticks[i].price.isFinite()
+                ) {
+                    timestampsValid = false
+                    break
+                }
+            }
+            if (!timestampsValid || oldest.entryTimeMs <= 0L || !oldest.entryPrice.isFinite() || oldest.entryPrice <= 0.0) {
+                pendingShadowRushes.removeFirst()
+                continue
+            }
+
+            var horizonPrice: Double? = ticks.firstOrNull { it.timeMs == targetTimeMs }?.price
+            var invalidBracket = false
             for (i in 1 until ticks.size) {
                 val before = ticks[i - 1]
                 val after = ticks[i]
-                if (before.timeMs <= targetTimeMs && after.timeMs >= targetTimeMs &&
-                    before.timeMs > 0L && after.timeMs > 0L &&
-                    before.price.isFinite() && after.price.isFinite()
-                ) {
+                if (horizonPrice == null && before.timeMs <= targetTimeMs && after.timeMs >= targetTimeMs) {
                     val span = after.timeMs - before.timeMs
+                    if (span <= 0L || span > MAX_SHADOW_LABEL_BRACKET_GAP_MS) {
+                        invalidBracket = true
+                        break
+                    }
                     horizonPrice = if (span <= 0L) {
                         after.price
                     } else {
@@ -745,20 +801,19 @@ class ModularStrategyEngine {
                 }
             }
 
-            // If the rolling tick buffer has already advanced beyond the target, discard
-            // the unverifiable sample without training on a fabricated later price.
-            if (horizonPrice == null && ticks.firstOrNull()?.timeMs?.let { it > targetTimeMs } == true) {
+            // Never defer a matured label indefinitely or substitute a later price. A missing
+            // bracket means the sample is unverifiable (including a gap or a rolled buffer).
+            if (invalidBracket || (horizonPrice == null && currentTimeMs >= targetTimeMs)) {
                 pendingShadowRushes.removeFirst()
                 continue
             }
-            // If the buffer has not yet supplied the after-horizon tick, defer.
             val settledPrice = horizonPrice ?: break
             pendingShadowRushes.removeFirst()
 
             val isContinuationWin = (oldest.direction == SignalDirection.UP && settledPrice > oldest.entryPrice) ||
                 (oldest.direction == SignalDirection.DOWN && settledPrice < oldest.entryPrice)
             val isTie = abs(settledPrice - oldest.entryPrice) < 1e-9
-            if (!isTie) {
+            if (!isTie && settledPrice.isFinite()) {
                 val labelY = if (isContinuationWin) 1.0 else 0.0
                 updateFtrlWeightsOnline(oldest.features, labelY)
                 rollingShadowWinRate = (0.85 * rollingShadowWinRate + 0.15 * labelY).coerceIn(0.0, 1.0)
@@ -768,7 +823,8 @@ class ModularStrategyEngine {
                     regime = oldest.regime,
                     predictedProb = oldest.predictedProb,
                     won = isContinuationWin,
-                    wasSpikeNoise = oldest.wasSpikeNoise
+                    wasSpikeNoise = oldest.wasSpikeNoise,
+                    fingerprint = oldest.fingerprint
                 )
             }
         }
