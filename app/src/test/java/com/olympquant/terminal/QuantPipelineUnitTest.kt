@@ -88,6 +88,40 @@ class QuantPipelineUnitTest {
             com.olympquant.terminal.domain.TemporalRegimeType.CONSOLIDATION,
             SignalDirection.UP
         ))
+
+        // Fingerprint statistics use their own bounded outcome window.
+        repeat(16) {
+            temporal.recordShadowOutcome(
+                direction = SignalDirection.UP,
+                regime = com.olympquant.terminal.domain.TemporalRegimeType.TREND,
+                predictedProb = 0.5,
+                won = false,
+                wasSpikeNoise = true,
+                fingerprint = ModularStrategyEngine.ShadowFingerprint.SPIKE_DOMINANCE
+            )
+        }
+        assertEquals(16, temporal.recentFingerprintSampleCount(
+            ModularStrategyEngine.ShadowFingerprint.SPIKE_DOMINANCE
+        ))
+        assertEquals(0.0, temporal.recentFingerprintWinRate(
+            ModularStrategyEngine.ShadowFingerprint.SPIKE_DOMINANCE
+        )!!, 1e-9)
+        repeat(20) {
+            temporal.recordShadowOutcome(
+                direction = SignalDirection.UP,
+                regime = com.olympquant.terminal.domain.TemporalRegimeType.TREND,
+                predictedProb = 0.5,
+                won = true,
+                wasSpikeNoise = false,
+                fingerprint = ModularStrategyEngine.ShadowFingerprint.SPIKE_DOMINANCE
+            )
+        }
+        assertEquals(32, temporal.recentFingerprintSampleCount(
+            ModularStrategyEngine.ShadowFingerprint.SPIKE_DOMINANCE
+        ))
+        assertEquals(0.625, temporal.recentFingerprintWinRate(
+            ModularStrategyEngine.ShadowFingerprint.SPIKE_DOMINANCE
+        )!!, 1e-9)
     }
 
     @Test
@@ -219,12 +253,17 @@ class QuantPipelineUnitTest {
         assertFalse(spikeEval.readyToExecute)
 
         // 4. Verify 5-second virtual shadow-learning resolves after 5000ms and increments learned sample count
+        val futureTickBeforeHorizon = Tick(
+            pair = "LATAM_X",
+            price = rushTicks.last().price + 0.95,
+            timeMs = rushTicks.last().timeMs + 4800L
+        )
         val futureTick = Tick(
             pair = "LATAM_X",
             price = rushTicks.last().price + 1.25,
             timeMs = rushTicks.last().timeMs + 5200L
         )
-        val postShadowTicks = rushTicks + futureTick
+        val postShadowTicks = rushTicks + listOf(futureTickBeforeHorizon, futureTick)
         val postShadowMetrics = strategyEngine.extractRawTickRushMetrics(
             rushTelemetry.copy(
                 latestPrice = futureTick.price,
@@ -234,6 +273,24 @@ class QuantPipelineUnitTest {
             )
         )
         assertTrue(postShadowMetrics.shadowSamplesLearned >= 1)
+
+        // A five-second outcome bracketed only by a six-second reconnect gap is unverifiable.
+        val gapEngine = ModularStrategyEngine()
+        gapEngine.extractRawTickRushMetrics(rushTelemetry)
+        val gapOnlyTick = Tick(
+            pair = "LATAM_X",
+            price = rushTicks.last().price + 1.25,
+            timeMs = rushTicks.last().timeMs + 5200L
+        )
+        gapEngine.extractRawTickRushMetrics(
+            rushTelemetry.copy(
+                latestPrice = gapOnlyTick.price,
+                latestTimeMs = gapOnlyTick.timeMs,
+                tickCount = rushTicks.size + 1,
+                recentTicks = rushTicks + gapOnlyTick
+            )
+        )
+        assertEquals(0, gapEngine.learnedSampleCount())
 
         // 5. Verify Hard Stop blocks execution when 10 trades or 3 consecutive losses are reached
         val hardStoppedEval = strategyEngine.evaluateStrategy(
@@ -938,21 +995,26 @@ class QuantPipelineUnitTest {
         )
         assertFalse("Momentum opposing smoothed tick direction must not execute", unalignedSmoothEval.readyToExecute)
 
-        // 4. Sniper M always labels the exact five-second horizon, independent of UI timeframe.
-        // A tick arriving at +6s brackets the +5s target; interpolation must settle at +6s arrival.
+        // 4. Sniper M labels only a well-bracketed exact five-second horizon.
+        // Ticks at +4.8s and +5.2s provide a valid interpolation bracket around expiry.
         val recentCleanTicks = cleanTicks.takeLast(120)
+        val tickBefore5s = Tick(
+            pair = "LATAM_X",
+            price = recentCleanTicks.last().price + 0.6,
+            timeMs = recentCleanTicks.last().timeMs + 4_800L
+        )
         val tickAt6s = Tick(
             pair = "LATAM_X",
             price = recentCleanTicks.last().price + 0.8,
-            timeMs = recentCleanTicks.last().timeMs + 6_000L
+            timeMs = recentCleanTicks.last().timeMs + 5_200L
         )
         val metricsAt6s = strategyEngine.extractRawTickRushMetrics(
             MarketTelemetryState(
                 pair = "LATAM_X",
                 latestPrice = tickAt6s.price,
                 latestTimeMs = tickAt6s.timeMs,
-                tickCount = recentCleanTicks.size + 1,
-                recentTicks = recentCleanTicks + tickAt6s,
+                tickCount = recentCleanTicks.size + 2,
+                recentTicks = recentCleanTicks + listOf(tickBefore5s, tickAt6s),
                 selectedTimeframeSec = 15
             )
         )
