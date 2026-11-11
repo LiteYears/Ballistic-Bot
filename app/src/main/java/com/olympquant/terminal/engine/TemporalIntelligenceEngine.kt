@@ -76,6 +76,7 @@ class TemporalIntelligenceEngine {
     // Walk-forward calibration & false-positive / impulse-detection tracking
     private var brierErrorEma: Double = 0.25 // Neutral Brier baseline before observations
     private var falsePositiveShadows: Int = 0
+    private var totalShadowOutcomes: Int = 0
     private var totalNoiseEventsClassified: Int = 0
     private var detectedGenuineImpulses: Int = 0
     private var totalGenuineImpulses: Int = 0
@@ -116,6 +117,7 @@ class TemporalIntelligenceEngine {
         }
         brierErrorEma = 0.25
         falsePositiveShadows = 0
+        totalShadowOutcomes = 0
         totalNoiseEventsClassified = 0
         detectedGenuineImpulses = 0
         totalGenuineImpulses = 0
@@ -134,6 +136,9 @@ class TemporalIntelligenceEngine {
         wasSpikeNoise: Boolean,
         fingerprint: ModularStrategyEngine.ShadowFingerprint = ModularStrategyEngine.ShadowFingerprint.OTHER
     ) {
+        totalShadowOutcomes++
+        if (!won) falsePositiveShadows++
+
         val fingerprintIndex = fingerprint.ordinal
         val fingerprintWriteIndex = fingerprintHead[fingerprintIndex]
         fingerprintOutcomes[fingerprintIndex][fingerprintWriteIndex] = if (won) 1 else 0
@@ -172,7 +177,6 @@ class TemporalIntelligenceEngine {
 
         if (wasSpikeNoise) {
             totalNoiseEventsClassified++
-            if (!won) falsePositiveShadows++
         } else {
             totalGenuineImpulses++
             if (won) detectedGenuineImpulses++
@@ -446,8 +450,8 @@ class TemporalIntelligenceEngine {
         } else {
             0.0
         }
-        val falsePositiveRatePct = if (totalNoiseEventsClassified > 0) {
-            ((falsePositiveShadows.toDouble() / totalNoiseEventsClassified.toDouble()) * 100.0)
+        val falsePositiveRatePct = if (totalShadowOutcomes > 0) {
+            ((falsePositiveShadows.toDouble() / totalShadowOutcomes.toDouble()) * 100.0)
                 .coerceIn(0.0, 100.0)
         } else {
             0.0
