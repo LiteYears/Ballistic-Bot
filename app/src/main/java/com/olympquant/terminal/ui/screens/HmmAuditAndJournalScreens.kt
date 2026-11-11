@@ -9,6 +9,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -20,6 +21,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -136,30 +138,46 @@ fun HmmAndAuditScreen(telemetry: MarketTelemetryState) {
     val micro = telemetry.microstructure
     val fib = telemetry.fibLevels
     val radarPolygonPath = remember { Path() }
+    var showZScoreFeatures by remember { mutableStateOf(false) }
 
-    LazyColumn(
+    BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
-            .testTag("hmm_audit_screen_list"),
-        contentPadding = PaddingValues(14.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
+            .background(ObsidianBackground),
+        contentAlignment = Alignment.TopCenter
     ) {
+        val horizontalPad = when {
+            maxWidth < 380.dp -> 14.dp
+            maxWidth < 600.dp -> 18.dp
+            else -> 28.dp
+        }
+        val verticalPad = if (maxWidth >= 600.dp) 20.dp else 16.dp
+        val itemSpacing = if (maxWidth >= 600.dp) 18.dp else 16.dp
+
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .widthIn(max = 880.dp)
+                .testTag("hmm_audit_screen_list"),
+            contentPadding = PaddingValues(horizontal = horizontalPad, vertical = verticalPad),
+            verticalArrangement = Arrangement.spacedBy(itemSpacing)
+        ) {
         item(key = "audit_title", contentType = "header") {
-            Column {
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 Text(
                     text = "8-STATE GAUSSIAN HMM & MICROSTRUCTURE AUDIT",
                     style = MaterialTheme.typography.titleLarge,
                     color = TextPrimary
                 )
                 Text(
-                    text = "Real-time forward posteriors (α_t), WebSocket order-flow imbalance & 50-tick Fibonacci diagnostics",
+                    text = "Real-time forward posteriors (α_t), WebSocket order-flow imbalance & structural corridors",
                     style = MaterialTheme.typography.labelSmall,
                     color = TextSecondary
                 )
             }
         }
 
-        // 1. WebSocket Stream Decision-Making Telemetry Card (Order-Flow Imbalance, Tick Intensity, Asset Lock, Clock Offset)
+        // 1. WebSocket Stream Decision-Making Telemetry Card
         item(key = "ws_stream_decision_telemetry", contentType = "ws_decision") {
             val ofi = telemetry.orderFlowImbalance.finiteOr(0.0)
             val intensity = telemetry.tickIntensityRatio.finiteOr(1.0)
@@ -173,16 +191,16 @@ fun HmmAndAuditScreen(telemetry: MarketTelemetryState) {
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .border(1.dp, SlateBorderBright, RoundedCornerShape(18.dp)),
+                    .border(1.dp, SlateBorderBright, RoundedCornerShape(16.dp)),
                 colors = CardDefaults.cardColors(containerColor = Color.Transparent),
-                shape = RoundedCornerShape(18.dp)
+                shape = RoundedCornerShape(16.dp)
             ) {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .background(CyberCardBrush)
-                        .padding(14.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -198,7 +216,7 @@ fun HmmAndAuditScreen(telemetry: MarketTelemetryState) {
                             modifier = Modifier.weight(1f).padding(end = 8.dp)
                         )
                         Text(
-                            text = if (telemetry.assetLocked) "⚠️ LOCKED" else "✅ +${telemetry.assetPayoutPercent}%",
+                            text = if (telemetry.assetLocked) "LOCKED" else "+${telemetry.assetPayoutPercent}% YIELD",
                             style = MaterialTheme.typography.labelSmall,
                             color = if (telemetry.assetLocked) BearishCrimson else BullishGreen,
                             fontWeight = FontWeight.Bold,
@@ -208,7 +226,7 @@ fun HmmAndAuditScreen(telemetry: MarketTelemetryState) {
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         AuditPill("ORDER FLOW", "${"%+.1f".format(ofi)}%", ofiColor, Modifier.weight(1f))
                         AuditPill("INTENSITY", "${"%.2f".format(intensity)}x", AmberGold, Modifier.weight(1f))
@@ -268,16 +286,16 @@ fun HmmAndAuditScreen(telemetry: MarketTelemetryState) {
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .border(1.dp, SlateBorderBright, RoundedCornerShape(18.dp)),
+                    .border(1.dp, SlateBorderBright, RoundedCornerShape(16.dp)),
                 colors = CardDefaults.cardColors(containerColor = Color.Transparent),
-                shape = RoundedCornerShape(18.dp)
+                shape = RoundedCornerShape(16.dp)
             ) {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .background(CyberCardBrush)
-                        .padding(14.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -306,9 +324,8 @@ fun HmmAndAuditScreen(telemetry: MarketTelemetryState) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        horizontalArrangement = Arrangement.spacedBy(14.dp)
                     ) {
-                        // 8-Axis Polar Radar Canvas
                         Canvas(
                             modifier = Modifier
                                 .size(132.dp)
@@ -357,7 +374,6 @@ fun HmmAndAuditScreen(telemetry: MarketTelemetryState) {
                             )
                         }
 
-                        // Right Column: 8-State Safe Progress Bars
                         Column(
                             modifier = Modifier.weight(1f),
                             verticalArrangement = Arrangement.spacedBy(5.dp)
@@ -404,40 +420,39 @@ fun HmmAndAuditScreen(telemetry: MarketTelemetryState) {
             }
         }
 
-        // 3. Microstructure, Landmark & 50-Tick Fibonacci Telemetry Audit Card
+        // 3. Consolidated Microstructure, Fibonacci & S/R Structural Corridor Audit Card
         item(key = "micro_fib_audit", contentType = "micro_fib") {
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .border(1.dp, SlateBorderBright, RoundedCornerShape(18.dp)),
+                    .border(1.dp, SlateBorderBright, RoundedCornerShape(16.dp)),
                 colors = CardDefaults.cardColors(containerColor = Color.Transparent),
-                shape = RoundedCornerShape(18.dp)
+                shape = RoundedCornerShape(16.dp)
             ) {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .background(CyberCardBrush)
-                        .padding(14.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     Text(
-                        text = "MICROSTRUCTURE, LANDMARKS & 50-TICK FIBONACCI AUDIT",
+                        text = "MICROSTRUCTURE, FIBONACCI & S/R CORRIDOR",
                         style = MaterialTheme.typography.labelLarge,
                         color = ElectricCyan
                     )
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         AuditPill("IMPULSE", "${"%.1f".format(micro.microImpulseScore.finiteOr(0.0))}%", AmberGold, Modifier.weight(1f))
                         AuditPill("EFFICIENCY", "${"%.1f".format(micro.directionalEfficiency.finiteOr(0.0))}%", ElectricCyan, Modifier.weight(1f))
                         AuditPill("MCI INDEX", "${"%.1f".format(micro.mci.finiteOr(50.0))}", NeonViolet, Modifier.weight(1f))
                     }
 
-                    // Breakout vs Mean-Reversion Probability Split Bar
                     val brkPct = (micro.breakoutProb.finiteOr(50.0) / 100.0).toFloat().finiteOr(0.5f).coerceIn(0.01f, 0.99f)
-                    Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween
@@ -464,40 +479,54 @@ fun HmmAndAuditScreen(telemetry: MarketTelemetryState) {
                         )
                     }
 
-                    Text(
-                        text = "Persistence: ${"%.1f".format(micro.microPersistence.finiteOr(0.0))} | Hesitation: ${"%.1f".format(micro.microHesitation.finiteOr(0.0))}% | Exhaustion: ${"%.1f".format(micro.microExhaustion.finiteOr(0.0))}%",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = TextSecondary
-                    )
-                    Text(
-                        text = "Landmark: ${micro.activeLandmark.name} | Phase: ${micro.phase.name} | Energy: ${micro.energyState.name} (${micro.urgency.name})",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = ElectricCyan
-                    )
-
-                    if (fib.high50.isFinite() && fib.low50.isFinite() && fib.high50 > fib.low50) {
-                        Surface(
-                            shape = RoundedCornerShape(10.dp),
-                            color = ObsidianBackground,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .border(1.dp, SlateBorder, RoundedCornerShape(10.dp))
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = ObsidianBackground,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .border(1.dp, SlateBorder, RoundedCornerShape(10.dp))
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
                         ) {
-                            Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text(
+                                text = "Persistence: ${"%.1f".format(micro.microPersistence.finiteOr(0.0))} • Hesitation: ${"%.1f".format(micro.microHesitation.finiteOr(0.0))}% • Exhaustion: ${"%.1f".format(micro.microExhaustion.finiteOr(0.0))}%",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = TextSecondary
+                            )
+                            Text(
+                                text = "S/R Corridor Width: ${"%.4f".format(telemetry.adaptiveCorridorWidth.finiteOr(0.2))} • Nearest S/R Dist: ${"%.4f".format(telemetry.srDistance.finiteOr(999.0))}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = ElectricCyan
+                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
                                 Text(
-                                    text = "50-TICK FIBONACCI RETRACEMENT LADDER (High ${"%.4f".format(fib.high50)} / Low ${"%.4f".format(fib.low50)})",
+                                    text = "Sup: ${telemetry.nearestSupport?.let { "${"%.4f".format(it.centerPrice.finiteOr(0.0))} (${it.touchCount}t)" } ?: "Clear"}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = BullishGreen
+                                )
+                                Text(
+                                    text = "Res: ${telemetry.nearestResistance?.let { "${"%.4f".format(it.centerPrice.finiteOr(0.0))} (${it.touchCount}t)" } ?: "Clear"}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = BearishCrimson
+                                )
+                            }
+                            if (fib.high50.isFinite() && fib.low50.isFinite() && fib.high50 > fib.low50) {
+                                Text(
+                                    text = "50T Fib 38.2%: ${"%.4f".format(fib.fib382.finiteOr(0.0))} • 50.0%: ${"%.4f".format(fib.fib500.finiteOr(0.0))} • 61.8%: ${"%.4f".format(fib.fib618.finiteOr(0.0))}",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = AmberGold
                                 )
+                            }
+                            if (telemetry.contextBlockReasons.isNotEmpty()) {
                                 Text(
-                                    text = "23.6%: ${"%.4f".format(fib.fib236.finiteOr(0.0))}  |  38.2%: ${"%.4f".format(fib.fib382.finiteOr(0.0))}  |  50.0%: ${"%.4f".format(fib.fib500.finiteOr(0.0))}",
+                                    text = "BLOCK: ${telemetry.contextBlockReasons.joinToString(" • ")}",
                                     style = MaterialTheme.typography.labelSmall,
-                                    color = TextPrimary
-                                )
-                                Text(
-                                    text = "61.8%: ${"%.4f".format(fib.fib618.finiteOr(0.0))}  |  78.6%: ${"%.4f".format(fib.fib786.finiteOr(0.0))}",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = ElectricCyan
+                                    color = BearishCrimson
                                 )
                             }
                         }
@@ -506,61 +535,7 @@ fun HmmAndAuditScreen(telemetry: MarketTelemetryState) {
             }
         }
 
-        // 4. Context Enhancer & S/R Memory Corridor Diagnostics
-        item(key = "context_sr_audit", contentType = "sr_audit") {
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .border(1.dp, SlateBorder, RoundedCornerShape(16.dp)),
-                colors = CardDefaults.cardColors(containerColor = SlateSurface),
-                shape = RoundedCornerShape(16.dp)
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(14.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    Text(
-                        text = "STRUCTURAL MEMORY & CONTEXT ENHANCER",
-                        style = MaterialTheme.typography.labelLarge,
-                        color = AmberGold
-                    )
-                    Text(
-                        text = "Adaptive S/R Corridor Width: ${"%.4f".format(telemetry.adaptiveCorridorWidth.finiteOr(0.2))} | Nearest S/R Distance: ${"%.4f".format(telemetry.srDistance.finiteOr(999.0))}",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = TextSecondary
-                    )
-                    Text(
-                        text = "Support Zone: ${telemetry.nearestSupport?.let { "${"%.4f".format(it.centerPrice.finiteOr(0.0))} (${it.touchCount} touches)" } ?: "None in active 300-candle window"}",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = BullishGreen
-                    )
-                    Text(
-                        text = "Resistance Zone: ${telemetry.nearestResistance?.let { "${"%.4f".format(it.centerPrice.finiteOr(0.0))} (${it.touchCount} touches)" } ?: "None in active 300-candle window"}",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = BearishCrimson
-                    )
-                    if (telemetry.contextBlockReasons.isEmpty()) {
-                        Text(
-                            text = "✅ Zero Structural or Stream Danger Blocks Active",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = BullishGreen
-                        )
-                    } else {
-                        telemetry.contextBlockReasons.forEach { reason ->
-                            Text(
-                                text = "⛔ BLOCK: $reason",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = BearishCrimson
-                            )
-                        }
-                    }
-                }
-            }
-        }
-
-        // 5. 12-Feature Scaled HMM Vector Inspector
+        // 4. Collapsible 12-Feature Scaled HMM Vector Inspector
         item(key = "hmm_features_audit", contentType = "features") {
             Card(
                 modifier = Modifier
@@ -572,55 +547,83 @@ fun HmmAndAuditScreen(telemetry: MarketTelemetryState) {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(14.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    Text(
-                        text = "12-FEATURE STANDARDIZED EMISSION INPUTS (Z-SCORES)",
-                        style = MaterialTheme.typography.labelLarge,
-                        color = ElectricCyan
-                    )
-                    val features = hmm?.scaledFeatures ?: emptyMap()
-                    if (features.isEmpty()) {
-                        Text(
-                            text = "Waiting for 25+ live ticks to standardize rolling return & velocity vectors.",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = TextMuted
-                        )
-                    } else {
-                        features.entries.chunked(2).forEach { pair ->
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                pair.forEach { (k, rawV) ->
-                                    val v = rawV.finiteOr(0.0)
-                                    Surface(
-                                        shape = RoundedCornerShape(8.dp),
-                                        color = SlateSurfaceVariant,
-                                        modifier = Modifier.weight(1f)
-                                    ) {
-                                        Row(
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .padding(horizontal = 10.dp, vertical = 8.dp),
-                                            horizontalArrangement = Arrangement.SpaceBetween,
-                                            verticalAlignment = Alignment.CenterVertically
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                            Text(
+                                text = "12-FEATURE EMISSION INPUTS (Z-SCORES)",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = ElectricCyan
+                            )
+                            val featuresCount = hmm?.scaledFeatures?.size ?: 0
+                            Text(
+                                text = if (featuresCount > 0) "$featuresCount standardized features ready" else "Warming up (<25 ticks)",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = TextSecondary
+                            )
+                        }
+                        OutlinedButton(
+                            onClick = { showZScoreFeatures = !showZScoreFeatures },
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                            modifier = Modifier.heightIn(min = 36.dp)
+                        ) {
+                            Text(
+                                text = if (showZScoreFeatures) "HIDE" else "INSPECT",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = ElectricCyan
+                            )
+                        }
+                    }
+
+                    if (showZScoreFeatures) {
+                        val features = hmm?.scaledFeatures ?: emptyMap()
+                        if (features.isEmpty()) {
+                            Text(
+                                text = "Waiting for 25+ live ticks to standardize rolling return & velocity vectors.",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = TextMuted
+                            )
+                        } else {
+                            features.entries.chunked(2).forEach { pair ->
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    pair.forEach { (k, rawV) ->
+                                        val v = rawV.finiteOr(0.0)
+                                        Surface(
+                                            shape = RoundedCornerShape(8.dp),
+                                            color = SlateSurfaceVariant,
+                                            modifier = Modifier.weight(1f)
                                         ) {
-                                            Text(
-                                                text = k,
-                                                style = MaterialTheme.typography.labelSmall,
-                                                color = TextSecondary,
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis,
-                                                modifier = Modifier.weight(1f).padding(end = 6.dp)
-                                            )
-                                            Text(
-                                                text = "%+.2fσ".format(v),
-                                                style = MaterialTheme.typography.labelSmall,
-                                                color = if (abs(v) > 2.0) AmberGold else TextPrimary,
-                                                maxLines = 1
-                                            )
+                                            Row(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                                                horizontalArrangement = Arrangement.SpaceBetween,
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Text(
+                                                    text = k,
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = TextSecondary,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis,
+                                                    modifier = Modifier.weight(1f).padding(end = 6.dp)
+                                                )
+                                                Text(
+                                                    text = "%+.2fσ".format(v),
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = if (abs(v) > 2.0) AmberGold else TextPrimary,
+                                                    maxLines = 1
+                                                )
+                                            }
                                         }
                                     }
                                 }
@@ -629,6 +632,7 @@ fun HmmAndAuditScreen(telemetry: MarketTelemetryState) {
                     }
                 }
             }
+        }
         }
     }
 }
@@ -645,7 +649,7 @@ private fun AuditPill(
         shape = RoundedCornerShape(10.dp),
         color = SlateSurfaceVariant
     ) {
-        Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp)) {
+        Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp)) {
             Text(
                 text = label,
                 style = MaterialTheme.typography.labelSmall,
@@ -718,12 +722,27 @@ fun TradeJournalScreen(
     val equityPath = remember { Path() }
     val equityAreaPath = remember { Path() }
 
-    Column(
+    BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
-            .padding(14.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
+            .background(ObsidianBackground),
+        contentAlignment = Alignment.TopCenter
     ) {
+        val horizontalPad = when {
+            maxWidth < 380.dp -> 14.dp
+            maxWidth < 600.dp -> 18.dp
+            else -> 28.dp
+        }
+        val verticalPad = if (maxWidth >= 600.dp) 20.dp else 16.dp
+        val itemSpacing = if (maxWidth >= 600.dp) 18.dp else 16.dp
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .widthIn(max = 880.dp)
+                .padding(horizontal = horizontalPad, vertical = verticalPad),
+            verticalArrangement = Arrangement.spacedBy(itemSpacing)
+        ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -746,11 +765,11 @@ fun TradeJournalScreen(
                 )
             }
 
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(
                     onClick = { exportedJsonDialog = onExportJson() },
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
-                    modifier = Modifier.heightIn(min = 40.dp).testTag("export_journal_button")
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                    modifier = Modifier.heightIn(min = 44.dp).testTag("export_journal_button")
                 ) {
                     Icon(Icons.Default.Share, contentDescription = "Export JSON", modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(4.dp))
@@ -758,8 +777,8 @@ fun TradeJournalScreen(
                 }
                 OutlinedButton(
                     onClick = onClearJournal,
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
-                    modifier = Modifier.heightIn(min = 40.dp).testTag("clear_journal_button")
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                    modifier = Modifier.heightIn(min = 44.dp).testTag("clear_journal_button")
                 ) {
                     Icon(Icons.Default.DeleteSweep, contentDescription = "Clear Journal", tint = BearishCrimson, modifier = Modifier.size(18.dp))
                 }
@@ -768,7 +787,7 @@ fun TradeJournalScreen(
 
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             JournalKpiCard("WIN RATE", "${"%.1f".format(stats.winRate)}% (${stats.wins}/${stats.losses})", BullishGreen, Modifier.weight(1f))
             JournalKpiCard("NET P&L", "$${"%+.2f".format(stats.netPnl)}", if (stats.netPnl >= 0) BullishGreen else BearishCrimson, Modifier.weight(1f))
@@ -783,7 +802,7 @@ fun TradeJournalScreen(
                 colors = CardDefaults.cardColors(containerColor = SlateSurface),
                 shape = RoundedCornerShape(16.dp)
             ) {
-                Column(modifier = Modifier.padding(12.dp)) {
+                Column(modifier = Modifier.padding(14.dp)) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween
@@ -882,12 +901,13 @@ fun TradeJournalScreen(
         } else {
             LazyColumn(
                 modifier = Modifier.fillMaxSize(),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
+                verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 items(trades, key = { it.id }, contentType = { "trade_row" }) { trade ->
                     TradeJournalRowCard(trade = trade)
                 }
             }
+        }
         }
     }
 
@@ -924,7 +944,7 @@ private fun JournalKpiCard(
         shape = RoundedCornerShape(12.dp),
         color = SlateSurface
     ) {
-        Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 9.dp)) {
+        Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
             Text(
                 text = label,
                 style = MaterialTheme.typography.labelSmall,
@@ -958,15 +978,15 @@ private fun TradeJournalRowCard(trade: TradeJournalEntity) {
     Card(
         modifier = Modifier
             .fillMaxWidth()
-            .border(1.dp, SlateBorder, RoundedCornerShape(14.dp)),
+            .border(1.dp, SlateBorder, RoundedCornerShape(16.dp)),
         colors = CardDefaults.cardColors(containerColor = SlateSurface),
-        shape = RoundedCornerShape(14.dp)
+        shape = RoundedCornerShape(16.dp)
     ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
+                .padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -1008,7 +1028,7 @@ private fun TradeJournalRowCard(trade: TradeJournalEntity) {
             }
 
             Text(
-                text = "Strategy: ${trade.strategyName} • ${trade.accountGroup.uppercase()} • ${timeFmt.format(Date(trade.timestampMs))}",
+                text = "${trade.strategyName} • ${trade.accountGroup.uppercase()} • ${timeFmt.format(Date(trade.timestampMs))}",
                 style = MaterialTheme.typography.labelSmall,
                 color = TextSecondary,
                 maxLines = 1,
@@ -1022,10 +1042,9 @@ private fun TradeJournalRowCard(trade: TradeJournalEntity) {
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 TelemetryBadge("WS ${trade.wsLatencyMs}ms")
-                TelemetryBadge("HMM S${trade.hmmState} ${trade.hmmRegime} (${(trade.hmmConfidence.finiteOr(0.0) * 100).toInt()}%)")
+                TelemetryBadge("HMM S${trade.hmmState} ${trade.hmmRegime}")
                 TelemetryBadge("HVOI ${"%.0f".format(trade.hvoiScore.finiteOr(50.0))}%")
                 TelemetryBadge("Cons ${"%.2f".format(trade.consistency.finiteOr(0.0))}")
-                TelemetryBadge("SlopeR ${"%.2f".format(trade.slopeRatio.finiteOr(0.0))}x")
             }
         }
     }
@@ -1042,7 +1061,7 @@ private fun TelemetryBadge(text: String) {
             style = MaterialTheme.typography.labelSmall,
             color = ElectricCyan,
             maxLines = 1,
-            modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp)
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
         )
     }
 }

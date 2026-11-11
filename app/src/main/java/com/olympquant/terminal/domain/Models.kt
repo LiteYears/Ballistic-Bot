@@ -1,8 +1,6 @@
 package com.olympquant.terminal.domain
 
 import androidx.compose.runtime.Immutable
-import com.olympquant.terminal.engine.DefaultStrategyScripts
-import com.olympquant.terminal.engine.StrategyScriptCompiler
 import kotlinx.serialization.Serializable
 import kotlin.math.roundToLong
 
@@ -52,7 +50,7 @@ enum class HvWindowState(
         badgeText = "MODERATE",
         scoreRangeLabel = "50% – 74%",
         marketCondition = "Developing trend with moderate pullbacks or transitional momentum across micro-anchors.",
-        actionText = "Selective Standby — Require all 6 breakout gates to align."
+        actionText = "Selective Standby — Require all 7 Sniper M gates to align."
     ),
     AVOID(
         badgeText = "AVOID",
@@ -160,14 +158,12 @@ data class HighVoltageFilterStatus(
 }
 
 /**
- * Default Strategy & Safety Bounds for the OlympQuant Strategy Script (.oqs) Engine.
- * - Supports `HighVoltage5s_HVWindow.oqs`, `X13_Temporal_Intelligence_5s.oqs`, and `TickRush5s_FTRL_Default.oqs`
- * - Supports expanded trade timeframes: 5s, 15s, 30s, 45s, 1m (60s).
+ * Hard-Locked Execution Mandate for the sole native Sniper M 5-Second Strategy.
  */
 object HardLockedMandate {
-    const val STRATEGY_NAME = DefaultStrategyScripts.SNIPER_M_STRATEGY_NAME
+    const val STRATEGY_NAME = "Sniper M"
     const val STRATEGY_DESCRIPTION =
-        "Sniper M: Analyzes raw tick stream data, smooths the trajectory (Zero-Lag Fast vs Slow EMA), follows aligned momentum, and executes when a tick stream surge fires in the smoothed direction."
+        "Sniper M (Sole Native Strategy): 5-second Hawkes-Laminar tick-burst continuation engine with 7-gate scientific false-positive rejection, non-decelerating convexity filtering, climax Z-score guard, and online FTRL-Proximal calibration."
     const val MIN_STAKE_USD = 1.0
     const val BALANCE_STAKE_PERCENT = 5.0
     const val MAX_STAKE_USD = 4000.0
@@ -188,52 +184,35 @@ object HardLockedMandate {
         return ((clamped * 100.0).roundToLong() / 100.0)
     }
 
-    fun lockedStrategyConfig(): StrategyConfig = fromScript(
+    fun lockedStrategyConfig(): StrategyConfig = StrategyConfig(
         id = 1L,
-        scriptCode = DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT,
+        name = STRATEGY_NAME,
+        description = STRATEGY_DESCRIPTION,
         isPreset = true,
-        isEnabled = true
+        isEnabled = true,
+        durationSeconds = LOCKED_DURATION_SEC,
+        stakeAmount = MIN_STAKE_USD,
+        cooldownMs = LOCKED_COOLDOWN_MS,
+        minConfidence = MIN_CONFIDENCE_REQUIRED,
+        triggerType = TriggerType.RAW_TICK_RUSH_5S,
+        triggerThreshold = 1.35,
+        regimeAdaptiveMode = RegimeAdaptiveMode.OFF,
+        filters = listOf(
+            StrategyFilterRule(FilterType.TICK_RUSH_SNR_GATE, true, 1.35),
+            StrategyFilterRule(FilterType.TICK_DIRECTIONAL_PURITY, true, 72.0),
+            StrategyFilterRule(FilterType.TICK_SPEED_AND_FRESHNESS, true, 1.20),
+            StrategyFilterRule(FilterType.ANTI_SPIKE_DOMINANCE_GATE, true, 58.0),
+            StrategyFilterRule(FilterType.FTRL_ML_META_LABEL_GATE, true, 54.0)
+        ),
+        scriptCode = "NATIVE_SNIPER_M_5S",
+        stakeMode = "PERCENT_BALANCE",
+        stakeValue = BALANCE_STAKE_PERCENT,
+        minStakeUsd = MIN_STAKE_USD,
+        maxStakeUsd = MAX_STAKE_USD,
+        minPayoutPercent = MIN_PAYOUT_PERCENT,
+        maxDailyTrades = MAX_TRADES_PER_DAY,
+        maxConsecutiveLosses = MAX_CONSECUTIVE_LOSSES
     )
-
-    fun fromScript(
-        id: Long,
-        scriptCode: String,
-        isPreset: Boolean = false,
-        isEnabled: Boolean = true
-    ): StrategyConfig {
-        val compiled = StrategyScriptCompiler.compile(scriptCode)
-        val parsed = compiled.parsedScript
-        val exec = parsed?.execution
-        return StrategyConfig(
-            id = id,
-            name = parsed?.name ?: STRATEGY_NAME,
-            description = parsed?.description ?: STRATEGY_DESCRIPTION,
-            isPreset = isPreset,
-            isEnabled = isEnabled,
-            durationSeconds = exec?.durationSec ?: LOCKED_DURATION_SEC,
-            stakeAmount = exec?.minStakeUsd ?: MIN_STAKE_USD,
-            cooldownMs = exec?.cooldownMs ?: LOCKED_COOLDOWN_MS,
-            minConfidence = exec?.minConfidence ?: MIN_CONFIDENCE_REQUIRED,
-            triggerType = TriggerType.RAW_TICK_RUSH_5S,
-            triggerThreshold = 1.35,
-            regimeAdaptiveMode = RegimeAdaptiveMode.OFF,
-            filters = listOf(
-                StrategyFilterRule(FilterType.TICK_RUSH_SNR_GATE, true, 1.35),
-                StrategyFilterRule(FilterType.TICK_DIRECTIONAL_PURITY, true, 72.0),
-                StrategyFilterRule(FilterType.TICK_SPEED_AND_FRESHNESS, true, 1.15),
-                StrategyFilterRule(FilterType.ANTI_SPIKE_DOMINANCE_GATE, true, 62.0),
-                StrategyFilterRule(FilterType.FTRL_ML_META_LABEL_GATE, true, 62.0)
-            ),
-            scriptCode = scriptCode,
-            stakeMode = exec?.stakeMode ?: "PERCENT_BALANCE",
-            stakeValue = exec?.stakeValue ?: BALANCE_STAKE_PERCENT,
-            minStakeUsd = exec?.minStakeUsd ?: MIN_STAKE_USD,
-            maxStakeUsd = exec?.maxStakeUsd ?: MAX_STAKE_USD,
-            minPayoutPercent = exec?.minPayoutPct ?: MIN_PAYOUT_PERCENT,
-            maxDailyTrades = exec?.maxDailyTrades ?: MAX_TRADES_PER_DAY,
-            maxConsecutiveLosses = exec?.maxConsecutiveLosses ?: MAX_CONSECUTIVE_LOSSES
-        )
-    }
 }
 
 @Immutable
@@ -438,7 +417,7 @@ data class StrategyConfig(
     val triggerThreshold: Double,
     val regimeAdaptiveMode: RegimeAdaptiveMode,
     val filters: List<StrategyFilterRule>,
-    val scriptCode: String = DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT,
+    val scriptCode: String = "NATIVE_SNIPER_M_5S",
     val stakeMode: String = "PERCENT_BALANCE",
     val stakeValue: Double = HardLockedMandate.BALANCE_STAKE_PERCENT,
     val minStakeUsd: Double = HardLockedMandate.MIN_STAKE_USD,

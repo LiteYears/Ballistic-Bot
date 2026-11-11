@@ -10,11 +10,9 @@ import com.olympquant.terminal.domain.Tick
 import com.olympquant.terminal.domain.TriggerType
 import com.olympquant.terminal.domain.finiteOr
 import com.olympquant.terminal.engine.CandleEngine
-import com.olympquant.terminal.engine.DefaultStrategyScripts
 import com.olympquant.terminal.engine.IndicatorEngine
 import com.olympquant.terminal.engine.ModularStrategyEngine
 import com.olympquant.terminal.engine.RegimeDetectionEngine
-import com.olympquant.terminal.engine.StrategyScriptCompiler
 import com.olympquant.terminal.network.OlympTradeWsClient
 import com.olympquant.terminal.network.WsConnectionStatus
 import org.junit.Assert.assertEquals
@@ -302,121 +300,78 @@ class QuantPipelineUnitTest {
     }
 
     @Test
-    fun `test OQS parser diagnostics while live execution remains hard-locked to Sniper M`() {
-        val defaultCompiled = com.olympquant.terminal.engine.StrategyScriptCompiler.compile(
-            DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT
-        )
-        assertTrue(defaultCompiled.isValid)
-        assertNotNull(defaultCompiled.parsedScript)
-        assertEquals("Sniper M", defaultCompiled.parsedScript!!.name)
-        assertEquals(5, defaultCompiled.parsedScript!!.execution.durationSec)
-
-        // Verify custom user-programmed strategy with custom [EXECUTION], [VARIABLES], [SIGNAL_UP], [SIGNAL_DOWN], and [GATES]
-        val customOqs = """
-            [META]
-            name = "User_Custom_Reversal_15s"
-            version = "1.2"
-            author = "QuantTrader"
-            description = "Custom programmable strategy testing user variables and gates."
-
-            [EXECUTION]
-            duration_sec = 15
-            stake_mode = "FIXED_USD"
-            stake_value = 25.0
-            min_stake_usd = 1.0
-            max_stake_usd = 4000.0
-            cooldown_ms = 5000
-            min_payout_pct = 80
-            min_confidence = 50.0
-            max_daily_trades = 12
-            max_consecutive_losses = 4
-
-            [VARIABLES]
-            let custom_ratio = rush_snr * 2.0
-            let spread_abs = abs(z_fast - z_slow)
-
-            [SIGNAL_UP]
-            rush_dir == UP
-            custom_ratio >= 2.5
-
-            [SIGNAL_DOWN]
-            rush_dir == DOWN
-            custom_ratio >= 2.5
-
-            [GATES]
-            gate "Custom Ratio Gate" : custom_ratio >= 2.5 and tick_purity >= 65.0
-            gate "Latency Check" : ws_latency_ms <= 150
-        """.trimIndent()
-
-        val customConfig = HardLockedMandate.fromScript(
-            id = 42L,
-            scriptCode = customOqs,
-            isPreset = false,
-            isEnabled = true
-        )
-        assertEquals("User_Custom_Reversal_15s", customConfig.name)
-        assertEquals(15, customConfig.durationSeconds)
-        assertEquals(25.0, customConfig.computeEffectiveStake(1000.0), 1e-6)
-        assertEquals(12, customConfig.maxDailyTrades)
-        assertEquals(4, customConfig.maxConsecutiveLosses)
+    fun `test Scientific 7-Gate Sniper M false-positive rejection pipeline and sole strategy lock`() {
+        val lockedStrategy = HardLockedMandate.lockedStrategyConfig()
+        assertEquals("Sniper M", lockedStrategy.name)
+        assertEquals(5, lockedStrategy.durationSeconds)
+        assertEquals("NATIVE_SNIPER_M_5S", lockedStrategy.scriptCode)
 
         val baseTs = 1700000000000L
         val noiseTicks = (0 until 14).map { i ->
             val offset = if (i % 2 == 0) 0.12 else -0.12
             Tick(pair = "LATAM_X", price = 4500.0 + offset, timeMs = baseTs + i * 240L)
         }
-        val rushTicks = noiseTicks + listOf(0.38, 0.80, 1.25, 1.74).mapIndexed { idx, cum ->
-            Tick(pair = "LATAM_X", price = noiseTicks.last().price + cum, timeMs = noiseTicks.last().timeMs + (idx + 1) * 130L)
+        val lastNoisePrice = noiseTicks.last().price
+        val lastNoiseTime = noiseTicks.last().timeMs
+
+        // 1. Clean, non-decelerating 4-tick surge passes all 7 scientific gates
+        val cleanRushTicks = noiseTicks + listOf(0.38, 0.80, 1.25, 1.74).mapIndexed { idx, cum ->
+            Tick(pair = "LATAM_X", price = lastNoisePrice + cum, timeMs = lastNoiseTime + (idx + 1) * 130L)
         }
-        val telemetry = MarketTelemetryState(
+        val cleanTelemetry = MarketTelemetryState(
             pair = "LATAM_X",
-            latestPrice = rushTicks.last().price,
-            tickCount = rushTicks.size,
+            latestPrice = cleanRushTicks.last().price,
+            latestTimeMs = cleanRushTicks.last().timeMs,
+            tickCount = cleanRushTicks.size,
             assetPayoutPercent = 85,
             assetLocked = false,
-            recentTicks = rushTicks,
+            recentTicks = cleanRushTicks,
             zFast = 4501.5,
-            zSlow = 4500.2
+            zSlow = 4500.2,
+            orderFlowImbalance = 32.0
         )
 
-        // A custom script can still be parsed for diagnostics, but the live engine must ignore it.
         val engine = ModularStrategyEngine()
-        val eval = engine.evaluateStrategy(
-            strategy = customConfig,
-            telemetry = telemetry,
+        val cleanEval = engine.evaluateStrategy(
+            strategy = lockedStrategy,
+            telemetry = cleanTelemetry,
             wsLatencyMs = 45L
         )
-        assertEquals("Sniper M", eval.strategyName)
-        assertEquals(58.0, eval.minConfidenceRequired, 1e-6)
-        assertTrue("Live execution must retain Sniper M's five-second script", eval.triggerReason.contains("5s"))
+        assertEquals("Sniper M", cleanEval.strategyName)
+        assertEquals(7, cleanEval.filterDiagnostics.size)
+        assertTrue("Clean accelerating surge must pass all 7 scientific gates: ${cleanEval.triggerReason}", cleanEval.readyToExecute)
 
-        // Verify syntax error reporting when a mandatory block or unknown variable is used
-        val brokenOqs = """
-            [META]
-            name = "Broken"
-            [SIGNAL_UP]
-            non_existent_var >= 10.0
-        """.trimIndent()
-        val brokenCompiled = com.olympquant.terminal.engine.StrategyScriptCompiler.compile(brokenOqs)
-        assertFalse(brokenCompiled.isValid)
-        assertTrue(brokenCompiled.errors.isNotEmpty())
+        // 2. Decelerating / Dying Tail Trap (strong early steps +0.75, +0.65, then dying +0.18, +0.06 -> convexity < 0.65 & tailRetention < 0.60)
+        val dyingTailTicks = noiseTicks + listOf(0.75, 1.40, 1.58, 1.64).mapIndexed { idx, cum ->
+            Tick(pair = "LATAM_X", price = lastNoisePrice + cum, timeMs = lastNoiseTime + (idx + 1) * 130L)
+        }
+        val dyingTailEval = ModularStrategyEngine().evaluateStrategy(
+            strategy = lockedStrategy,
+            telemetry = cleanTelemetry.copy(
+                latestPrice = dyingTailTicks.last().price,
+                latestTimeMs = dyingTailTicks.last().timeMs,
+                tickCount = dyingTailTicks.size,
+                recentTicks = dyingTailTicks
+            ),
+            wsLatencyMs = 45L
+        )
+        assertFalse("Decelerating dying-tail burst must be rejected as a false positive", dyingTailEval.readyToExecute)
+
+        // 3. Counter-Order-Flow Imbalance Divergence Trap (UP price surge while heavy sell OFI = -35.0)
+        val counterOfiEval = ModularStrategyEngine().evaluateStrategy(
+            strategy = lockedStrategy,
+            telemetry = cleanTelemetry.copy(orderFlowImbalance = -35.0),
+            wsLatencyMs = 45L
+        )
+        assertFalse("UP surge against strong negative OFI (-35.0) must be rejected by Gate 6", counterOfiEval.readyToExecute)
     }
 
     @Test
     fun `test X13 Temporal Intelligence Engine rolling windows hysteresis N-of-M persistence and 3-layer architecture`() {
-        val x13Compiled = com.olympquant.terminal.engine.StrategyScriptCompiler.compile(
-            DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT
-        )
-        assertTrue(x13Compiled.isValid)
-        assertNotNull(x13Compiled.parsedScript)
-        assertEquals("Sniper M", x13Compiled.parsedScript!!.name)
+        val x13Strategy = HardLockedMandate.lockedStrategyConfig()
+        assertEquals("Sniper M", x13Strategy.name)
+        assertEquals(5, x13Strategy.durationSeconds)
 
-        val x13Strategy = HardLockedMandate.fromScript(
-            id = 1L,
-            scriptCode = DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT,
-            isPreset = true,
-            isEnabled = true
-        )
 
         val engine = ModularStrategyEngine()
         val baseTs = System.currentTimeMillis() - 4000L
@@ -599,9 +554,7 @@ class QuantPipelineUnitTest {
         val lockedConfig = HardLockedMandate.lockedStrategyConfig()
         assertEquals("Sniper M", lockedConfig.name)
         assertEquals(5, lockedConfig.durationSeconds)
-        val compiledLocked = StrategyScriptCompiler.compile(lockedConfig.scriptCode)
-        assertTrue("Canonical Sniper M script must compile cleanly: ${compiledLocked.errors}", compiledLocked.isValid)
-        assertEquals(5, compiledLocked.parsedScript?.execution?.durationSec)
+        assertEquals("NATIVE_SNIPER_M_5S", lockedConfig.scriptCode)
 
         // 2. Verify Clean Breakout Momentum -> HV Window EXCELLENT (>=75%) and all 6 HighVoltage filters PASS
         val candleEngine = CandleEngine()
@@ -843,8 +796,7 @@ class QuantPipelineUnitTest {
         val countBefore = strategyEngine.temporalEngine.rollingMean("rush_snr", 4)
         val snapshotSymbols = strategyEngine.getLiveSymbolSnapshot(
             telemetry = fxTelemetry.copy(orderFlowImbalance = 44.5),
-            wsLatencyMs = 28L,
-            scriptCode = DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT
+            wsLatencyMs = 28L
         )
         val countAfter = strategyEngine.temporalEngine.rollingMean("rush_snr", 4)
         assertEquals("getLiveSymbolSnapshot must not mutate rolling window state", countBefore, countAfter, 1e-9)
@@ -1145,25 +1097,7 @@ class QuantPipelineUnitTest {
         val baseTimeMs = 1700000000000L
         val strategyEngine = ModularStrategyEngine()
 
-        // 1. Verify getLiveSymbolSnapshot with hysteresis(...) in [VARIABLES] does NOT mutate hysteresis state
-        val hystScript = """
-            [META]
-            name = "HystAuditTest"
-            version = "1.0"
-            author = "Audit"
-            description = "Tests non-mutating hysteresis evaluation in getLiveSymbolSnapshot"
-            [EXECUTION]
-            duration_sec = 5
-            [VARIABLES]
-            let custom_hyst = hysteresis(rush_snr, 1.50, 1.10)
-            [SIGNAL_UP]
-            rush_dir == UP
-            [SIGNAL_DOWN]
-            rush_dir == DOWN
-            [GATES]
-            gate "HystGate" : custom_hyst == 1
-        """.trimIndent()
-
+        // 1. Verify getLiveSymbolSnapshot does NOT mutate hysteresis state
         val highSnrTicks = (0 until 10).map { i ->
             Tick(pair = "LATAM_X", price = 4500.0 + i * 0.45, timeMs = baseTimeMs + i * 180L)
         }
@@ -1175,14 +1109,14 @@ class QuantPipelineUnitTest {
             recentTicks = highSnrTicks,
             wsSynchronized = true
         )
-        // Call getLiveSymbolSnapshot (read-only UI/Studio preview) when rush_snr >= 1.50
-        val snapHigh = strategyEngine.getLiveSymbolSnapshot(highSnrTelemetry, wsLatencyMs = 25L, scriptCode = hystScript)
-        assertEquals(1.0, snapHigh["custom_hyst"] ?: 0.0, 1e-6)
+        // Call getLiveSymbolSnapshot (read-only UI preview) when rush_snr >= 1.50
+        val snapHigh = strategyEngine.getLiveSymbolSnapshot(highSnrTelemetry, wsLatencyMs = 25L)
+        assertTrue((snapHigh["rush_snr"] ?: 0.0) >= 1.50)
 
-        // Now evaluate at rush_snr ~ 1.20 (between exit=1.10 and enter=1.50):
-        // Because getLiveSymbolSnapshot did NOT mutate hysteresis state, the latch must still be false (0.0)!
+        // Now evaluate at rush_snr ~ 1.25 (between exit=1.10 and enter=1.50):
+        // Because getLiveSymbolSnapshot did NOT mutate hysteresis state, the latch must still be false!
         val midActivated = strategyEngine.temporalEngine.evaluateHysteresis(
-            key = "dsl_hyst_rush_snr_1.50_1.10",
+            key = "momentum_snr_hyst",
             currentValue = 1.25,
             enterThreshold = 1.50,
             exitThreshold = 1.10,
@@ -1211,34 +1145,7 @@ class QuantPipelineUnitTest {
         )
         assertTrue(zeroMeanEngine.temporalEngine.hasSeries("ofi"))
         assertEquals(0.0, zeroMeanEngine.temporalEngine.rollingMean("ofi", 2), 1e-9)
-
-        val compiledRollMean = StrategyScriptCompiler.compile(
-            """
-            [META]
-            name = "ZeroMeanRollTest"
-            version = "1.0"
-            author = "Audit"
-            description = "Tests zero-mean rolling series"
-            [EXECUTION]
-            duration_sec = 5
-            [VARIABLES]
-            let ofi_mean_2 = roll_mean(ofi, 2)
-            [SIGNAL_UP]
-            rush_dir == UP
-            [SIGNAL_DOWN]
-            rush_dir == DOWN
-            [GATES]
-            gate "G1" : rush_snr >= 0.0
-            """.trimIndent()
-        ).parsedScript!!
-        val symbolsWithNonZeroCurrentOfi = mutableMapOf("ofi" to -25.0, "rush_dir" to 1.0, "rush_snr" to 1.4, "UP" to 1.0, "DOWN" to -1.0)
-        val evalZeroMean = StrategyScriptCompiler.evaluateVariablesAndSignals(
-            compiledRollMean,
-            symbolsWithNonZeroCurrentOfi,
-            zeroMeanEngine.temporalEngine
-        )
-        // Must be 0.0 (the true 2-observation rolling mean of +25 and -25), NOT fallback to raw ofi (-25.0)!
-        assertEquals(0.0, evalZeroMean.evaluatedSymbols["ofi_mean_2"] ?: -999.0, 1e-6)
+        assertEquals(0.0, zeroMeanEngine.temporalEngine.rollingMedian("ofi", 2), 1e-9)
 
         // 3. Verify IndicatorEngine & Sniper M work seamlessly on 10-tick streams (6 <= len < 15)
         val indEngine = IndicatorEngine()
@@ -1321,7 +1228,746 @@ class QuantPipelineUnitTest {
         )
         assertFalse("Collapsing/dying surge tail (tick_convexity < 0.55) must not execute", dyingEval.readyToExecute)
     }
+
+    @Test
+    fun `test Iteration 1 Task 1 shadow settlement prevents future price interpolation and handles ties delays and wide brackets`() {
+        val baseTs = 1700000000000L
+        val noiseTicks = (0 until 14).map { i ->
+            val offset = if (i % 2 == 0) 0.14 else -0.14
+            Tick(pair = "LATAM_X", price = 4500.0 + offset, timeMs = baseTs + i * 220L)
+        }
+        val lastNoiseTs = noiseTicks.last().timeMs
+        val lastNoisePrice = noiseTicks.last().price
+        val rushTicks = noiseTicks + listOf(0.42, 0.88, 1.38, 1.92).mapIndexed { idx, cum ->
+            Tick(pair = "LATAM_X", price = lastNoisePrice + cum, timeMs = lastNoiseTs + (idx + 1) * 140L)
+        }
+        val triggerTick = rushTicks.last() // price = 4501.78, timeMs = triggerTick.timeMs
+
+        // 1. Future-price anti-interpolation test:
+        //    At +4800ms (200ms before 5s expiry), price has reversed BELOW entryPrice (triggerTick.price - 0.30).
+        //    At +5200ms (200ms AFTER 5s expiry), a huge post-expiry jump occurs (triggerTick.price + 6.00).
+        //    Linear interpolation would compute +2.85 (> entryPrice -> fabricated WIN).
+        //    True càdlàg settlement must use the last valid quote at or before +5000ms (-0.30 -> LOSS).
+        val engine = ModularStrategyEngine()
+        engine.extractRawTickRushMetrics(
+            MarketTelemetryState(
+                pair = "LATAM_X",
+                latestPrice = triggerTick.price,
+                latestTimeMs = triggerTick.timeMs,
+                tickCount = rushTicks.size,
+                recentTicks = rushTicks,
+                wsSynchronized = true
+            )
+        )
+        val firstPostTriggerTick = Tick(
+            pair = "LATAM_X",
+            price = triggerTick.price + 0.12,
+            timeMs = triggerTick.timeMs + 160L
+        )
+        val preExpiryLossTick = Tick(
+            pair = "LATAM_X",
+            price = triggerTick.price - 0.30,
+            timeMs = triggerTick.timeMs + 4800L
+        )
+        val postExpiryHugeSpikeTick = Tick(
+            pair = "LATAM_X",
+            price = triggerTick.price + 6.00,
+            timeMs = triggerTick.timeMs + 5200L
+        )
+
+        // Feed at +4800ms: even if telemetry.latestTimeMs is artificially set to +5100ms (delayed WS frame),
+        // premature settlement must NOT occur because ticks.last().timeMs is only +4800ms (< +5000ms).
+        val preExpiryStream = rushTicks + listOf(firstPostTriggerTick, preExpiryLossTick)
+        engine.extractRawTickRushMetrics(
+            MarketTelemetryState(
+                pair = "LATAM_X",
+                latestPrice = preExpiryLossTick.price,
+                latestTimeMs = triggerTick.timeMs + 5100L,
+                tickCount = preExpiryStream.size,
+                recentTicks = preExpiryStream,
+                wsSynchronized = true
+            )
+        )
+        assertEquals("Delayed tick stream before +5000ms must not settle prematurely", 0, engine.learnedSampleCount())
+
+        // Now feed the post-expiry tick at +5200ms (bracket gap = 400ms <= 1500ms):
+        val settledStream = preExpiryStream + postExpiryHugeSpikeTick
+        engine.extractRawTickRushMetrics(
+            MarketTelemetryState(
+                pair = "LATAM_X",
+                latestPrice = postExpiryHugeSpikeTick.price,
+                latestTimeMs = postExpiryHugeSpikeTick.timeMs,
+                tickCount = settledStream.size,
+                recentTicks = settledStream,
+                wsSynchronized = true
+            )
+        )
+        assertEquals(1, engine.learnedSampleCount())
+        val record = engine.getSettledShadowRecords().single()
+        assertEquals(triggerTick.price, record.entryPrice, 1e-9)
+        assertEquals("Expiry price must be last quote at or before +5000ms, never interpolated with post-expiry spike", preExpiryLossTick.price, record.expiryPrice, 1e-9)
+        assertEquals(preExpiryLossTick.timeMs, record.expiryQuoteTimeMs)
+        assertEquals(postExpiryHugeSpikeTick.timeMs, record.confirmingTickTimeMs)
+        assertEquals(firstPostTriggerTick.price, record.firstPostTriggerPrice, 1e-9)
+        assertFalse("Outcome at +5000ms was below entryPrice and must be recorded as LOSS", record.won)
+
+        // 2. Exact timestamp settlement (+5000ms exact tick):
+        val exactEngine = ModularStrategyEngine()
+        exactEngine.extractRawTickRushMetrics(
+            MarketTelemetryState(
+                pair = "LATAM_X",
+                latestPrice = triggerTick.price,
+                latestTimeMs = triggerTick.timeMs,
+                tickCount = rushTicks.size,
+                recentTicks = rushTicks,
+                wsSynchronized = true
+            )
+        )
+        val tickAt4600 = Tick("LATAM_X", triggerTick.price + 0.25, triggerTick.timeMs + 4600L)
+        val tickExact5000 = Tick("LATAM_X", triggerTick.price + 0.55, triggerTick.timeMs + 5000L)
+        val exactStream = rushTicks + listOf(tickAt4600, tickExact5000)
+        exactEngine.extractRawTickRushMetrics(
+            MarketTelemetryState(
+                pair = "LATAM_X",
+                latestPrice = tickExact5000.price,
+                latestTimeMs = tickExact5000.timeMs,
+                tickCount = exactStream.size,
+                recentTicks = exactStream,
+                wsSynchronized = true
+            )
+        )
+        assertEquals(1, exactEngine.learnedSampleCount())
+        val exactRecord = exactEngine.getSettledShadowRecords().single()
+        assertEquals(ModularStrategyEngine.ExpiryResolutionStatus.RESOLVED_EXACT_TIMESTAMP, exactRecord.resolutionStatus)
+        assertEquals(tickExact5000.price, exactRecord.expiryPrice, 1e-9)
+        assertTrue(exactRecord.won)
+
+        // 3. Tie settlement (expiry quote == entryPrice):
+        val tieEngine = ModularStrategyEngine()
+        tieEngine.extractRawTickRushMetrics(
+            MarketTelemetryState(
+                pair = "LATAM_X",
+                latestPrice = triggerTick.price,
+                latestTimeMs = triggerTick.timeMs,
+                tickCount = rushTicks.size,
+                recentTicks = rushTicks,
+                wsSynchronized = true
+            )
+        )
+        val tieBefore = Tick("LATAM_X", triggerTick.price, triggerTick.timeMs + 4850L)
+        val tieAfter = Tick("LATAM_X", triggerTick.price + 0.90, triggerTick.timeMs + 5150L)
+        val tieStream = rushTicks + listOf(tieBefore, tieAfter)
+        tieEngine.extractRawTickRushMetrics(
+            MarketTelemetryState(
+                pair = "LATAM_X",
+                latestPrice = tieAfter.price,
+                latestTimeMs = tieAfter.timeMs,
+                tickCount = tieStream.size,
+                recentTicks = tieStream,
+                wsSynchronized = true
+            )
+        )
+        assertEquals("Tie outcome must not increment directional learnedSampleCount", 0, tieEngine.learnedSampleCount())
+        assertEquals("Tie outcome must be counted in tieShadowSampleCount", 1, tieEngine.tieShadowSampleCount())
+        assertTrue(tieEngine.getSettledShadowRecords().single().isTie)
+    }
+
+    @Test
+    fun `test Iteration 1 Task 2 shadow candidate eligibility separates Populations A B C and D`() {
+        val engine = ModularStrategyEngine()
+        val strategy = HardLockedMandate.lockedStrategyConfig()
+        val baseTs = 1700000000000L
+
+        val noiseTicks = (0 until 14).map { i ->
+            val offset = if (i % 2 == 0) 0.14 else -0.14
+            Tick(pair = "LATAM_X", price = 4500.0 + offset, timeMs = baseTs + i * 220L)
+        }
+        val lastNoiseTs = noiseTicks.last().timeMs
+        val lastNoisePrice = noiseTicks.last().price
+
+        // Population A only: 1-tick freak spike (rushSnr >= 1.22, purity >= 62%, but singleTickDominance > 65%)
+        val spikeTicks = noiseTicks + listOf(0.04, 0.08, 0.12, 1.92).mapIndexed { idx, cum ->
+            Tick(pair = "LATAM_X", price = lastNoisePrice + cum, timeMs = lastNoiseTs + (idx + 1) * 140L)
+        }
+        engine.evaluateStrategy(
+            strategy = strategy,
+            telemetry = MarketTelemetryState(
+                pair = "LATAM_X",
+                latestPrice = spikeTicks.last().price,
+                latestTimeMs = spikeTicks.last().timeMs,
+                tickCount = spikeTicks.size,
+                recentTicks = spikeTicks,
+                wsSynchronized = true
+            ),
+            wsLatencyMs = 30L
+        )
+        val diagAfterSpike = engine.getPopulationDiagnostics()
+        assertEquals("Spike must be recorded in Population A (observed impulses)", 1, diagAfterSpike.observedImpulseCount)
+        assertEquals("Spike must NOT enter Population B (structural Sniper M candidates)", 0, diagAfterSpike.structuralCandidateCount)
+        assertEquals("Spike must NOT enter Population C (deterministic gate pass)", 0, diagAfterSpike.deterministicGatePassCount)
+
+        // Counter-trend impulse (Population A only: upward burst while zFast < zSlow)
+        val counterTrendStartTs = spikeTicks.last().timeMs + 6000L
+        val counterBaseTicks = (0 until 14).map { i ->
+            val offset = if (i % 2 == 0) 0.14 else -0.14
+            Tick(pair = "LATAM_X", price = 4500.0 + offset, timeMs = counterTrendStartTs + i * 220L)
+        }
+        val counterRushTicks = counterBaseTicks + listOf(0.42, 0.88, 1.38, 1.92).mapIndexed { idx, cum ->
+            Tick(
+                pair = "LATAM_X",
+                price = counterBaseTicks.last().price + cum,
+                timeMs = counterBaseTicks.last().timeMs + (idx + 1) * 140L
+            )
+        }
+        engine.evaluateStrategy(
+            strategy = strategy,
+            telemetry = MarketTelemetryState(
+                pair = "LATAM_X",
+                latestPrice = counterRushTicks.last().price,
+                latestTimeMs = counterRushTicks.last().timeMs,
+                tickCount = counterRushTicks.size,
+                recentTicks = counterRushTicks,
+                zFast = 4495.0,
+                zSlow = 4505.0, // Explicitly bearish ZLEMA opposing the upward burst
+                wsSynchronized = true
+            ),
+            wsLatencyMs = 30L
+        )
+        val diagAfterCounterTrend = engine.getPopulationDiagnostics()
+        assertEquals(2, diagAfterCounterTrend.observedImpulseCount)
+        assertEquals("Counter-trend burst must NOT enter Population B", 0, diagAfterCounterTrend.structuralCandidateCount)
+        assertEquals(0, diagAfterCounterTrend.deterministicGatePassCount)
+
+        // Population B & C: Structurally valid Sniper M surge passing all deterministic gates
+        val validStartTs = counterRushTicks.last().timeMs + 6000L
+        val validBaseTicks = (0 until 14).map { i ->
+            val offset = if (i % 2 == 0) 0.14 else -0.14
+            Tick(pair = "LATAM_X", price = 4500.0 + offset, timeMs = validStartTs + i * 220L)
+        }
+        val validRushTicks = validBaseTicks + listOf(0.42, 0.88, 1.38, 1.92).mapIndexed { idx, cum ->
+            Tick(
+                pair = "LATAM_X",
+                price = validBaseTicks.last().price + cum,
+                timeMs = validBaseTicks.last().timeMs + (idx + 1) * 140L
+            )
+        }
+        val validEval = engine.evaluateStrategy(
+            strategy = strategy,
+            telemetry = MarketTelemetryState(
+                pair = "LATAM_X",
+                latestPrice = validRushTicks.last().price,
+                latestTimeMs = validRushTicks.last().timeMs,
+                tickCount = validRushTicks.size,
+                recentTicks = validRushTicks,
+                wsSynchronized = true
+            ),
+            wsLatencyMs = 30L
+        )
+        assertTrue(validEval.readyToExecute)
+        val diagAfterValid = engine.getPopulationDiagnostics()
+        assertEquals(3, diagAfterValid.observedImpulseCount)
+        assertEquals(1, diagAfterValid.structuralCandidateCount)
+        assertEquals(1, diagAfterValid.deterministicGatePassCount)
+
+        // Population D: Broker-accepted trade with trigger timestamp, estimated entry, and broker-confirmed open price
+        engine.recordBrokerAcceptedTrade(
+            brokerTradeId = 77001L,
+            pair = "LATAM_X",
+            triggerTimeMs = validRushTicks.last().timeMs,
+            estimatedEntryPrice = validRushTicks.last().price,
+            brokerConfirmedOpenPrice = validRushTicks.last().price + 0.04,
+            acceptedAtMs = validRushTicks.last().timeMs + 42L
+        )
+        val diagFinal = engine.getPopulationDiagnostics()
+        assertEquals(1, diagFinal.brokerAcceptedTradeCount)
+        val acceptedRecord = engine.getBrokerAcceptedTrades().single()
+        assertEquals(77001L, acceptedRecord.brokerTradeId)
+        assertEquals(validRushTicks.last().price, acceptedRecord.estimatedEntryPrice, 1e-9)
+        assertEquals(validRushTicks.last().price + 0.04, acceptedRecord.brokerConfirmedOpenPrice, 1e-9)
+    }
+
+    @Test
+    fun `test Iteration 1 Task 3 FTRL exponential forgetting mathematics decay and numerical stability`() {
+        val engine = ModularStrategyEngine()
+        // Feature 1 active vector: x[0]=1 (bias), x[1]=1.5 (signal), others 0
+        val xFeature1 = DoubleArray(ModularStrategyEngine.FEATURE_DIM).apply {
+            this[0] = 1.0
+            this[1] = 1.5
+        }
+        // Orthogonal Feature 2 active vector: x[0]=0.0, x[2]=1.0, x[1]=0.0
+        val xFeature2Only = DoubleArray(ModularStrategyEngine.FEATURE_DIM).apply {
+            this[2] = 1.0
+        }
+
+        // 1. Train 8 consecutive positive outcomes on xFeature1
+        repeat(8) {
+            engine.updateFtrlWeightsOnline(xFeature1, 1.0)
+        }
+        val probAfterPositiveRegime = engine.predictFtrlWinProbability(xFeature1)
+        assertTrue("After positive regime, P(Win) must exceed 0.55, got $probAfterPositiveRegime", probAfterPositiveRegime > 0.55)
+        val z1Peak = kotlin.math.abs(engine.getFtrlZ(1))
+        val n1Peak = engine.getFtrlN(1)
+        assertTrue(z1Peak > ModularStrategyEngine.FTRL_L1)
+        assertTrue(n1Peak > 0.0)
+
+        // 2. Advance 60 steps where Feature 1 has zero gradient (x[1] = 0.0)
+        //    Verify exact analytical exponential decay: z_1(t+60) = gamma^60 * z_1(t) and n_1(t+60) = gamma^60 * n_1(t)
+        val expectedDecay60 = Math.pow(ModularStrategyEngine.FORGETTING_GAMMA, 60.0)
+        repeat(60) {
+            engine.updateFtrlWeightsOnline(xFeature2Only, 1.0)
+        }
+        assertEquals(z1Peak * expectedDecay60, kotlin.math.abs(engine.getFtrlZ(1)), 1e-9)
+        assertEquals(n1Peak * expectedDecay60, engine.getFtrlN(1), 1e-9)
+
+        // 3. Advance another 340 steps (400 total, 0.985^400 = 0.00237) with x[1] = 0.0 so |z_1| decays below FTRL_L1 (0.015):
+        //    L1 proximal soft-thresholding must zero out w_1 completely!
+        repeat(340) {
+            engine.updateFtrlWeightsOnline(xFeature2Only, 1.0)
+        }
+        engine.predictFtrlWinProbability(xFeature1)
+        assertTrue("Stale |z_1| must decay below FTRL_L1", kotlin.math.abs(engine.getFtrlZ(1)) <= ModularStrategyEngine.FTRL_L1)
+        assertEquals("L1 soft-thresholding must drive forgotten feature weight w_1 to exact 0.0", 0.0, engine.getFtrlWeight(1), 1e-12)
+
+        // 4. Regime reversal: train 10 negative outcomes (labelY = 0.0) on xFeature1 and verify rapid adaptation < 0.45
+        repeat(10) {
+            engine.updateFtrlWeightsOnline(xFeature1, 0.0)
+        }
+        val probAfterNegativeRegime = engine.predictFtrlWinProbability(xFeature1)
+        assertTrue("Recent negative observations must dominate forgotten positive observations, got $probAfterNegativeRegime", probAfterNegativeRegime < 0.45)
+
+        // 5. Prolonged inactivity stability: 4000 zero-gradient updates must flush subnormals to 0.0 without NaN
+        val zeroVec = DoubleArray(ModularStrategyEngine.FEATURE_DIM)
+        repeat(4000) {
+            engine.updateFtrlWeightsOnline(zeroVec, 0.5)
+        }
+        for (i in 0 until ModularStrategyEngine.FEATURE_DIM) {
+            assertEquals(0.0, engine.getFtrlZ(i), 1e-18)
+            assertEquals(0.0, engine.getFtrlN(i), 1e-18)
+        }
+        assertEquals(0.5, engine.predictFtrlWinProbability(xFeature1), 1e-9)
+    }
+
+    @Test
+    fun `test Iteration 1 Task 4 removes target contamination from f7 and migrates SNIPER_FTRL_V1 safely`() {
+        val engine = ModularStrategyEngine()
+        val vecLowPurity = engine.buildFtrlFeatureVector(
+            rushSnr = 1.60,
+            tickConvexity = 1.20,
+            arrivalCompressionRatio = 0.80,
+            singleTickDominance = 0.35,
+            microPullbackRecovery = 0.80,
+            localZScore15 = 1.70,
+            purityPercent = 65.0
+        )
+        val vecHighPurity = engine.buildFtrlFeatureVector(
+            rushSnr = 1.60,
+            tickConvexity = 1.20,
+            arrivalCompressionRatio = 0.80,
+            singleTickDominance = 0.35,
+            microPullbackRecovery = 0.80,
+            localZScore15 = 1.70,
+            purityPercent = 95.0
+        )
+        assertEquals(ModularStrategyEngine.FEATURE_DIM, vecLowPurity.size)
+        assertEquals(-0.5, vecLowPurity[7], 1e-9)  // (65 - 75) / 20 = -0.5
+        assertEquals(1.0, vecHighPurity[7], 1e-9)  // (95 - 75) / 20 = +1.0
+
+        // Verify SNIPER_FTRL_V1 -> SNIPER_FTRL_V2 explicit migration zeroes retired coordinate 7
+        // while preserving valid exogenous coordinates 0..6 and 8..10:
+        val legacyZ = DoubleArray(11) { idx -> if (idx == 7) -2.50 else -0.40 }
+        val legacyN = DoubleArray(11) { idx -> if (idx == 7) 9.00 else 1.20 }
+        val legacyPayload = buildString {
+            append("SNIPER_FTRL_V1|42|0.68")
+            legacyZ.forEach { append('|').append(it) }
+            legacyN.forEach { append('|').append(it) }
+        }
+
+        val migratedEngine = ModularStrategyEngine()
+        assertTrue(migratedEngine.restoreLearningState(legacyPayload))
+        assertTrue("Restoring SNIPER_FTRL_V1 must flag explicit schema migration", migratedEngine.migratedFromLegacySchema)
+        assertEquals("SNIPER_FTRL_V1->SNIPER_FTRL_V2", migratedEngine.lastRestoredSchemaVersion)
+        assertEquals("Retired target-leak coordinate 7 z-accumulator must be zeroed on V1 migration", 0.0, migratedEngine.getFtrlZ(7), 1e-12)
+        assertEquals("Retired target-leak coordinate 7 n-accumulator must be zeroed on V1 migration", 0.0, migratedEngine.getFtrlN(7), 1e-12)
+        assertEquals("Retired target-leak coordinate 7 weight must be zeroed on V1 migration", 0.0, migratedEngine.getFtrlWeight(7), 1e-12)
+        assertEquals("Exogenous coordinate 1 z-accumulator must be preserved", -0.40, migratedEngine.getFtrlZ(1), 1e-9)
+        assertEquals("Exogenous coordinate 1 n-accumulator must be preserved", 1.20, migratedEngine.getFtrlN(1), 1e-9)
+
+        // Re-exporting after migration must emit SNIPER_FTRL_V2
+        val exportedV2 = migratedEngine.exportLearningState()
+        assertTrue(exportedV2.startsWith("SNIPER_FTRL_V2|"))
+    }
+
+    @Test
+    fun `test Iteration 1 Task 5 ring buffer validation across initial partial full wrap-around reset and isolation`() {
+        val temporal = com.olympquant.terminal.engine.TemporalIntelligenceEngine()
+        val regimes = com.olympquant.terminal.domain.TemporalRegimeType.entries
+
+        // 1. Initial empty state across all regimes and directions
+        for (r in regimes) {
+            assertEquals(0, temporal.recentRegimeDirectionSampleCount(r, SignalDirection.UP))
+            assertEquals(0, temporal.recentRegimeDirectionSampleCount(r, SignalDirection.DOWN))
+            assertEquals(null, temporal.recentRegimeDirectionWinRate(r, SignalDirection.UP))
+            assertEquals(null, temporal.recentRegimeDirectionWinRate(r, SignalDirection.DOWN))
+            assertEquals(null, temporal.recentRegimeDirectionWinRate(r, SignalDirection.NONE))
+        }
+
+        // 2. Partially filled buffer (8 samples: 5 wins, 3 losses -> 0.625)
+        repeat(5) {
+            temporal.recordShadowOutcome(SignalDirection.UP, com.olympquant.terminal.domain.TemporalRegimeType.EXPANSION_IMPULSE, 0.6, true, false)
+        }
+        repeat(3) {
+            temporal.recordShadowOutcome(SignalDirection.UP, com.olympquant.terminal.domain.TemporalRegimeType.EXPANSION_IMPULSE, 0.6, false, false)
+        }
+        assertEquals(8, temporal.recentRegimeDirectionSampleCount(com.olympquant.terminal.domain.TemporalRegimeType.EXPANSION_IMPULSE, SignalDirection.UP))
+        assertEquals(0.625, temporal.recentRegimeDirectionWinRate(com.olympquant.terminal.domain.TemporalRegimeType.EXPANSION_IMPULSE, SignalDirection.UP)!!, 1e-9)
+
+        // 3. Regime and direction isolation check
+        assertEquals(0, temporal.recentRegimeDirectionSampleCount(com.olympquant.terminal.domain.TemporalRegimeType.EXPANSION_IMPULSE, SignalDirection.DOWN))
+        assertEquals(null, temporal.recentRegimeDirectionWinRate(com.olympquant.terminal.domain.TemporalRegimeType.EXPANSION_IMPULSE, SignalDirection.DOWN))
+        assertEquals(0, temporal.recentRegimeDirectionSampleCount(com.olympquant.terminal.domain.TemporalRegimeType.TREND, SignalDirection.UP))
+
+        // 4. Fill to exact capacity (32 samples: add 24 losses -> 5 wins / 32 = 0.15625)
+        repeat(24) {
+            temporal.recordShadowOutcome(SignalDirection.UP, com.olympquant.terminal.domain.TemporalRegimeType.EXPANSION_IMPULSE, 0.6, false, false)
+        }
+        assertEquals(32, temporal.recentRegimeDirectionSampleCount(com.olympquant.terminal.domain.TemporalRegimeType.EXPANSION_IMPULSE, SignalDirection.UP))
+        assertEquals(5.0 / 32.0, temporal.recentRegimeDirectionWinRate(com.olympquant.terminal.domain.TemporalRegimeType.EXPANSION_IMPULSE, SignalDirection.UP)!!, 1e-9)
+
+        // 5. Circular wrap-around: overwrite the first 5 wins + 3 losses (8 oldest slots) with 8 wins -> 8 wins / 32 = 0.25
+        repeat(8) {
+            temporal.recordShadowOutcome(SignalDirection.UP, com.olympquant.terminal.domain.TemporalRegimeType.EXPANSION_IMPULSE, 0.6, true, false)
+        }
+        assertEquals(32, temporal.recentRegimeDirectionSampleCount(com.olympquant.terminal.domain.TemporalRegimeType.EXPANSION_IMPULSE, SignalDirection.UP))
+        assertEquals(8.0 / 32.0, temporal.recentRegimeDirectionWinRate(com.olympquant.terminal.domain.TemporalRegimeType.EXPANSION_IMPULSE, SignalDirection.UP)!!, 1e-9)
+
+        // 6. Buffer reset
+        temporal.reset()
+        assertEquals(0, temporal.recentRegimeDirectionSampleCount(com.olympquant.terminal.domain.TemporalRegimeType.EXPANSION_IMPULSE, SignalDirection.UP))
+        assertEquals(null, temporal.recentRegimeDirectionWinRate(com.olympquant.terminal.domain.TemporalRegimeType.EXPANSION_IMPULSE, SignalDirection.UP))
+    }
+
+    @Test
+    fun `test Iteration 1 Task 6 deterministic chronological walk-forward evaluation and UP DOWN symmetry`() {
+        val baseTs = 1700000000000L
+
+        // Helper to build a deterministic 18-tick segment + 5-second outcome resolution ticks
+        fun buildScenarioStream(
+            startTs: Long,
+            basePrice: Double,
+            directionSign: Int, // +1 for UP, -1 for DOWN
+            surgeSteps: List<Double>,
+            stepDtMs: Long = 135L,
+            preExpiryDeltaAt4800Ms: Double?,
+            postExpiryDeltaAt5200Ms: Double,
+            postExpiryTimeMs: Long = 5200L
+        ): List<Tick> {
+            val osc = (0 until 14).map { i ->
+                val offset = (if (i % 2 == 0) 0.12 else -0.12) * directionSign
+                Tick(pair = "LATAM_X", price = basePrice + offset, timeMs = startTs + i * 220L)
+            }
+            var curPrice = osc.last().price
+            var curTs = osc.last().timeMs
+            val burst = surgeSteps.map { step ->
+                curPrice += step * directionSign
+                curTs += stepDtMs
+                Tick(pair = "LATAM_X", price = curPrice, timeMs = curTs)
+            }
+            val triggerTs = burst.last().timeMs
+            val triggerPrice = burst.last().price
+            val postTriggerTick = Tick(
+                pair = "LATAM_X",
+                price = triggerPrice + (0.08 * directionSign),
+                timeMs = triggerTs + 150L
+            )
+            val tail = mutableListOf(postTriggerTick)
+            if (preExpiryDeltaAt4800Ms != null) {
+                tail.add(
+                    Tick(
+                        pair = "LATAM_X",
+                        price = triggerPrice + (preExpiryDeltaAt4800Ms * directionSign),
+                        timeMs = triggerTs + 4800L
+                    )
+                )
+            }
+            val postPrice = triggerPrice + (postExpiryDeltaAt5200Ms * directionSign)
+            tail.add(Tick(pair = "LATAM_X", price = postPrice, timeMs = triggerTs + postExpiryTimeMs))
+            // Append 4 balanced oscillation ticks after +5200ms so the 4-tick window at settlement has netDelta4 == 0.0
+            tail.add(Tick(pair = "LATAM_X", price = postPrice + 0.04 * directionSign, timeMs = triggerTs + postExpiryTimeMs + 150L))
+            tail.add(Tick(pair = "LATAM_X", price = postPrice, timeMs = triggerTs + postExpiryTimeMs + 300L))
+            tail.add(Tick(pair = "LATAM_X", price = postPrice + 0.04 * directionSign, timeMs = triggerTs + postExpiryTimeMs + 450L))
+            tail.add(Tick(pair = "LATAM_X", price = postPrice, timeMs = triggerTs + postExpiryTimeMs + 600L))
+            return osc + burst + tail
+        }
+
+        // 1. Verify exact UP/DOWN directional symmetry on mirror-image tick streams
+        val upEngine = ModularStrategyEngine()
+        val downEngine = ModularStrategyEngine()
+        val upStream = buildScenarioStream(
+            startTs = baseTs,
+            basePrice = 4500.0,
+            directionSign = 1,
+            surgeSteps = listOf(0.42, 0.46, 0.50, 0.54),
+            preExpiryDeltaAt4800Ms = 0.65,
+            postExpiryDeltaAt5200Ms = 0.80
+        )
+        val downStream = buildScenarioStream(
+            startTs = baseTs,
+            basePrice = 4500.0,
+            directionSign = -1,
+            surgeSteps = listOf(0.42, 0.46, 0.50, 0.54),
+            preExpiryDeltaAt4800Ms = 0.65,
+            postExpiryDeltaAt5200Ms = 0.80
+        )
+        val upRushTicks = upStream.take(18)
+        val downRushTicks = downStream.take(18)
+        val upMetrics = upEngine.extractRawTickRushMetrics(
+            MarketTelemetryState(pair = "LATAM_X", latestPrice = upRushTicks.last().price, latestTimeMs = upRushTicks.last().timeMs, tickCount = 18, recentTicks = upRushTicks, wsSynchronized = true)
+        )
+        val downMetrics = downEngine.extractRawTickRushMetrics(
+            MarketTelemetryState(pair = "LATAM_X", latestPrice = downRushTicks.last().price, latestTimeMs = downRushTicks.last().timeMs, tickCount = 18, recentTicks = downRushTicks, wsSynchronized = true)
+        )
+        assertEquals(SignalDirection.UP, upMetrics.rushDirection)
+        assertEquals(SignalDirection.DOWN, downMetrics.rushDirection)
+        assertEquals(upMetrics.rushSnr, downMetrics.rushSnr, 1e-9)
+        assertEquals(upMetrics.purityPercent, downMetrics.purityPercent, 1e-9)
+        assertEquals(upMetrics.tickConvexity, downMetrics.tickConvexity, 1e-9)
+        assertEquals(upMetrics.ftrlWinProbPercent, downMetrics.ftrlWinProbPercent, 1e-9)
+
+        // 2. Chronological Walk-Forward Evaluation Foundation:
+        //    Phase A (Warm-up / Training Period): 6 chronological setups (onlineTrainingEnabled = true)
+        //    Phase B (Out-of-Sample Evaluation Period): 10 chronological scenarios covering:
+        //      - Early impulse continuation (UP & DOWN)
+        //      - Late impulse exhaustion (dying tail rejected by Sniper M)
+        //      - Immediate reversal (snapback before +5000ms)
+        //      - Flat/noisy market
+        //      - Single-tick spike trap
+        //      - Missing expiry observation (reconnect gap > 1500ms -> invalid sample)
+        //      - High-latency shadow entry comparison
+        val wfEngine = ModularStrategyEngine()
+        val strategy = HardLockedMandate.lockedStrategyConfig()
+        var clockMs = baseTs
+
+        // Phase A: 6 Training setups (4 continuations, 2 reversals)
+        val trainingOutcomes = listOf(true, true, false, true, true, false)
+        for ((idx, isWin) in trainingOutcomes.withIndex()) {
+            val dir = if (idx % 2 == 0) 1 else -1
+            val delta4800 = if (isWin) 0.65 else -0.45
+            val stream = buildScenarioStream(
+                startTs = clockMs,
+                basePrice = 4500.0,
+                directionSign = dir,
+                surgeSteps = listOf(0.42, 0.46, 0.50, 0.54),
+                preExpiryDeltaAt4800Ms = delta4800,
+                postExpiryDeltaAt5200Ms = delta4800
+            )
+            val triggerSlice = stream.take(18)
+            wfEngine.evaluateStrategy(
+                strategy = strategy,
+                telemetry = MarketTelemetryState(
+                    pair = "LATAM_X",
+                    latestPrice = triggerSlice.last().price,
+                    latestTimeMs = triggerSlice.last().timeMs,
+                    tickCount = triggerSlice.size,
+                    recentTicks = triggerSlice,
+                    wsSynchronized = true
+                ),
+                wsLatencyMs = 30L
+            )
+            // Settle at post-expiry tail
+            wfEngine.extractRawTickRushMetrics(
+                MarketTelemetryState(
+                    pair = "LATAM_X",
+                    latestPrice = stream.last().price,
+                    latestTimeMs = stream.last().timeMs,
+                    tickCount = stream.size,
+                    recentTicks = stream,
+                    wsSynchronized = true
+                )
+            )
+            clockMs = stream.last().timeMs + 6000L
+        }
+        assertEquals(6, wfEngine.learnedSampleCount())
+        val weightsBeforeOos = (0 until ModularStrategyEngine.FEATURE_DIM).map { wfEngine.getFtrlWeight(it) }
+
+        // Freeze online weight updates during the Out-Of-Sample (OOS) evaluation period!
+        wfEngine.onlineTrainingEnabled = false
+        val recordsBeforeOos = wfEngine.getSettledShadowRecords().size
+        val diagBeforeOos = wfEngine.getPopulationDiagnostics()
+
+        data class OosScenario(
+            val name: String,
+            val directionSign: Int,
+            val surgeSteps: List<Double>,
+            val preExpiryDelta4800: Double?,
+            val postExpiryDelta5200: Double,
+            val expectStructuralCandidate: Boolean
+        )
+
+        val oosScenarios = listOf(
+            // 1. Early impulse continuation UP (WIN)
+            OosScenario("EarlyImpulse_UP_Win1", +1, listOf(0.40, 0.46, 0.52, 0.58), +0.72, +0.85, true),
+            // 2. Early impulse continuation DOWN (WIN)
+            OosScenario("EarlyImpulse_DOWN_Win1", -1, listOf(0.40, 0.46, 0.52, 0.58), +0.70, +0.82, true),
+            // 3. Immediate reversal UP (LOSS at +4800ms despite +5200ms spike)
+            OosScenario("ImmediateReversal_UP_Loss", +1, listOf(0.42, 0.45, 0.48, 0.50), -0.38, +2.50, true),
+            // 4. Late impulse exhaustion (dying tail: +0.85, +0.85, +0.12, +0.10 -> convexity < 0.55, rejected!)
+            OosScenario("LateExhaustion_Rejected", +1, listOf(0.85, 0.85, 0.12, 0.10), -0.50, -0.60, false),
+            // 5. Single-tick freak spike (+0.03, +0.03, +0.04, +1.85 -> dominance > 65%, rejected!)
+            OosScenario("SingleTickSpike_Rejected", -1, listOf(0.03, 0.03, 0.04, 1.85), -0.90, -1.10, false),
+            // 6. Flat/noisy market (+0.05, -0.04, +0.06, -0.03 -> SNR < 1.25, rejected!)
+            OosScenario("FlatNoisy_Rejected", +1, listOf(0.05, -0.04, 0.06, -0.03), 0.0, 0.0, false),
+            // 7. Missing expiry observation (>1500ms reconnect gap -> invalid sample, not fabricated!)
+            OosScenario("MissingExpiry_InvalidBracket", +1, listOf(0.42, 0.46, 0.50, 0.54), null, +0.90, true),
+            // 8. Early impulse continuation UP (WIN)
+            OosScenario("EarlyImpulse_UP_Win2", +1, listOf(0.44, 0.48, 0.54, 0.60), +0.64, +0.75, true),
+            // 9. Early impulse continuation DOWN (WIN)
+            OosScenario("EarlyImpulse_DOWN_Win2", -1, listOf(0.44, 0.48, 0.54, 0.60), +0.68, +0.79, true),
+            // 10. Immediate reversal DOWN (LOSS)
+            OosScenario("ImmediateReversal_DOWN_Loss", -1, listOf(0.41, 0.44, 0.47, 0.49), -0.32, -0.40, true)
+        )
+
+        for (sc in oosScenarios) {
+            val stream = buildScenarioStream(
+                startTs = clockMs,
+                basePrice = 4500.0,
+                directionSign = sc.directionSign,
+                surgeSteps = sc.surgeSteps,
+                preExpiryDeltaAt4800Ms = sc.preExpiryDelta4800,
+                postExpiryDeltaAt5200Ms = sc.postExpiryDelta5200
+            )
+            val triggerSlice = stream.take(18)
+            val eval = wfEngine.evaluateStrategy(
+                strategy = strategy,
+                telemetry = MarketTelemetryState(
+                    pair = "LATAM_X",
+                    latestPrice = triggerSlice.last().price,
+                    latestTimeMs = triggerSlice.last().timeMs,
+                    tickCount = triggerSlice.size,
+                    recentTicks = triggerSlice,
+                    wsSynchronized = true
+                ),
+                wsLatencyMs = 30L
+            )
+            assertEquals("Scenario ${sc.name} candidate eligibility mismatch", sc.expectStructuralCandidate, eval.readyToExecute)
+
+            // Settle horizon at post-expiry tail
+            wfEngine.extractRawTickRushMetrics(
+                MarketTelemetryState(
+                    pair = "LATAM_X",
+                    latestPrice = stream.last().price,
+                    latestTimeMs = stream.last().timeMs,
+                    tickCount = stream.size,
+                    recentTicks = stream,
+                    wsSynchronized = true
+                )
+            )
+            clockMs = stream.last().timeMs + 6000L
+        }
+
+        // Verify FTRL weights were strictly frozen during OOS evaluation (zero look-ahead training)
+        val weightsAfterOos = (0 until ModularStrategyEngine.FEATURE_DIM).map { wfEngine.getFtrlWeight(it) }
+        for (i in weightsBeforeOos.indices) {
+            assertEquals("OOS evaluation must not mutate FTRL weights", weightsBeforeOos[i], weightsAfterOos[i], 1e-12)
+        }
+
+        val diagAfterOos = wfEngine.getPopulationDiagnostics()
+        val oosCandidatesB = diagAfterOos.structuralCandidateCount - diagBeforeOos.structuralCandidateCount
+        val oosInvalidCount = diagAfterOos.invalidShadowSampleCount - diagBeforeOos.invalidShadowSampleCount
+        val oosRecords = wfEngine.getSettledShadowRecords().drop(recordsBeforeOos)
+
+        assertEquals("7 structural Sniper M candidates expected in OOS (4 wins, 2 losses, 1 invalid)", 7, oosCandidatesB)
+        assertEquals("1 invalid missing-bracket sample expected in OOS", 1, oosInvalidCount)
+        assertEquals("6 resolved non-tie OOS samples expected (4 wins, 2 losses)", 6, oosRecords.size)
+
+        val oosWins = oosRecords.count { it.won }
+        val oosAccuracy = oosWins.toDouble() / oosRecords.size.toDouble()
+        assertEquals(4, oosWins)
+        assertEquals(4.0 / 6.0, oosAccuracy, 1e-9) // 4 wins (2 UP, 2 DOWN) out of 6 resolved (1 MissingExpiry excluded)
+
+        // Compute OOS Brier score and Payout-Adjusted Expected Value (at 85% payout)
+        val oosBrier = oosRecords.map { rec ->
+            val y = if (rec.won) 1.0 else 0.0
+            (rec.predictedProb - y) * (rec.predictedProb - y)
+        }.average()
+        val payoutRatio = 0.85
+        val oosEvPerUnitStake = oosAccuracy * payoutRatio - (1.0 - oosAccuracy)
+        assertTrue(oosBrier in 0.0..0.35)
+        assertEquals((4.0 / 6.0) * 0.85 - (2.0 / 6.0), oosEvPerUnitStake, 1e-9) // +0.2333 (+23.33% EV per unit stake)
+    }
+
+    @Test
+    fun `test Iteration 3 execution quality summary pair switch preservation and latency deceleration penalty`() {
+        val engine = ModularStrategyEngine()
+        val strategy = HardLockedMandate.lockedStrategyConfig()
+        val baseTs = 1700000500000L
+
+        // Build a valid 18-tick Sniper M burst + 5s continuation settlement
+        val osc = (0 until 14).map { i ->
+            val offset = if (i % 2 == 0) 0.12 else -0.12
+            Tick(pair = "LATAM_X", price = 4500.0 + offset, timeMs = baseTs + i * 220L)
+        }
+        var curPrice = osc.last().price
+        var curTs = osc.last().timeMs
+        val burst = listOf(0.42, 0.46, 0.50, 0.54).map { step ->
+            curPrice += step
+            curTs += 135L
+            Tick(pair = "LATAM_X", price = curPrice, timeMs = curTs)
+        }
+        val triggerSlice = osc + burst
+        val triggerTs = burst.last().timeMs
+        val triggerPrice = burst.last().price
+
+        engine.evaluateStrategy(
+            strategy = strategy,
+            telemetry = MarketTelemetryState(
+                pair = "LATAM_X",
+                latestPrice = triggerPrice,
+                latestTimeMs = triggerTs,
+                tickCount = triggerSlice.size,
+                recentTicks = triggerSlice,
+                wsSynchronized = true
+            ),
+            wsLatencyMs = 25L
+        )
+        // Record a broker-accepted trade with 0.04pt slippage
+        engine.recordBrokerAcceptedTrade(
+            brokerTradeId = 9001L,
+            pair = "LATAM_X",
+            triggerTimeMs = triggerTs,
+            estimatedEntryPrice = triggerPrice,
+            brokerConfirmedOpenPrice = triggerPrice + 0.04,
+            acceptedAtMs = triggerTs + 35L
+        )
+
+        val fullStream = triggerSlice + listOf(
+            Tick(pair = "LATAM_X", price = triggerPrice + 0.10, timeMs = triggerTs + 150L),
+            Tick(pair = "LATAM_X", price = triggerPrice + 0.65, timeMs = triggerTs + 4800L),
+            Tick(pair = "LATAM_X", price = triggerPrice + 0.80, timeMs = triggerTs + 5200L)
+        )
+        engine.extractRawTickRushMetrics(
+            MarketTelemetryState(
+                pair = "LATAM_X",
+                latestPrice = fullStream.last().price,
+                latestTimeMs = fullStream.last().timeMs,
+                tickCount = fullStream.size,
+                recentTicks = fullStream,
+                wsSynchronized = true
+            )
+        )
+
+        val summary = engine.getExecutionQualitySummary()
+        assertEquals(1, summary.learnedSamples)
+        assertEquals(100.0, summary.postTriggerWinRatePercent, 1e-9)
+        assertEquals(0.04, summary.meanBrokerSlippagePts, 1e-9)
+        val weightBeforeSwitch = engine.getFtrlWeight(0)
+
+        // Switching pairs via resetTransientPairQueues() must preserve learned samples & FTRL weights!
+        engine.resetTransientPairQueues()
+        assertEquals(1, engine.learnedSampleCount())
+        assertEquals(weightBeforeSwitch, engine.getFtrlWeight(0), 1e-12)
+    }
 }
+
 
 
 

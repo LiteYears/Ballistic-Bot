@@ -230,8 +230,8 @@ class OlympQuantRepository(
         val savedToken = prefs[Keys.ACCESS_TOKEN] ?: ""
         val rawTf = prefs[Keys.SELECTED_TIMEFRAME_SEC] ?: 5
         SessionPreferences(
-            loggedInEmail = prefs[Keys.LOGGED_IN_EMAIL] ?: "",
-            loggedInUsername = prefs[Keys.LOGGED_IN_USERNAME] ?: "",
+            loggedInEmail = (prefs[Keys.LOGGED_IN_EMAIL] ?: "").ifBlank { "operator@olympquant.terminal" },
+            loggedInUsername = (prefs[Keys.LOGGED_IN_USERNAME] ?: "").ifBlank { "SniperOperator" },
             accessToken = savedToken.ifBlank { defaultEnvToken },
             wsUri = prefs[Keys.WS_URI] ?: SessionPreferences.DEFAULT_WS_URI,
             selectedPair = prefs[Keys.SELECTED_PAIR] ?: "LATAM_X",
@@ -253,28 +253,8 @@ class OlympQuantRepository(
         )
     }
 
-    val strategiesFlow: Flow<List<StrategyConfig>> = dao.observeStrategies().map { entities ->
-        if (entities.isEmpty()) {
-            listOf(
-                HardLockedMandate.fromScript(
-                    id = 1L,
-                    scriptCode = com.olympquant.terminal.engine.DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT,
-                    isPreset = true,
-                    isEnabled = true
-                )
-            )
-        } else {
-            entities.map { entity ->
-                val script = entity.filtersJson.takeIf { it.contains("[META]") }
-                    ?: com.olympquant.terminal.engine.DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT
-                HardLockedMandate.fromScript(
-                    id = entity.id,
-                    scriptCode = script,
-                    isPreset = entity.isPreset,
-                    isEnabled = entity.isEnabled
-                )
-            }
-        }
+    val strategiesFlow: Flow<List<StrategyConfig>> = dao.observeStrategies().map {
+        listOf(HardLockedMandate.lockedStrategyConfig())
     }
 
     val tradeJournalFlow: Flow<List<TradeJournalEntity>> = dao.observeTradeJournal()
@@ -283,11 +263,7 @@ class OlympQuantRepository(
         runCatching {
             val existing = dao.getAllStrategies()
             val hasOnlySniperM = existing.size == 1 &&
-                existing.first().name.equals(
-                    com.olympquant.terminal.engine.DefaultStrategyScripts.SNIPER_M_STRATEGY_NAME,
-                    ignoreCase = true
-                ) &&
-                existing.first().filtersJson == com.olympquant.terminal.engine.DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT
+                existing.first().name.equals(HardLockedMandate.STRATEGY_NAME, ignoreCase = true)
 
             if (!hasOnlySniperM) {
                 dao.clearAllStrategies()
@@ -297,28 +273,11 @@ class OlympQuantRepository(
             dao.setExclusiveLoadedStrategy(1L)
             context.dataStore.edit { prefs ->
                 prefs[Keys.SELECTED_TIMEFRAME_SEC] = 5
+                if (prefs[Keys.LOGGED_IN_EMAIL].isNullOrBlank()) {
+                    prefs[Keys.LOGGED_IN_EMAIL] = "operator@olympquant.terminal"
+                    prefs[Keys.LOGGED_IN_USERNAME] = "SniperOperator"
+                }
             }
-        }
-    }
-
-    /**
-     * Sniper M is the only supported strategy. This compatibility method deliberately
-     * returns the locked configuration rather than creating a second strategy.
-     */
-    suspend fun createStrategyFromTemplate(customName: String, durationSec: Int = 5): StrategyConfig {
-        ensureSeeded()
-        return HardLockedMandate.lockedStrategyConfig()
-    }
-
-    suspend fun saveAndLoadStrategyScript(strategyId: Long, scriptCode: String): Result<StrategyConfig> {
-        val canonical = com.olympquant.terminal.engine.DefaultStrategyScripts.SNIPER_M_OQS_SCRIPT
-        if (scriptCode.trim() != canonical.trim()) {
-            return Result.failure(
-                IllegalArgumentException("Sniper M is locked. Custom and alternate strategies are disabled.")
-            )
-        }
-        return runCatching {
-            resetToDefaultStrategy()
         }
     }
 
@@ -328,15 +287,6 @@ class OlympQuantRepository(
             prefs[Keys.SELECTED_TIMEFRAME_SEC] = 5
         }
         ensureSeeded()
-    }
-
-    suspend fun loadStrategy(strategyId: Long) {
-        ensureSeeded()
-        dao.setExclusiveLoadedStrategy(1L)
-    }
-
-    suspend fun deleteStrategy(strategyId: Long) {
-        resetToDefaultStrategy()
     }
 
     suspend fun resetToDefaultStrategy(): StrategyConfig {

@@ -194,8 +194,12 @@ class TerminalViewModel(
                     val idx = activeOpenTrades.indexOfLast {
                         it.pair == accepted.pair && abs(it.openedAtMs - accepted.timestampMs) < 5_000L
                     }
+                    var triggerTimeMs = accepted.timestampMs
+                    var estimatedEntryPrice = accepted.openPrice
                     if (idx >= 0) {
                         val existing = activeOpenTrades[idx]
+                        triggerTimeMs = existing.openedAtMs
+                        estimatedEntryPrice = existing.entryPrice
                         if (existing.brokerTradeId != accepted.brokerTradeId) {
                             activeOpenTrades[idx] = existing.copy(
                                 brokerTradeId = accepted.brokerTradeId,
@@ -203,6 +207,14 @@ class TerminalViewModel(
                             )
                         }
                     }
+                    modularStrategyEngine.recordBrokerAcceptedTrade(
+                        brokerTradeId = accepted.brokerTradeId,
+                        pair = accepted.pair,
+                        triggerTimeMs = triggerTimeMs,
+                        estimatedEntryPrice = estimatedEntryPrice,
+                        brokerConfirmedOpenPrice = accepted.openPrice,
+                        acceptedAtMs = accepted.timestampMs
+                    )
                     repository.updateAcceptedTrade(
                         pair = accepted.pair,
                         brokerTradeId = accepted.brokerTradeId,
@@ -648,80 +660,14 @@ class TerminalViewModel(
     }
 
     fun currentLoadedStrategy(): StrategyConfig {
-        val list = strategies.value
-        return list.firstOrNull { it.isEnabled }
-            ?: list.firstOrNull()
-            ?: HardLockedMandate.lockedStrategyConfig()
+        return HardLockedMandate.lockedStrategyConfig()
     }
 
-    fun getLiveSymbolSnapshot(scriptCode: String): Map<String, Double> {
+    fun getLiveSymbolSnapshot(): Map<String, Double> {
         return modularStrategyEngine.getLiveSymbolSnapshot(
             telemetry = _telemetry.value,
-            wsLatencyMs = wsLatencyMs.value,
-            scriptCode = scriptCode
+            wsLatencyMs = wsLatencyMs.value
         )
-    }
-
-    fun createNewStrategyFromTemplate(customName: String, onCreated: (StrategyConfig) -> Unit = {}) {
-        viewModelScope.launch {
-            val tfSec = TradeTimeframe.fromSeconds(sessionPrefs.value.selectedTimeframeSec).seconds
-            val created = withContext(Dispatchers.IO) {
-                repository.createStrategyFromTemplate(customName, durationSec = tfSec)
-            }
-            _lastExecutionBanner.value = "Created & Loaded Strategy: ${created.name} (${TradeTimeframe.fromSeconds(created.durationSeconds).label})"
-            onCreated(created)
-        }
-    }
-
-    fun saveAndLoadStrategyScript(
-        strategyId: Long,
-        scriptCode: String,
-        onResult: (Result<StrategyConfig>) -> Unit = {}
-    ) {
-        viewModelScope.launch {
-            val result = withContext(Dispatchers.IO) {
-                repository.saveAndLoadStrategyScript(strategyId, scriptCode)
-            }
-            result.onSuccess { saved ->
-                _lastExecutionBanner.value =
-                    "Loaded Strategy: ${saved.name} • ${saved.durationSeconds}s • ${saved.stakeMode} (${saved.stakeValue})"
-            }.onFailure { err ->
-                _lastExecutionBanner.value = "Script Compile Error: ${err.message}"
-            }
-            onResult(result)
-        }
-    }
-
-    fun loadStrategy(strategyId: Long) {
-        viewModelScope.launch {
-            withContext(Dispatchers.IO) {
-                repository.loadStrategy(strategyId)
-            }
-            val chosen = strategies.value.firstOrNull { it.id == strategyId }
-            if (chosen != null) {
-                _lastExecutionBanner.value =
-                    "Active Loaded Strategy: ${chosen.name} (${chosen.durationSeconds}s)"
-            }
-        }
-    }
-
-    fun deleteStrategy(strategyId: Long) {
-        viewModelScope.launch {
-            withContext(Dispatchers.IO) {
-                repository.deleteStrategy(strategyId)
-            }
-            _lastExecutionBanner.value = "Strategy removed • Active strategy updated"
-        }
-    }
-
-    fun resetToDefaultStrategy(onReset: (StrategyConfig) -> Unit = {}) {
-        viewModelScope.launch {
-            val defaultCfg = withContext(Dispatchers.IO) {
-                repository.resetToDefaultStrategy()
-            }
-            _lastExecutionBanner.value = "Reset to Default Strategy: ${defaultCfg.name}"
-            onReset(defaultCfg)
-        }
     }
 
     private data class HardLockedDailyStats(
@@ -950,7 +896,7 @@ class TerminalViewModel(
         trendAgeEngine.reset()
         regimeEngine.reset()
         indicatorEngine.reset()
-        modularStrategyEngine.reset()
+        modularStrategyEngine.resetTransientPairQueues()
         val prefs = sessionPrefs.value
         _telemetry.value = MarketTelemetryState(
             pair = pair,
