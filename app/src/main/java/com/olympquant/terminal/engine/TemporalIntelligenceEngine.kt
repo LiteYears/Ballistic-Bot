@@ -69,6 +69,9 @@ class TemporalIntelligenceEngine {
     private val recentRegimeDirectionOutcomes = Array(4) { Array(2) { IntArray(32) } }
     private val recentRegimeDirectionHead = Array(4) { IntArray(2) }
     private val recentRegimeDirectionCount = Array(4) { IntArray(2) }
+    private val fingerprintOutcomes = Array(ModularStrategyEngine.ShadowFingerprint.values().size) { IntArray(32) }
+    private val fingerprintHead = IntArray(ModularStrategyEngine.ShadowFingerprint.values().size)
+    private val fingerprintCount = IntArray(ModularStrategyEngine.ShadowFingerprint.values().size)
 
     // Walk-forward calibration & false-positive / impulse-detection tracking
     private var brierErrorEma: Double = 0.25 // Neutral Brier baseline before observations
@@ -106,6 +109,11 @@ class TemporalIntelligenceEngine {
                 recentRegimeDirectionCount[regime][direction] = 0
             }
         }
+        for (i in fingerprintOutcomes.indices) {
+            Arrays.fill(fingerprintOutcomes[i], 0)
+            fingerprintHead[i] = 0
+            fingerprintCount[i] = 0
+        }
         brierErrorEma = 0.25
         falsePositiveShadows = 0
         totalNoiseEventsClassified = 0
@@ -123,8 +131,15 @@ class TemporalIntelligenceEngine {
         regime: TemporalRegimeType,
         predictedProb: Double,
         won: Boolean,
-        wasSpikeNoise: Boolean
+        wasSpikeNoise: Boolean,
+        fingerprint: ModularStrategyEngine.ShadowFingerprint = ModularStrategyEngine.ShadowFingerprint.OTHER
     ) {
+        val fingerprintIndex = fingerprint.ordinal
+        val fingerprintWriteIndex = fingerprintHead[fingerprintIndex]
+        fingerprintOutcomes[fingerprintIndex][fingerprintWriteIndex] = if (won) 1 else 0
+        fingerprintHead[fingerprintIndex] = (fingerprintWriteIndex + 1) % 32
+        fingerprintCount[fingerprintIndex] = (fingerprintCount[fingerprintIndex] + 1).coerceAtMost(32)
+
         val y = if (won) 1.0 else 0.0
         val p = predictedProb.finiteOr(0.5).coerceIn(0.01, 0.99)
         val sqErr = (p - y) * (p - y)
@@ -162,6 +177,20 @@ class TemporalIntelligenceEngine {
             totalGenuineImpulses++
             if (won) detectedGenuineImpulses++
         }
+    }
+
+    @Synchronized
+    fun recentFingerprintSampleCount(fingerprint: ModularStrategyEngine.ShadowFingerprint): Int =
+        fingerprintCount[fingerprint.ordinal]
+
+    @Synchronized
+    fun recentFingerprintWinRate(fingerprint: ModularStrategyEngine.ShadowFingerprint): Double? {
+        val index = fingerprint.ordinal
+        val count = fingerprintCount[index]
+        if (count == 0) return null
+        var wins = 0
+        for (i in 0 until count) wins += fingerprintOutcomes[index][i]
+        return (wins.toDouble() / count.toDouble()).coerceIn(0.0, 1.0)
     }
 
     @Synchronized
