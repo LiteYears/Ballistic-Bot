@@ -44,6 +44,42 @@ class QuantPipelineUnitTest {
     }
 
     @Test
+    fun `test ADWIN detects a sustained TIME-5 prediction error shift and persists adaptation state`() {
+        val engine = ModularStrategyEngine()
+
+        // Stable low-error regime should not trigger drift.
+        repeat(24) { assertFalse(engine.observeAdwinError(0.05)) }
+        assertEquals(0, engine.getDriftDetectionCount())
+
+        // A sustained high-error regime should cut away the stale prefix and accelerate learning.
+        var detected = false
+        repeat(24) {
+            if (engine.observeAdwinError(0.95)) detected = true
+        }
+        assertTrue("ADWIN must detect a material prediction-error shift", detected)
+        assertEquals(1, engine.getDriftDetectionCount())
+        assertTrue(engine.getFastLearningUpdatesRemaining() > 0)
+        assertTrue(engine.getAdwinWindowSize() in 8..24)
+
+        val snapshot = engine.exportLearningState()
+        val restored = ModularStrategyEngine()
+        assertTrue(restored.restoreLearningState(snapshot))
+        assertEquals(engine.getDriftDetectionCount(), restored.getDriftDetectionCount())
+        assertEquals(engine.getFastLearningUpdatesRemaining(), restored.getFastLearningUpdatesRemaining())
+        assertEquals(engine.getAdwinWindowSize(), restored.getAdwinWindowSize())
+
+        // V2 snapshots remain readable and are upgraded without losing FTRL weights.
+        val parts = snapshot.split('|')
+        val errorCount = parts[5].toInt()
+        val zStart = 6 + errorCount
+        val v2Snapshot = (listOf("SNIPER_FTRL_V2", parts[1], parts[2]) + parts.subList(zStart, parts.size))
+            .joinToString("|")
+        val migrated = ModularStrategyEngine()
+        assertTrue(migrated.restoreLearningState(v2Snapshot))
+        assertEquals("SNIPER_FTRL_V2->SNIPER_FTRL_V3", migrated.lastRestoredSchemaVersion)
+    }
+
+    @Test
     fun `test recent regime-direction performance uses bounded walk-forward outcomes`() {
         val temporal = com.olympquant.terminal.engine.TemporalIntelligenceEngine()
         repeat(16) {
@@ -229,6 +265,9 @@ class QuantPipelineUnitTest {
         assertEquals(SignalDirection.UP, rushEval.finalSignal)
         assertTrue(rushEval.confidenceScore >= HardLockedMandate.MIN_CONFIDENCE_REQUIRED)
         assertTrue(rushEval.readyToExecute)
+        assertFalse("ML must not alter execution during its neutral warm-up", rushEval.mlModelReady)
+        assertFalse(rushEval.mlGateApplied)
+        assertEquals(50.0, rushEval.mlWinProbabilityPercent, 1e-9)
 
         // 3. Verify Single-Tick Freak Spike Trap (e.g. +0.04, +0.04, +0.04, +1.80 -> dominance > 90%) is BLOCKED
         val spikeDeltas = listOf(0.04, 0.08, 0.12, 1.92)
