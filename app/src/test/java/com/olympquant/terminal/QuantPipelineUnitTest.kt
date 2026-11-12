@@ -2095,6 +2095,29 @@ class QuantPipelineUnitTest {
         )
         assertEquals(SignalDirection.UP, eval.finalSignal)
         assertTrue("Confidence score must reflect strong surge execution: ${eval.confidenceScore}", eval.confidenceScore >= 60.0)
+
+        // A warmed learner must actually meta-label an aligned structural Sniper M candidate.
+        val mlEngine = ModularStrategyEngine()
+        val candidateFeatures = mlEngine.buildFtrlFeatureVector(
+            rushSnr = metrics.rushSnr,
+            tickConvexity = metrics.tickConvexity,
+            arrivalCompressionRatio = metrics.arrivalCompressionRatio,
+            singleTickDominance = metrics.singleTickDominancePercent / 100.0,
+            microPullbackRecovery = metrics.microPullbackRecovery,
+            localZScore15 = metrics.localZScore15,
+            purityPercent = metrics.purityPercent
+        )
+        repeat(80) { mlEngine.updateFtrlWeightsOnline(candidateFeatures, 0.0) }
+        val mlFilteredEval = mlEngine.evaluateStrategy(
+            strategy = strategy,
+            telemetry = telemetry,
+            wsLatencyMs = 25L,
+            minPayoutPercent = 80
+        )
+        assertTrue(mlFilteredEval.mlModelReady)
+        assertTrue("ML gate must attach to aligned structural Sniper M candidates", mlFilteredEval.mlGateApplied)
+        assertFalse("A consistently loss-trained meta-labeler must reject this candidate", mlFilteredEval.readyToExecute)
+        assertEquals(SignalDirection.NONE, mlFilteredEval.finalSignal)
     }
 
     @Test
