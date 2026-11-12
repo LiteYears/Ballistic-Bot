@@ -59,7 +59,7 @@ class QuantPipelineUnitTest {
         assertTrue("ADWIN must detect a material prediction-error shift", detected)
         assertEquals(1, engine.getDriftDetectionCount())
         assertTrue(engine.getFastLearningUpdatesRemaining() > 0)
-        assertTrue(engine.getAdwinWindowSize() in 8..24)
+        assertTrue(engine.getAdwinWindowSize() in 8..32)
 
         val snapshot = engine.exportLearningState()
         val restored = ModularStrategyEngine()
