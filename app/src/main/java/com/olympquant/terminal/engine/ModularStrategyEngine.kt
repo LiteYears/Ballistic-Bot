@@ -782,6 +782,19 @@ class ModularStrategyEngine {
         val trendContradicts = (decision == SignalDirection.UP && telemetry.zFast > 0.0 && telemetry.zSlow > 0.0 && telemetry.zFast < telemetry.zSlow - 1e-4) ||
             (decision == SignalDirection.DOWN && telemetry.zFast > 0.0 && telemetry.zSlow > 0.0 && telemetry.zFast > telemetry.zSlow + 1e-4)
 
+        // Online FTRL is a meta-labeler, never a replacement for Sniper M / TIME-5 detection.
+        // Apply it only to an aligned structural Sniper M candidate and only after warm-up.
+        val mlModelReady = shadowSamplesCount >= MIN_ADAPTIVE_LABELS
+        val mlDirectionAligned = decision != SignalDirection.NONE &&
+            rush.rushDirection == decision &&
+            rush.candidatePopulation == CandidatePopulation.POPULATION_B_STRUCTURAL_SNIPER_CANDIDATE
+        val mlGateApplied = mlModelReady && mlDirectionAligned
+        val payoutRatio = (telemetry.assetPayoutPercent.coerceAtLeast(minPayoutPercent) / 100.0).coerceAtLeast(0.01)
+        val breakEvenProbability = 1.0 / (1.0 + payoutRatio)
+        val mlRequiredProbability = max(MIN_FTRL_WIN_PROBABILITY, breakEvenProbability + 0.01)
+        val mlProbability = (rush.ftrlWinProbPercent / 100.0).finiteOr(0.5).coerceIn(0.01, 0.99)
+        val mlGatePassed = !mlGateApplied || mlProbability >= mlRequiredProbability
+
         val rejectionReason: String? = when {
             telemetry.hardStopReason != null -> "Hard stop engaged: ${telemetry.hardStopReason}"
             !contextPassed -> "Blocked by context: ${telemetry.contextBlockReasons.first()}"
@@ -815,19 +828,6 @@ class ModularStrategyEngine {
         } else {
             0.0
         }
-
-        // Online FTRL is a meta-labeler, never a replacement for Sniper M / TIME-5 detection.
-        // Apply it only to an aligned structural Sniper M candidate and only after warm-up.
-        val mlModelReady = shadowSamplesCount >= MIN_ADAPTIVE_LABELS
-        val mlDirectionAligned = decision != SignalDirection.NONE &&
-            rush.rushDirection == decision &&
-            rush.candidatePopulation == CandidatePopulation.POPULATION_B_STRUCTURAL_SNIPER_CANDIDATE
-        val mlGateApplied = mlModelReady && mlDirectionAligned
-        val payoutRatio = (telemetry.assetPayoutPercent.coerceAtLeast(minPayoutPercent) / 100.0).coerceAtLeast(0.01)
-        val breakEvenProbability = 1.0 / (1.0 + payoutRatio)
-        val mlRequiredProbability = max(MIN_FTRL_WIN_PROBABILITY, breakEvenProbability + 0.01)
-        val mlProbability = (rush.ftrlWinProbPercent / 100.0).finiteOr(0.5).coerceIn(0.01, 0.99)
-        val mlGatePassed = !mlGateApplied || mlProbability >= mlRequiredProbability
 
         val readyToExecute = (decision != SignalDirection.NONE) &&
             !trendContradicts &&
