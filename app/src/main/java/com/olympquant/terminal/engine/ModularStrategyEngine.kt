@@ -410,22 +410,22 @@ class ModularStrategyEngine {
 
         val restoredErrors: List<Double>
         val zStart: Int
+        val restoredDriftCount: Int
+        val restoredFastUpdates: Int
         if (isV3) {
-            val restoredDriftCount = parts.getOrNull(3)?.toIntOrNull()?.takeIf { it >= 0 } ?: return false
-            val restoredFastUpdates = parts.getOrNull(4)?.toIntOrNull()?.takeIf { it in 0..DRIFT_FAST_LEARNING_UPDATES } ?: return false
+            restoredDriftCount = parts.getOrNull(3)?.toIntOrNull()?.takeIf { it >= 0 } ?: return false
+            restoredFastUpdates = parts.getOrNull(4)?.toIntOrNull()?.takeIf { it in 0..DRIFT_FAST_LEARNING_UPDATES } ?: return false
             val errorCount = parts.getOrNull(5)?.toIntOrNull()?.takeIf { it in 0..ADWIN_MAX_WINDOW } ?: return false
             zStart = 6 + errorCount
             if (parts.size != zStart + FEATURE_DIM * 2) return false
             restoredErrors = parts.subList(6, zStart).map { it.toDoubleOrNull() ?: return false }
             if (restoredErrors.any { !it.isFinite() || it !in 0.0..1.0 }) return false
-            driftDetectionCount = restoredDriftCount
-            fastLearningUpdatesRemaining = restoredFastUpdates
         } else {
             if (parts.size != 3 + FEATURE_DIM * 2) return false
             zStart = 3
             restoredErrors = emptyList()
-            driftDetectionCount = 0
-            fastLearningUpdatesRemaining = 0
+            restoredDriftCount = 0
+            restoredFastUpdates = 0
         }
 
         val zValues = parts.subList(zStart, zStart + FEATURE_DIM).map { it.toDoubleOrNull() ?: return false }
@@ -435,6 +435,8 @@ class ModularStrategyEngine {
 
         shadowSamplesCount = samples
         rollingShadowWinRate = rollingRate
+        driftDetectionCount = restoredDriftCount
+        fastLearningUpdatesRemaining = restoredFastUpdates
         adwinModelErrors.clear()
         restoredErrors.forEach { adwinModelErrors.addLast(it) }
         lastAdwinErrorRate = if (restoredErrors.isNotEmpty()) restoredErrors.average() else 0.0
@@ -494,6 +496,15 @@ class ModularStrategyEngine {
 
     @Synchronized
     internal fun getFtrlN(index: Int): Double = if (index in 0 until FEATURE_DIM) ftrlN[index] else 0.0
+
+    @Synchronized
+    internal fun getDriftDetectionCount(): Int = driftDetectionCount
+
+    @Synchronized
+    internal fun getFastLearningUpdatesRemaining(): Int = fastLearningUpdatesRemaining
+
+    @Synchronized
+    internal fun getAdwinWindowSize(): Int = adwinModelErrors.size
 
     @Synchronized
     fun recordBrokerAcceptedTrade(
