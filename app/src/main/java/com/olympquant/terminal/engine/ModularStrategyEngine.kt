@@ -9,6 +9,9 @@ import com.olympquant.terminal.domain.StrategyConfig
 import com.olympquant.terminal.domain.StrategyEvaluation
 import com.olympquant.terminal.domain.TemporalRegimeType
 import com.olympquant.terminal.domain.TemporalTelemetrySnapshot
+import com.olympquant.terminal.domain.Time5EvaluationRecord
+import com.olympquant.terminal.domain.Time5Metrics
+import com.olympquant.terminal.domain.Time5StrategyParams
 import com.olympquant.terminal.domain.finiteOr
 import kotlin.math.abs
 import kotlin.math.exp
@@ -184,6 +187,84 @@ class ModularStrategyEngine {
         private set
     val temporalEngine = TemporalIntelligenceEngine()
 
+    // Centralized TIME-5 Strategy Parameters
+    var params: Time5StrategyParams = Time5StrategyParams()
+
+    // TIME-5 Time-Aware Exponential Smoothing State (tau = 800ms)
+    private var lastSmoothedVelocity: Double = 0.0
+    private var lastComputedAcceleration: Double = 0.0
+    private var lastVelocityTimestampMs: Long = 0L
+    private var hasVelocityHistory: Boolean = false
+
+    // TIME-5 Evaluation Record and Signal Lifecycle History
+    private val evaluationRecords = ArrayDeque<Time5EvaluationRecord>(256)
+
+    fun getEvaluationRecords(): List<Time5EvaluationRecord> = synchronized(this) {
+        evaluationRecords.toList()
+    }
+
+    fun getLatestEvaluationRecord(): Time5EvaluationRecord? = synchronized(this) {
+        evaluationRecords.lastOrNull()
+    }
+
+    @Synchronized
+    fun recordExecutionAttempt(timestampMs: Long, pair: String, price: Double, direction: SignalDirection) {
+        val last = evaluationRecords.lastOrNull()
+        if (last != null && (last.assetIdentifier == pair || last.assetIdentifier.isEmpty())) {
+            evaluationRecords.removeLast()
+            evaluationRecords.addLast(
+                last.copy(
+                    executionAttempted = true,
+                    lifecycleEvent = "EXECUTION_ATTEMPT"
+                )
+            )
+        }
+    }
+
+    @Synchronized
+    fun recordExecutionConfirmed(brokerTradeId: Long, openPrice: Double) {
+        val last = evaluationRecords.lastOrNull()
+        if (last != null) {
+            evaluationRecords.removeLast()
+            evaluationRecords.addLast(
+                last.copy(
+                    platformConfirmed = true,
+                    actualExecutionPrice = if (openPrice > 0.0) openPrice else last.currentPrice,
+                    lifecycleEvent = "EXECUTION_CONFIRMED"
+                )
+            )
+        }
+    }
+
+    @Synchronized
+    fun recordExecutionFailed(reason: String) {
+        val last = evaluationRecords.lastOrNull()
+        if (last != null) {
+            evaluationRecords.removeLast()
+            evaluationRecords.addLast(
+                last.copy(
+                    rejectionReason = reason,
+                    lifecycleEvent = "EXECUTION_FAILED"
+                )
+            )
+        }
+    }
+
+    @Synchronized
+    fun recordTradeSettled(brokerTradeId: Long, expiryPrice: Double, outcome: String) {
+        val last = evaluationRecords.lastOrNull()
+        if (last != null) {
+            evaluationRecords.removeLast()
+            evaluationRecords.addLast(
+                last.copy(
+                    expiryPrice = expiryPrice,
+                    realizedOutcome = outcome,
+                    lifecycleEvent = if (outcome.isNotBlank()) "TRADE_RESULT" else "TRADE_EXPIRED"
+                )
+            )
+        }
+    }
+
     init {
         reset()
     }
@@ -198,6 +279,10 @@ class ModularStrategyEngine {
         pendingBroadImpulses.clear()
         lastShadowEnqueueTimeMs = 0L
         lastBroadImpulseEnqueueTimeMs = 0L
+        lastSmoothedVelocity = 0.0
+        lastComputedAcceleration = 0.0
+        lastVelocityTimestampMs = 0L
+        hasVelocityHistory = false
     }
 
     @Synchronized
@@ -222,6 +307,11 @@ class ModularStrategyEngine {
         onlineTrainingEnabled = true
         lastRestoredSchemaVersion = CURRENT_LEARNING_STATE_SCHEMA
         migratedFromLegacySchema = false
+        lastSmoothedVelocity = 0.0
+        lastComputedAcceleration = 0.0
+        lastVelocityTimestampMs = 0L
+        hasVelocityHistory = false
+        evaluationRecords.clear()
         temporalEngine.reset()
         for (i in 0 until FEATURE_DIM) {
             // Neutral cold start: no hand-authored weights or assumed edge.
@@ -430,242 +520,323 @@ class ModularStrategyEngine {
     ): StrategyEvaluation {
         val rush = extractRawTickRushMetrics(telemetry)
         val temporalSnapshot = temporalEngine.pushObservationFrame(telemetry, rush, wsLatencyMs)
-        val zlemaTrendDir = resolveZlemaTrendDirection(telemetry, telemetry.recentTicks, rush.rushDirection)
+        val ticks = telemetry.recentTicks
+        val nowMs = System.currentTimeMillis()
 
-        val rawSignal = if (rush.rushDirection != SignalDirection.NONE && zlemaTrendDir == rush.rushDirection) {
-            rush.rushDirection
-        } else {
-            SignalDirection.NONE
-        }
-
-        val effectiveMinPayout = minPayoutPercent.coerceIn(50, 98)
-        val effectiveMinConfidence = 58.0
-        val hv = telemetry.hvWindow
-        val hvStatus = telemetry.highVoltageStatus
-        val micro = telemetry.microstructure
-
-        // =========================================================================================
-        // SCIENTIFIC 7-GATE SNIPER M FALSE-POSITIVE REJECTION PIPELINE (SOLE NATIVE STRATEGY)
-        // =========================================================================================
-
-        // Gate 1: Market Synchronization, Latency, Payout & Chop/Whipsaw Immunity
-        val syncAndFresh = temporalSnapshot.snapshotSynchronized &&
-            temporalSnapshot.tickAgeMs <= 3500L &&
-            wsLatencyMs <= 250L &&
-            !telemetry.assetLocked &&
-            telemetry.assetPayoutPercent >= effectiveMinPayout
-        val noChopOrWhipsaw = !hv.tightChopDetected &&
-            !hv.crazyWhipsawDetected &&
-            !hv.pauseImmediately &&
-            hv.wickCollapseRatioPercent.finiteOr(20.0) <= 55.0
-        val gate1Passed = syncAndFresh && noChopOrWhipsaw
-        val gate1Diag = FilterDiagnostic(
-            filterType = FilterType.TICK_SPEED_AND_FRESHNESS,
-            passed = gate1Passed,
-            actualValueFormatted = if (!syncAndFresh) {
-                "Sync=${temporalSnapshot.snapshotSynchronized} • ${wsLatencyMs}ms"
-            } else if (!noChopOrWhipsaw) {
-                hv.activeTrap.label
-            } else {
-                "SYNCED • ${wsLatencyMs}ms • +${telemetry.assetPayoutPercent}%"
-            },
-            thresholdFormatted = "Synced • ≤250ms • No Chop",
-            reason = "Requires synchronized stream, RTT ≤ 250ms, payout ≥ $effectiveMinPayout%, and zero chop/whipsaw traps",
-            gateTitle = "1. Sync, Latency & Chop Guard"
-        )
-
-        // Gate 2: Smoothed ZLEMA Trajectory & 5-Tick Momentum Anchor Alignment
-        val netDelta5Val = telemetry.netDelta5.finiteOr(0.0)
-        val netDelta5Aligned = when (rush.rushDirection) {
-            SignalDirection.UP -> netDelta5Val >= -1e-9 && rush.netDelta4 > 0.0
-            SignalDirection.DOWN -> netDelta5Val <= 1e-9 && rush.netDelta4 < 0.0
-            SignalDirection.NONE -> false
-        }
-        val zlemaAligned = rush.rushDirection != SignalDirection.NONE && zlemaTrendDir == rush.rushDirection
-        val gate2Passed = zlemaAligned && netDelta5Aligned && hv.score.finiteOr(60.0) >= 50.0
-        val gate2Diag = FilterDiagnostic(
-            filterType = FilterType.TICK_RUSH_SNR_GATE,
-            passed = gate2Passed,
-            actualValueFormatted = "Smooth=${zlemaTrendDir.name} • Rush=${rush.rushDirection.name} • HV=${"%.0f".format(hv.score)}%",
-            thresholdFormatted = "Aligned • HV ≥ 50%",
-            reason = "Requires smoothed ZLEMA (Fast vs Slow) and 5-tick net delta to align with burst direction",
-            gateTitle = "2. Smoothed ZLEMA & Momentum Anchor"
-        )
-
-        // Gate 3: Winsorized Hawkes-Laminar Surge SNR & Arrival Speed
-        val minSnrRequired = max(1.28, temporalSnapshot.regimeSnrThreshold.finiteOr(1.30) - 0.04)
-        val gate3Passed = rush.rushSnr >= minSnrRequired &&
-            rush.clearedNoiseMean &&
-            rush.tickSpeedTps >= 1.15
-        val gate3Diag = FilterDiagnostic(
-            filterType = FilterType.TICK_RUSH_SNR_GATE,
-            passed = gate3Passed,
-            actualValueFormatted = "${"%.2f".format(rush.rushSnr)}x @ ${"%.2f".format(rush.tickSpeedTps)} T/s",
-            thresholdFormatted = "≥${"%.2f".format(minSnrRequired)}x @ ≥1.15 T/s",
-            reason = "Requires Winsorized 4-tick surge SNR ≥ ${"%.2f".format(minSnrRequired)}x above baseline noise and speed ≥ 1.15 T/s",
-            gateTitle = "3. Hawkes-Laminar Surge SNR & Speed"
-        )
-
-        // Gate 4: Trajectory Purity, Tip Alignment & Non-Decelerating Convexity (Anti-Dying-Tail Guard)
-        val minPurityRequired = max(68.0, temporalSnapshot.regimePurityThreshold.finiteOr(70.0) - 2.0)
-        val convexityValid = rush.tickConvexity in 0.65..3.20
-        val tailRetentionValid = rush.lastStepRatio >= 0.72 && rush.tailRetentionRatio >= 0.60
-        val gate4Passed = rush.purityPercent >= minPurityRequired &&
-            rush.tipAligned &&
-            convexityValid &&
-            tailRetentionValid &&
-            rush.microPullbackRecovery >= 0.68
-        val gate4Diag = FilterDiagnostic(
-            filterType = FilterType.TICK_DIRECTIONAL_PURITY,
-            passed = gate4Passed,
-            actualValueFormatted = "Pur ${"%.0f".format(rush.purityPercent)}% • Cvx ${"%.2f".format(rush.tickConvexity)}x • Tail ${"%.2f".format(rush.tailRetentionRatio)}x",
-            thresholdFormatted = "≥${"%.0f".format(minPurityRequired)}% • Cvx≥0.65x • Tail≥0.60x",
-            reason = "Rejects decelerating/stalling tails (convexity < 0.65x or final step decay < 0.60x) and internal whipsaws",
-            gateTitle = "4. Purity, Tip & Non-Decelerating Convexity"
-        )
-
-        // Gate 5: Anti-Spike Dominance & Z-Score Climax Exhaustion Guard
-        val notSingleTickSpike = rush.singleTickDominancePercent <= 58.0
-        val notClimaxOverextended = rush.localZScore15 in 0.70..2.90 &&
-            !(rush.localZScore15 > 2.45 && rush.tickConvexity < 0.95)
-        val activelyAccelerating = rush.tickConvexity in 0.95..2.40 && rush.tailRetentionRatio >= 0.85
-        val notMicroExhausted = (micro.microExhaustion.finiteOr(0.0) <= 62.0 || activelyAccelerating) &&
-            micro.microHesitation.finiteOr(0.0) <= 58.0
-        val gate5Passed = notSingleTickSpike && notClimaxOverextended && notMicroExhausted
-        val gate5Diag = FilterDiagnostic(
-            filterType = FilterType.ANTI_SPIKE_DOMINANCE_GATE,
-            passed = gate5Passed,
-            actualValueFormatted = "Dom ${"%.0f".format(rush.singleTickDominancePercent)}% • Z15 ${"%.2f".format(rush.localZScore15)}σ • Exh ${"%.0f".format(micro.microExhaustion)}%",
-            thresholdFormatted = "Dom≤58% • Z15≤2.9σ • Exh≤62%",
-            reason = "Blocks isolated 1-tick liquidity spikes (>58% dominance) and overextended 15-tick Z-score climax reversals",
-            gateTitle = "5. Anti-Spike & Climax Exhaustion Guard"
-        )
-
-        // Gate 6: Order-Flow Imbalance (OFI) Agreement, Slope Ratio & S/R Clearance
-        val rawOfi = telemetry.orderFlowImbalance.finiteOr(0.0)
-        val medOfi = temporalSnapshot.rollingOfiMedian.finiteOr(0.0)
-        val ofiAligned = when (rush.rushDirection) {
-            SignalDirection.UP -> rawOfi >= -18.0 && medOfi >= -14.0
-            SignalDirection.DOWN -> rawOfi <= 18.0 && medOfi <= 14.0
-            SignalDirection.NONE -> false
-        }
-        val slopeVal = telemetry.slopeRatio.finiteOr(1.0)
-        val slopeAndSrPassed = (slopeVal < 3.10 || activelyAccelerating) && hvStatus.srObstaclePassed
-        val gate6Passed = ofiAligned && slopeAndSrPassed
-        val gate6Diag = FilterDiagnostic(
-            filterType = FilterType.TICK_SPEED_AND_FRESHNESS,
-            passed = gate6Passed,
-            actualValueFormatted = "OFI ${"%+.1f".format(rawOfi)}% • Slope ${"%.2f".format(slopeVal)}x",
-            thresholdFormatted = "OFI Aligned • Slope < 3.10x",
-            reason = "Rejects counter-order-flow divergence, parabolic blow-offs (slope ≥ 3.10x), and S/R obstacles",
-            gateTitle = "6. Order-Flow Imbalance & Slope Guard"
-        )
-
-        // Gate 7: Online FTRL-Proximal Meta-Labeler, Hysteresis & Walk-Forward Regime Guard
-        val adaptiveModelReady = shadowSamplesCount >= MIN_ADAPTIVE_LABELS
-        val learnedWinProbability = (rush.ftrlWinProbPercent / 100.0).finiteOr(0.5).coerceIn(0.01, 0.99)
-        val adaptiveModelPassed = !adaptiveModelReady || learnedWinProbability >= MIN_FTRL_WIN_PROBABILITY
-        val regimeDirectionWinRate = temporalEngine.recentRegimeDirectionWinRate(
-            temporalSnapshot.regimeType,
-            rawSignal
-        )
-        val regimeDirectionSampleCount = temporalEngine.recentRegimeDirectionSampleCount(
-            temporalSnapshot.regimeType,
-            rawSignal
-        )
-        val regimePerformancePassed = regimeDirectionSampleCount < MIN_REGIME_DIRECTION_LABELS ||
-            (regimeDirectionWinRate ?: 0.5) >= MIN_REGIME_DIRECTION_WIN_RATE
-        val fingerprintSampleCount = temporalEngine.recentFingerprintSampleCount(rush.shadowFingerprint)
-        val fingerprintWinRate = temporalEngine.recentFingerprintWinRate(rush.shadowFingerprint)
-        val fingerprintPerformancePassed = rush.shadowFingerprint == ShadowFingerprint.OTHER ||
-            fingerprintSampleCount < MIN_FINGERPRINT_LABELS ||
-            (fingerprintWinRate ?: 0.5) >= MIN_FINGERPRINT_WIN_RATE
-        val hystOrStrongSnr = temporalSnapshot.momentumHysteresisActive ||
-            temporalSnapshot.snrHysteresisActive ||
-            rush.rushSnr >= 1.35
-        val gate7Passed = adaptiveModelPassed &&
-            regimePerformancePassed &&
-            fingerprintPerformancePassed &&
-            hystOrStrongSnr &&
-            rush.ftrlWinProbPercent >= 49.5
-        val gate7Diag = FilterDiagnostic(
-            filterType = FilterType.FTRL_ML_META_LABEL_GATE,
-            passed = gate7Passed,
-            actualValueFormatted = "P(5s)=${"%.1f".format(rush.ftrlWinProbPercent)}% (${rush.shadowSamplesLearned} Lbl)",
-            thresholdFormatted = if (adaptiveModelReady) "≥53.0% Calibrated" else "≥50.0% Warmup",
-            reason = "Online FTRL-Proximal 5s continuation probability, Schmitt-trigger hysteresis, and walk-forward regime guard",
-            gateTitle = "7. Online FTRL-Proximal & Walk-Forward Gate"
-        )
-
-        val baseDiagnostics = listOf(
-            gate1Diag,
-            gate2Diag,
-            gate3Diag,
-            gate4Diag,
-            gate5Diag,
-            gate6Diag,
-            gate7Diag
-        )
-
-        val contextPassed = telemetry.contextBlockReasons.isEmpty()
-        val finalDiagnostics = if (!contextPassed) {
-            baseDiagnostics + FilterDiagnostic(
-                filterType = FilterType.ANTI_SPIKE_DOMINANCE_GATE,
-                passed = false,
-                actualValueFormatted = "${telemetry.contextBlockReasons.size} Block(s)",
-                thresholdFormatted = "0 Blocks",
-                reason = telemetry.contextBlockReasons.joinToString(" • "),
-                gateTitle = "Context & Structural Guard"
+        // 1. Tick Count & Structural Observation Integrity
+        if (ticks.size < 4) {
+            val record = Time5EvaluationRecord(
+                timestampMs = telemetry.latestTimeMs.takeIf { it > 0L } ?: nowMs,
+                assetIdentifier = telemetry.pair,
+                currentPrice = telemetry.latestPrice,
+                decision = "NO_TRADE",
+                rejectionReason = "Insufficient observations (${ticks.size}/4 ticks required)",
+                lifecycleEvent = "SIGNAL_REJECTED"
             )
+            evaluationRecords.addLast(record)
+            if (evaluationRecords.size > 256) evaluationRecords.removeFirst()
+
+            return StrategyEvaluation(
+                strategyId = strategy.id,
+                strategyName = HardLockedMandate.STRATEGY_NAME,
+                rawSignal = SignalDirection.NONE,
+                finalSignal = SignalDirection.NONE,
+                confidenceScore = 0.0,
+                minConfidenceRequired = HardLockedMandate.MIN_CONFIDENCE_REQUIRED,
+                triggerReason = "TIME-5 [NO TRADE]: Insufficient observations (${ticks.size}/4 ticks)",
+                filterDiagnostics = listOf(
+                    FilterDiagnostic(
+                        filterType = FilterType.TICK_SPEED_AND_FRESHNESS,
+                        passed = false,
+                        actualValueFormatted = "${ticks.size}/4 Ticks",
+                        thresholdFormatted = "≥ 4 Ticks",
+                        reason = "TIME-5 requires minimum 4 recent price observations for 3-interval displacement & velocity",
+                        gateTitle = "1. Price Observations"
+                    ),
+                    FilterDiagnostic(
+                        filterType = FilterType.FTRL_ML_META_LABEL_GATE,
+                        passed = telemetry.contextBlockReasons.isEmpty(),
+                        actualValueFormatted = if (telemetry.contextBlockReasons.isEmpty()) "CLEAN" else telemetry.contextBlockReasons.joinToString(", "),
+                        thresholdFormatted = "Zero Context Blocks",
+                        reason = if (telemetry.contextBlockReasons.isEmpty()) "Context block check passed" else "Blocked by context: ${telemetry.contextBlockReasons.joinToString(", ")}",
+                        gateTitle = "Context & Structural Guard"
+                    )
+                ),
+                contextBlockReasons = listOf("Insufficient ticks"),
+                regimeAdjustmentNote = "TIME-5 Balanced Momentum • Waiting for tick stream",
+                readyToExecute = false,
+                temporalTelemetry = temporalSnapshot,
+                time5Metrics = Time5Metrics(
+                    decision = SignalDirection.NONE,
+                    rejectionReason = "Insufficient observations"
+                )
+            )
+        }
+
+        val lastIdx = ticks.lastIndex
+        val t0 = ticks[lastIdx - 3]
+        val t1 = ticks[lastIdx - 2]
+        val t2 = ticks[lastIdx - 1]
+        val t3 = ticks[lastIdx]
+
+        val currentPrice = t3.price
+        val currentTickTimeMs = if (t3.timeMs > 0L) t3.timeMs else nowMs
+
+        // 2. Monotonic Timestamp & Stale Data Check
+        val isMonotonic = (t3.timeMs >= t2.timeMs) && (t2.timeMs >= t1.timeMs) && (t1.timeMs >= t0.timeMs)
+        val streamRef = if (telemetry.latestTimeMs > 0L) telemetry.latestTimeMs else currentTickTimeMs
+        val tickAgeMs = if (abs(nowMs - currentTickTimeMs) < 300_000L) {
+            (nowMs - currentTickTimeMs).coerceAtLeast(0L)
+        } else {
+            abs(streamRef - currentTickTimeMs).coerceAtLeast(0L)
+        }
+        val isFresh = isMonotonic && (tickAgeMs <= params.maxTickAgeMs) && (wsLatencyMs <= params.maxLatencyMs)
+        val isPriceValid = currentPrice > 0.0 && currentPrice.isFinite()
+
+        // 3. Mathematical Component A: Short-Term Price Displacement
+        // M = current_price - price_3_ticks_ago
+        val M = currentPrice - t0.price
+
+        // 4. Mathematical Component B: Short-Term Velocity
+        // V = (current_price - price_2_ticks_ago) / elapsed_seconds
+        val velocityDtMs = (currentTickTimeMs - t1.timeMs).coerceAtLeast(1L)
+        val velocityDtSec = max(0.001, velocityDtMs / 1000.0)
+        val V = (currentPrice - t1.price) / velocityDtSec
+
+        // 5. Mathematical Component C: Acceleration via Time-Aware Exponential Smoothing
+        // Tau = 800 ms; idempotent when evaluated repeatedly on the same tick timestamp
+        val smoothedVelocity: Double
+        val A: Double
+        if (hasVelocityHistory && currentTickTimeMs == lastVelocityTimestampMs) {
+            smoothedVelocity = lastSmoothedVelocity
+            A = lastComputedAcceleration
+        } else {
+            val stepDtMs = if (lastVelocityTimestampMs > 0L) (currentTickTimeMs - lastVelocityTimestampMs).coerceAtLeast(1L) else 250L
+            val stepDtSec = max(0.001, stepDtMs / 1000.0)
+            val tauSec = params.smoothingTauMs / 1000.0
+            val alpha = (1.0 - exp(-stepDtSec / tauSec)).coerceIn(0.01, 1.0)
+            smoothedVelocity = if (hasVelocityHistory) {
+                alpha * V + (1.0 - alpha) * lastSmoothedVelocity
+            } else {
+                V
+            }
+            A = if (hasVelocityHistory) (smoothedVelocity - lastSmoothedVelocity) else 0.0
+            lastSmoothedVelocity = smoothedVelocity
+            lastComputedAcceleration = A
+            lastVelocityTimestampMs = currentTickTimeMs
+            hasVelocityHistory = true
+        }
+
+        // 6. Mathematical Component D: Directional Efficiency
+        // DE = abs(net_displacement) / (sum(abs(individual_price_changes)) + epsilon)
+        val dp1 = t1.price - t0.price
+        val dp2 = t2.price - t1.price
+        val dp3 = t3.price - t2.price
+        val absDisplacement = abs(M)
+        val sumAbsSteps = abs(dp1) + abs(dp2) + abs(dp3)
+        val epsilon = 1e-9
+        val DE = (absDisplacement / (sumAbsSteps + epsilon)).coerceIn(0.0, 1.0)
+
+        // 7. Rolling Volatility Estimate & Normalized Signal Strength
+        // Compute average absolute tick change over available recent ticks (up to 25 ticks)
+        val recentSteps = ticks.takeLast(25).zipWithNext { a, b -> abs(b.price - a.price) }
+        val rollingVol = if (recentSteps.isNotEmpty()) {
+            recentSteps.average().coerceAtLeast(1e-7)
+        } else {
+            1e-7
+        }
+        val normalizedMomentum = absDisplacement / rollingVol
+
+        // 8. Opposing Impulse Detection on Latest Observation
+        // For UP (M > 0): latest step dp3 must not show a clear opposing impulse
+        val upOpposingImpulse = dp3 < 0 && (abs(dp3) > 0.40 * absDisplacement || abs(dp3) > 1.8 * rollingVol || (dp3 < 0 && dp2 < 0))
+        // For DOWN (M < 0): latest step dp3 must not show a clear opposing impulse
+        val downOpposingImpulse = dp3 > 0 && (abs(dp3) > 0.40 * absDisplacement || abs(dp3) > 1.8 * rollingVol || (dp3 > 0 && dp2 > 0))
+
+        // 9. Balanced Execution Evaluation
+        val maxStep = maxOf(abs(dp1), abs(dp2), abs(dp3))
+        val isSingleTickSpike = (sumAbsSteps > 0.0) && ((maxStep / (sumAbsSteps + 1e-9)) > 0.65) && (maxStep > 2.0 * rollingVol)
+        val tipDisplacement = abs(dp2) + abs(dp3)
+        val isExhaustedDyingTail = (abs(dp1) > 2.0 * rollingVol) && (tipDisplacement < 0.35 * abs(dp1))
+        val isAnomaly = isSingleTickSpike || isExhaustedDyingTail
+
+        val dePassed = DE >= params.minDirectionalEfficiency
+        val momentumPassed = normalizedMomentum >= params.minNormalizedMomentum
+        val contextPassed = telemetry.contextBlockReasons.isEmpty()
+        val feedPassed = isFresh && isPriceValid && !telemetry.assetLocked && telemetry.wsSynchronized && (telemetry.assetPayoutPercent >= minPayoutPercent) && (telemetry.hardStopReason == null) && contextPassed
+
+        val isUpValid = (M > 0.0) && (V > 0.0) && dePassed && momentumPassed && !upOpposingImpulse && feedPassed && !isAnomaly
+        val isDownValid = (M < 0.0) && (V < 0.0) && dePassed && momentumPassed && !downOpposingImpulse && feedPassed && !isAnomaly
+
+        val decision = when {
+            isUpValid -> SignalDirection.UP
+            isDownValid -> SignalDirection.DOWN
+            else -> SignalDirection.NONE
+        }
+
+        val opposingImpulse = if (M > 0.0) upOpposingImpulse else if (M < 0.0) downOpposingImpulse else false
+
+        val trendContradicts = (decision == SignalDirection.UP && telemetry.zFast > 0.0 && telemetry.zSlow > 0.0 && telemetry.zFast < telemetry.zSlow - 1e-4) ||
+            (decision == SignalDirection.DOWN && telemetry.zFast > 0.0 && telemetry.zSlow > 0.0 && telemetry.zFast > telemetry.zSlow + 1e-4)
+
+        val rejectionReason: String? = when {
+            telemetry.hardStopReason != null -> "Hard stop engaged: ${telemetry.hardStopReason}"
+            !contextPassed -> "Blocked by context: ${telemetry.contextBlockReasons.first()}"
+            !telemetry.wsSynchronized -> "WebSocket stream not synchronized / reconnecting"
+            isSingleTickSpike -> "Single-tick freak spike anomaly (single step > 65% of movement)"
+            isExhaustedDyingTail -> "Late impulse exhaustion (dying tail)"
+            !isPriceValid -> "Invalid price quote: $currentPrice"
+            !isMonotonic -> "Market data out of order (timestamps non-monotonic)"
+            !isFresh -> "Feed stale (Tick age: ${tickAgeMs}ms, RTT: ${wsLatencyMs}ms)"
+            telemetry.assetLocked -> "Asset locked / suspended"
+            telemetry.assetPayoutPercent < minPayoutPercent -> "Payout too low: ${telemetry.assetPayoutPercent}% < $minPayoutPercent%"
+            !momentumPassed -> "Momentum too weak relative to volatility (${"%.2f".format(normalizedMomentum)}σ < ${"%.2f".format(params.minNormalizedMomentum)}σ)"
+            !dePassed -> "Directional efficiency below threshold (${"%.2f".format(DE)} < ${"%.2f".format(params.minDirectionalEfficiency)})"
+            opposingImpulse -> "Clear opposing counter-impulse on latest observation"
+            M > 0.0 && V <= 0.0 -> "Velocity contradicts displacement (M>0, V<=0)"
+            M < 0.0 && V >= 0.0 -> "Velocity opposes displacement (M<0, V>=0)"
+            M == 0.0 -> "Zero price displacement (flat market)"
+            trendContradicts -> "Recent smoothed movement contradicts proposed direction"
+            else -> null
+        }
+
+        // 10. Confidence Score (Scaled from normalized momentum, directional efficiency, and acceleration bonus)
+        val baseConfidence = 50.0 +
+            min(35.0, (normalizedMomentum - params.minNormalizedMomentum).coerceAtLeast(0.0) * 15.0) +
+            min(15.0, (DE - params.minDirectionalEfficiency).coerceAtLeast(0.0) * 30.0)
+        val accelAligned = (decision == SignalDirection.UP && A > 0.0) || (decision == SignalDirection.DOWN && A < 0.0)
+        val accelBonus = if (accelAligned) 5.0 else 0.0
+        val effectiveConfidence = if (decision != SignalDirection.NONE) {
+            (baseConfidence + accelBonus).coerceIn(0.0, 100.0)
+        } else {
+            0.0
+        }
+
+        val readyToExecute = (decision != SignalDirection.NONE) && !trendContradicts && (effectiveConfidence >= HardLockedMandate.MIN_CONFIDENCE_REQUIRED)
+
+        // 11. TIME-5 Filter Diagnostics for Telemetry & Dashboard
+        val diag1 = FilterDiagnostic(
+            filterType = FilterType.TICK_RUSH_SNR_GATE,
+            passed = (decision == SignalDirection.UP && M > 0.0) || (decision == SignalDirection.DOWN && M < 0.0) || (decision == SignalDirection.NONE && absDisplacement > 0.0),
+            actualValueFormatted = "M = ${"%+.5f".format(M)}",
+            thresholdFormatted = if (M > 0.0) "> 0.0 (UP)" else if (M < 0.0) "< 0.0 (DOWN)" else "Non-zero",
+            reason = "A. Price Displacement over 3 ticks: M = current_price - price_3_ticks_ago",
+            gateTitle = "A. Displacement (M)"
+        )
+        val diag2 = FilterDiagnostic(
+            filterType = FilterType.TICK_SPEED_AND_FRESHNESS,
+            passed = (decision == SignalDirection.UP && V > 0.0) || (decision == SignalDirection.DOWN && V < 0.0),
+            actualValueFormatted = "V = ${"%+.4f".format(V)}/s",
+            thresholdFormatted = if (M > 0.0) "> 0.0" else if (M < 0.0) "< 0.0" else "Aligned",
+            reason = "B. Velocity over 2 ticks with actual timestamp Δt: V = (current_price - price_2_ticks_ago) / elapsed_seconds",
+            gateTitle = "B. Velocity (V)"
+        )
+        val diag3 = FilterDiagnostic(
+            filterType = FilterType.TICK_DIRECTIONAL_PURITY,
+            passed = dePassed,
+            actualValueFormatted = "DE = ${"%.2f".format(DE)}",
+            thresholdFormatted = "≥ ${"%.2f".format(params.minDirectionalEfficiency)}",
+            reason = "D. Directional Efficiency: DE = abs(net_displacement) / (sum(abs(individual_changes)) + ε)",
+            gateTitle = "D. Directional Efficiency (DE)"
+        )
+        val diag4 = FilterDiagnostic(
+            filterType = FilterType.ANTI_SPIKE_DOMINANCE_GATE,
+            passed = momentumPassed,
+            actualValueFormatted = "${"%.2f".format(normalizedMomentum)}σ (σ=${"%.5f".format(rollingVol)})",
+            thresholdFormatted = "≥ ${"%.2f".format(params.minNormalizedMomentum)}σ",
+            reason = "Volatility-Normalized Momentum: |M| / rolling_volatility across synthetic-asset scales",
+            gateTitle = "Strength (Normalized M)"
+        )
+        val diag5 = FilterDiagnostic(
+            filterType = FilterType.FTRL_ML_META_LABEL_GATE,
+            passed = !opposingImpulse,
+            actualValueFormatted = if (opposingImpulse) "OPPOSING IMPULSE" else "CLEAN PATH",
+            thresholdFormatted = "No Counter Impulse",
+            reason = "Verifies latest tick does not show a clear opposing counter-impulse",
+            gateTitle = "Opposing Impulse Guard"
+        )
+        val diag6 = FilterDiagnostic(
+            filterType = FilterType.TICK_SPEED_AND_FRESHNESS,
+            passed = feedPassed,
+            actualValueFormatted = "${wsLatencyMs}ms • ${tickAgeMs}ms • +${telemetry.assetPayoutPercent}%",
+            thresholdFormatted = "Fresh ≤450ms • ≥${minPayoutPercent}%",
+            reason = "Feed freshness, latency validation, asset lock guard, and minimum payout",
+            gateTitle = "Feed Freshness & Yield"
+        )
+        val contextDiag = FilterDiagnostic(
+            filterType = FilterType.FTRL_ML_META_LABEL_GATE,
+            passed = contextPassed && !trendContradicts,
+            actualValueFormatted = when {
+                !contextPassed -> telemetry.contextBlockReasons.joinToString(", ")
+                trendContradicts -> "Trend Conflict"
+                else -> "CLEAN"
+            },
+            thresholdFormatted = "Zero Context Blocks & Aligned",
+            reason = when {
+                !contextPassed -> "Blocked by context: ${telemetry.contextBlockReasons.joinToString(", ")}"
+                trendContradicts -> "Momentum opposes recent smoothed trend direction"
+                else -> "Structural context and smoothed trend aligned"
+            },
+            gateTitle = "Context & Structural Guard"
+        )
+
+        val baseDiagnostics = listOf(diag1, diag2, diag3, diag4, diag5, diag6)
+        val diagnostics = if (!contextPassed || trendContradicts) {
+            baseDiagnostics + contextDiag
         } else {
             baseDiagnostics
         }
 
-        val deterministicCorePassed = gate1Passed &&
-            gate2Passed &&
-            gate3Passed &&
-            gate4Passed &&
-            gate5Passed &&
-            gate6Passed &&
-            contextPassed &&
-            telemetry.hardStopReason == null
-
-        // Deterministic signal-quality score remains separate from the learned win probability.
-        val latencyDecelPenalty = if (wsLatencyMs > HIGH_WS_LATENCY_THRESHOLD_MS && rush.arrivalCompressionRatio > 1.05) {
-            4.0
+        val triggerReason = if (readyToExecute) {
+            "TIME-5 [${decision.name} 5s]: M=${"%+.4f".format(M)} • V=${"%+.3f".format(V)}/s • A=${"%+.3f".format(A)} • DE=${"%.2f".format(DE)} • Str=${"%.1f".format(normalizedMomentum)}σ"
         } else {
-            0.0
-        }
-        val rawSignalQuality = if (rawSignal != SignalDirection.NONE && deterministicCorePassed) {
-            (
-                46.0 +
-                    min(18.0, (rush.rushSnr - 1.0).coerceAtLeast(0.0) * 12.0) +
-                    min(15.0, (rush.purityPercent - 50.0).coerceAtLeast(0.0) * 0.35) +
-                    ((rush.tickConvexity - 0.65).coerceIn(0.0, 1.5) * 5.0) +
-                    ((rush.tickSpeedTps - 1.15).coerceAtLeast(0.0).coerceAtMost(2.0) * 2.0) +
-                    (if (rush.tipAligned) 8.0 else 0.0) +
-                    ((1.05 - rush.arrivalCompressionRatio).coerceIn(0.0, 0.5) * 4.0) -
-                    latencyDecelPenalty
-                ).finiteOr(0.0).coerceIn(0.0, 100.0)
-        } else {
-            0.0
+            "TIME-5 [NO TRADE]: ${rejectionReason ?: "Scanning for momentum impulse"}"
         }
 
-        val effectiveConfidence = if (adaptiveModelReady && rawSignalQuality > 0.0) {
-            (rawSignalQuality + ((learnedWinProbability - 0.5) * 20.0).coerceIn(-10.0, 8.0))
-                .finiteOr(0.0).coerceIn(0.0, 100.0)
-        } else {
-            rawSignalQuality
+        val metrics = Time5Metrics(
+            momentum = M,
+            velocity = V,
+            acceleration = A,
+            directionalEfficiency = DE,
+            rollingVolatility = rollingVol,
+            normalizedMomentum = normalizedMomentum,
+            smoothedVelocity = smoothedVelocity,
+            decision = decision,
+            rejectionReason = rejectionReason,
+            isFresh = isFresh,
+            isOpposingImpulse = opposingImpulse
+        )
+
+        val lifecycleEvent = when (decision) {
+            SignalDirection.UP -> "SIGNAL_UP"
+            SignalDirection.DOWN -> "SIGNAL_DOWN"
+            else -> "SIGNAL_REJECTED"
         }
 
-        val enoughTicks = telemetry.tickCount >= 8 || telemetry.recentTicks.size >= 8
-        val deterministicGatesPassed = enoughTicks &&
-            temporalSnapshot.snapshotSynchronized &&
-            rawSignal != SignalDirection.NONE &&
-            deterministicCorePassed &&
-            rawSignalQuality >= effectiveMinConfidence
+        val record = Time5EvaluationRecord(
+            timestampMs = currentTickTimeMs,
+            assetIdentifier = telemetry.pair,
+            currentPrice = currentPrice,
+            momentum = M,
+            velocity = V,
+            acceleration = A,
+            directionalEfficiency = DE,
+            normalizedSignalStrength = normalizedMomentum,
+            decision = if (decision != SignalDirection.NONE) decision.name else "NO_TRADE",
+            rejectionReason = rejectionReason,
+            executionAttempted = false,
+            platformConfirmed = false,
+            actualExecutionPrice = null,
+            expiryPrice = null,
+            realizedOutcome = null,
+            lifecycleEvent = lifecycleEvent
+        )
+        evaluationRecords.addLast(record)
+        while (evaluationRecords.size > 256) {
+            evaluationRecords.removeFirst()
+        }
 
-        if (deterministicGatesPassed) {
+        if (readyToExecute && rush.candidatePopulation == CandidatePopulation.POPULATION_B_STRUCTURAL_SNIPER_CANDIDATE) {
             deterministicGatePassCount++
             val latestTickMs = telemetry.recentTicks.lastOrNull()?.timeMs ?: telemetry.latestTimeMs
             val lastPending = pendingShadowRushes.lastOrNull()
@@ -677,48 +848,20 @@ class ModularStrategyEngine {
             }
         }
 
-        val allFiltersPassed = deterministicCorePassed && gate7Passed
-        val confidencePassed = effectiveConfidence >= effectiveMinConfidence && gate7Passed
-        val readyToExecute = enoughTicks &&
-            temporalSnapshot.snapshotSynchronized &&
-            rawSignal != SignalDirection.NONE &&
-            allFiltersPassed &&
-            confidencePassed
-
-        val smoothedDirLabel = zlemaTrendDir.name
-
-        val triggerReason = if (!contextPassed && rawSignal != SignalDirection.NONE) {
-            "BLOCKED [${rawSignal.name}]: ${telemetry.contextBlockReasons.first()}"
-        } else if (rawSignal != SignalDirection.NONE && deterministicCorePassed && !regimePerformancePassed) {
-            "Sniper M [5s ${rawSignal.name}] paused: recent ${temporalSnapshot.regimeType.name} ${rawSignal.name} hit rate=${"%.1f".format((regimeDirectionWinRate ?: 0.0) * 100.0)}% over $regimeDirectionSampleCount labels"
-        } else if (rawSignal != SignalDirection.NONE && deterministicCorePassed && !fingerprintPerformancePassed) {
-            "Sniper M [5s ${rawSignal.name}] paused: recent ${rush.shadowFingerprint.name} outcomes=$fingerprintSampleCount, hit rate=${"%.1f".format((fingerprintWinRate ?: 0.0) * 100.0)}%"
-        } else if (rawSignal != SignalDirection.NONE && deterministicCorePassed && adaptiveModelReady && !adaptiveModelPassed) {
-            "Sniper M [5s ${rawSignal.name}] blocked by FTRL learner: P(5s)=${"%.1f".format(learnedWinProbability * 100.0)}% < ${(MIN_FTRL_WIN_PROBABILITY * 100.0).toInt()}%"
-        } else if (readyToExecute) {
-            "Sniper M [SURGE ${rawSignal.name} 5s]: Smooth=$smoothedDirLabel • SNR=${"%.2f".format(rush.rushSnr)}x • Cvx=${"%.2f".format(rush.tickConvexity)}x • Dom=${"%.0f".format(rush.singleTickDominancePercent)}% • Purity=${"%.0f".format(rush.purityPercent)}%"
-        } else {
-            val firstBlockedGate = finalDiagnostics.firstOrNull { !it.passed }
-            val blockHint = firstBlockedGate?.let { "${it.gateTitle} (${it.actualValueFormatted})" } ?: "Scanning 5s Burst"
-            "Sniper M [5s] • $blockHint • Smooth=$smoothedDirLabel • SNR=${"%.2f".format(rush.rushSnr)}x"
-        }
-
-        val regimeNote =
-            "Sniper M Sole 5s Engine • 7-Gate Scientific False-Positive Filter • Smooth EMA ($smoothedDirLabel) • Purity ${"%.0f".format(rush.purityPercent)}% • SNR ${"%.2f".format(rush.rushSnr)}x • Convexity ${"%.2f".format(rush.tickConvexity)}x"
-
         return StrategyEvaluation(
-            strategyId = 1L,
+            strategyId = strategy.id,
             strategyName = HardLockedMandate.STRATEGY_NAME,
-            rawSignal = rawSignal,
-            finalSignal = if (readyToExecute) rawSignal else SignalDirection.NONE,
+            rawSignal = decision,
+            finalSignal = if (readyToExecute) decision else SignalDirection.NONE,
             confidenceScore = effectiveConfidence,
-            minConfidenceRequired = effectiveMinConfidence,
+            minConfidenceRequired = HardLockedMandate.MIN_CONFIDENCE_REQUIRED,
             triggerReason = triggerReason,
-            filterDiagnostics = finalDiagnostics,
-            contextBlockReasons = telemetry.contextBlockReasons,
-            regimeAdjustmentNote = regimeNote,
+            filterDiagnostics = diagnostics,
+            contextBlockReasons = if (rejectionReason != null && decision == SignalDirection.NONE) listOf(rejectionReason) else emptyList(),
+            regimeAdjustmentNote = "TIME-5 Balanced Execution • 4 Core Math Components (M, V, A, DE) • 600ms Cooldown • 5s Expiry",
             readyToExecute = readyToExecute,
-            temporalTelemetry = temporalSnapshot
+            temporalTelemetry = temporalSnapshot,
+            time5Metrics = metrics
         )
     }
 
@@ -755,7 +898,7 @@ class ModularStrategyEngine {
                     noiseCount++
                 }
             }
-            if (noiseCount == 0) {
+            val actualNoiseRange = if (noiseCount == 0) {
                 for (i in 1..lastIdx) {
                     val step = abs(ticks[i].price - ticks[i - 1].price)
                     if (step.isFinite() && step > 0.0) {
@@ -763,13 +906,16 @@ class ModularStrategyEngine {
                         noiseCount++
                     }
                 }
+                1..lastIdx
+            } else {
+                noiseStartIdx..noiseEndIdx
             }
             val prelimNoiseMean = if (noiseCount > 0) rawNoiseSum / noiseCount.toDouble() else 0.0
             val winsorCap = (prelimNoiseMean * 2.2).coerceAtLeast(1e-7)
             var winsorSum = 0.0
             var winsorCount = 0
             if (prelimNoiseMean > 0.0) {
-                for (i in noiseStartIdx..noiseEndIdx) {
+                for (i in actualNoiseRange) {
                     val step = abs(ticks[i].price - ticks[i - 1].price)
                     if (step.isFinite() && step > 0.0) {
                         winsorSum += min(step, winsorCap)
@@ -789,6 +935,8 @@ class ModularStrategyEngine {
             val netDelta4 = (ticks[lastIdx].price - ticks[lastIdx - k].price).finiteOr(0.0)
             val k3 = min(3, lastIdx)
             val netDelta3 = (ticks[lastIdx].price - ticks[lastIdx - k3].price).finiteOr(0.0)
+            val k2 = min(2, lastIdx)
+            val netDelta2 = (ticks[lastIdx].price - ticks[lastIdx - k2].price).finiteOr(0.0)
 
             var pathLen4 = 0.0
             var maxSingleStep4 = 0.0
@@ -829,10 +977,13 @@ class ModularStrategyEngine {
                 0.0
             }
 
-            // 3. Feature 1: RushSNR_4 (blended 4-tick and 3-tick surge SNR)
+            // 3. Feature 1: Multi-Scale RushSNR (harmonized 4-tick, 3-tick, and early 2-tick impulse SNR)
             val snr4 = abs(netDelta4) / (avgNoiseStep * sqrt(k.toDouble()))
             val snr3 = abs(netDelta3) / (avgNoiseStep * sqrt(k3.toDouble()))
-            val rushSnr = maxOf(snr4, snr3 * 0.96).finiteOr(0.0)
+            val snr2 = abs(netDelta2) / (avgNoiseStep * sqrt(k2.toDouble()))
+            val earlyStepAligned = (candidateDir == SignalDirection.UP && netDelta2 > 0.0 && netDelta3 > 0.0) ||
+                (candidateDir == SignalDirection.DOWN && netDelta2 < 0.0 && netDelta3 < 0.0)
+            val rushSnr = maxOf(snr4, snr3, if (earlyStepAligned) snr2 else 0.0).finiteOr(0.0)
 
             // 4. Feature 2: TickConvexity ((|d_t| + |d_{t-1}|) / (|d_{t-2}| + |d_{t-3}|))
             val signedD0 = ticks[lastIdx].price - ticks[lastIdx - 1].price
@@ -930,7 +1081,7 @@ class ModularStrategyEngine {
                 smoothedTipAligned &&
                 noInternalWhipsaw &&
                 lastStepRatio >= 0.72 &&
-                tailRetentionRatio >= 0.60 &&
+                (tailRetentionRatio >= 0.60 || lastStepRatio >= 1.05) &&
                 (prevStepAligned || sameDirStepsIn4 >= 3)
 
             // Tick arrival speed over the 4-tick rush window (guard against 0ms burst timestamps)
@@ -938,9 +1089,9 @@ class ModularStrategyEngine {
             val windowTps = (k * 1000.0) / dtMs.toDouble()
             val tickSpeedTps = maxOf(windowTps.coerceAtMost(25.0), telemetry.velocity.finiteOr(0.0))
 
-            // Micro-noise breakout beyond the preceding 8-tick oscillation center (zero-allocation index loop)
-            val priorStart = max(0, ticks.size - 10)
-            val priorEndExclusive = max(priorStart + 1, ticks.size - min(2, ticks.size - 1))
+            // Micro-noise breakout beyond the preceding pre-surge oscillation center (zero-allocation index loop)
+            val priorStart = max(0, ticks.size - 14)
+            val priorEndExclusive = max(priorStart + 1, lastIdx - 3)
             var priorSum = 0.0
             var priorCount = 0
             for (i in priorStart until priorEndExclusive) {
@@ -953,8 +1104,8 @@ class ModularStrategyEngine {
                 ticks[lastIdx - k].price
             }
             val clearedNoiseMean = when (candidateDir) {
-                SignalDirection.UP -> latestTick.price >= localMean + avgNoiseStep * 0.65
-                SignalDirection.DOWN -> latestTick.price <= localMean - avgNoiseStep * 0.65
+                SignalDirection.UP -> latestTick.price >= localMean + avgNoiseStep * 0.50
+                SignalDirection.DOWN -> latestTick.price <= localMean - avgNoiseStep * 0.50
                 SignalDirection.NONE -> false
             }
 
@@ -990,7 +1141,7 @@ class ModularStrategyEngine {
                 tipAligned &&
                 clearedNoiseMean &&
                 tickConvexity in 0.65..3.20 &&
-                tailRetentionRatio >= 0.60 &&
+                (tailRetentionRatio >= 0.60 || lastStepRatio >= 1.05) &&
                 tickSpeedTps >= 1.15 &&
                 singleTickDominancePercent <= 58.0 &&
                 localZScore15 in 0.70..2.90 &&
@@ -1157,6 +1308,8 @@ class ModularStrategyEngine {
             resolvedZFast < resolvedZSlow - 1e-10 -> SignalDirection.DOWN
             telemetry.trend == SignalDirection.UP -> SignalDirection.UP
             telemetry.trend == SignalDirection.DOWN -> SignalDirection.DOWN
+            telemetry.highVoltageStatus.zlemaTrend == SignalDirection.UP -> SignalDirection.UP
+            telemetry.highVoltageStatus.zlemaTrend == SignalDirection.DOWN -> SignalDirection.DOWN
             else -> fallbackDir
         }
     }
@@ -1189,7 +1342,7 @@ class ModularStrategyEngine {
         val f4 = ((0.55 - singleTickDominance) / 0.22).finiteOr(0.0).coerceIn(-2.5, 1.8)
         val f5 = ((microPullbackRecovery - 0.55) / 0.35).finiteOr(0.0).coerceIn(-1.5, 1.8)
         val f6 = if (localZScore15 <= 2.85) {
-            ((localZScore15 - 1.05) / 1.0).finiteOr(0.0).coerceIn(-1.5, 1.8)
+            ((localZScore15 - 0.85) / 1.0).finiteOr(0.0).coerceIn(-1.5, 1.8)
         } else {
             -((localZScore15 - 2.85) * 1.4).finiteOr(0.0).coerceIn(0.0, 2.5)
         }

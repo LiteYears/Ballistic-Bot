@@ -689,17 +689,18 @@ fun TradeJournalScreen(
 
     val stats by remember(trades) {
         derivedStateOf {
-            val resolved = trades.filter { it.outcome == "WIN" || it.outcome == "LOSS" }
-            val wins = resolved.count { it.outcome == "WIN" }
-            val losses = resolved.count { it.outcome == "LOSS" }
-            val winRate = if (resolved.isNotEmpty()) (wins.toDouble() / resolved.size * 100.0) else 0.0
-            val netPnl = trades.sumOf { it.profitLoss.finiteOr(0.0) }
-            val grossWin = trades.filter { it.profitLoss > 0 }.sumOf { it.profitLoss.finiteOr(0.0) }
-            val grossLoss = abs(trades.filter { it.profitLoss < 0 }.sumOf { it.profitLoss.finiteOr(0.0) })
+            val decisive = trades.filter { it.outcome == "WIN" || it.outcome == "LOSS" }
+            val settled = trades.filter { it.outcome == "WIN" || it.outcome == "LOSS" || it.outcome == "TIE" }
+            val wins = decisive.count { it.outcome == "WIN" }
+            val losses = decisive.count { it.outcome == "LOSS" }
+            val winRate = if (decisive.isNotEmpty()) (wins.toDouble() / decisive.size * 100.0) else 0.0
+            val netPnl = settled.sumOf { it.profitLoss.finiteOr(0.0) }
+            val grossWin = settled.filter { it.profitLoss > 0 }.sumOf { it.profitLoss.finiteOr(0.0) }
+            val grossLoss = abs(settled.filter { it.profitLoss < 0 }.sumOf { it.profitLoss.finiteOr(0.0) })
             val profitFactor = if (grossLoss > 0) grossWin / grossLoss else if (grossWin > 0) 9.99 else 0.0
-            val expectedValue = if (resolved.isNotEmpty()) netPnl / resolved.size else 0.0
+            val expectedValue = if (settled.isNotEmpty()) netPnl / settled.size else 0.0
 
-            val chronological = resolved.asReversed()
+            val chronological = settled.sortedBy { it.timestampMs }
             val curve = ArrayList<Double>(chronological.size + 1)
             var running = 0.0
             curve.add(0.0)

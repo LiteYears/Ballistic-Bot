@@ -302,9 +302,9 @@ class QuantPipelineUnitTest {
     @Test
     fun `test Scientific 7-Gate Sniper M false-positive rejection pipeline and sole strategy lock`() {
         val lockedStrategy = HardLockedMandate.lockedStrategyConfig()
-        assertEquals("Sniper M", lockedStrategy.name)
+        assertEquals(HardLockedMandate.STRATEGY_NAME, lockedStrategy.name)
         assertEquals(5, lockedStrategy.durationSeconds)
-        assertEquals("NATIVE_SNIPER_M_5S", lockedStrategy.scriptCode)
+        assertEquals("TIME_5_BALANCED", lockedStrategy.scriptCode)
 
         val baseTs = 1700000000000L
         val noiseTicks = (0 until 14).map { i ->
@@ -314,7 +314,7 @@ class QuantPipelineUnitTest {
         val lastNoisePrice = noiseTicks.last().price
         val lastNoiseTime = noiseTicks.last().timeMs
 
-        // 1. Clean, non-decelerating 4-tick surge passes all 7 scientific gates
+        // 1. Clean, accelerating 4-tick surge passes TIME-5 balanced execution gates
         val cleanRushTicks = noiseTicks + listOf(0.38, 0.80, 1.25, 1.74).mapIndexed { idx, cum ->
             Tick(pair = "LATAM_X", price = lastNoisePrice + cum, timeMs = lastNoiseTime + (idx + 1) * 130L)
         }
@@ -337,39 +337,47 @@ class QuantPipelineUnitTest {
             telemetry = cleanTelemetry,
             wsLatencyMs = 45L
         )
-        assertEquals("Sniper M", cleanEval.strategyName)
-        assertEquals(7, cleanEval.filterDiagnostics.size)
-        assertTrue("Clean accelerating surge must pass all 7 scientific gates: ${cleanEval.triggerReason}", cleanEval.readyToExecute)
+        assertEquals(HardLockedMandate.STRATEGY_NAME, cleanEval.strategyName)
+        assertEquals(6, cleanEval.filterDiagnostics.size)
+        assertTrue("Clean accelerating surge must pass TIME-5 balanced execution: ${cleanEval.triggerReason}", cleanEval.readyToExecute)
 
-        // 2. Decelerating / Dying Tail Trap (strong early steps +0.75, +0.65, then dying +0.18, +0.06 -> convexity < 0.65 & tailRetention < 0.60)
-        val dyingTailTicks = noiseTicks + listOf(0.75, 1.40, 1.58, 1.64).mapIndexed { idx, cum ->
+        // 2. Opposing Counter-Impulse Trap (impulse reversed on latest tick -> rejected by Opposing Impulse Guard)
+        val opposingCounterTicks = noiseTicks + listOf(0.40, 0.90, 1.50, 0.70).mapIndexed { idx, cum ->
             Tick(pair = "LATAM_X", price = lastNoisePrice + cum, timeMs = lastNoiseTime + (idx + 1) * 130L)
         }
-        val dyingTailEval = ModularStrategyEngine().evaluateStrategy(
+        val opposingEval = ModularStrategyEngine().evaluateStrategy(
             strategy = lockedStrategy,
             telemetry = cleanTelemetry.copy(
-                latestPrice = dyingTailTicks.last().price,
-                latestTimeMs = dyingTailTicks.last().timeMs,
-                tickCount = dyingTailTicks.size,
-                recentTicks = dyingTailTicks
+                latestPrice = opposingCounterTicks.last().price,
+                latestTimeMs = opposingCounterTicks.last().timeMs,
+                tickCount = opposingCounterTicks.size,
+                recentTicks = opposingCounterTicks
             ),
             wsLatencyMs = 45L
         )
-        assertFalse("Decelerating dying-tail burst must be rejected as a false positive", dyingTailEval.readyToExecute)
+        assertFalse("Opposing counter-impulse on latest observation must be rejected", opposingEval.readyToExecute)
 
-        // 3. Counter-Order-Flow Imbalance Divergence Trap (UP price surge while heavy sell OFI = -35.0)
-        val counterOfiEval = ModularStrategyEngine().evaluateStrategy(
+        // 3. Low Directional Efficiency / Choppy Oscillation Trap (whipsawing steps with DE < 0.45)
+        val choppyTicks = noiseTicks + listOf(0.40, -0.30, 0.35, -0.25).mapIndexed { idx, cum ->
+            Tick(pair = "LATAM_X", price = lastNoisePrice + cum, timeMs = lastNoiseTime + (idx + 1) * 130L)
+        }
+        val choppyEval = ModularStrategyEngine().evaluateStrategy(
             strategy = lockedStrategy,
-            telemetry = cleanTelemetry.copy(orderFlowImbalance = -35.0),
+            telemetry = cleanTelemetry.copy(
+                latestPrice = choppyTicks.last().price,
+                latestTimeMs = choppyTicks.last().timeMs,
+                tickCount = choppyTicks.size,
+                recentTicks = choppyTicks
+            ),
             wsLatencyMs = 45L
         )
-        assertFalse("UP surge against strong negative OFI (-35.0) must be rejected by Gate 6", counterOfiEval.readyToExecute)
+        assertFalse("Choppy oscillation with DE < 0.45 must be rejected by TIME-5", choppyEval.readyToExecute)
     }
 
     @Test
     fun `test X13 Temporal Intelligence Engine rolling windows hysteresis N-of-M persistence and 3-layer architecture`() {
         val x13Strategy = HardLockedMandate.lockedStrategyConfig()
-        assertEquals("Sniper M", x13Strategy.name)
+        assertEquals(HardLockedMandate.STRATEGY_NAME, x13Strategy.name)
         assertEquals(5, x13Strategy.durationSeconds)
 
 
@@ -552,9 +560,9 @@ class QuantPipelineUnitTest {
     fun `test Sniper M five-second lock, strict mathematical filters, HV Window states, and chop and whipsaw guards`() {
         // 1. Sniper M has one immutable five-second execution horizon.
         val lockedConfig = HardLockedMandate.lockedStrategyConfig()
-        assertEquals("Sniper M", lockedConfig.name)
+        assertEquals(HardLockedMandate.STRATEGY_NAME, lockedConfig.name)
         assertEquals(5, lockedConfig.durationSeconds)
-        assertEquals("NATIVE_SNIPER_M_5S", lockedConfig.scriptCode)
+        assertEquals("TIME_5_BALANCED", lockedConfig.scriptCode)
 
         // 2. Verify Clean Breakout Momentum -> HV Window EXCELLENT (>=75%) and all 6 HighVoltage filters PASS
         val candleEngine = CandleEngine()
@@ -977,7 +985,7 @@ class QuantPipelineUnitTest {
     fun `test Sniper M analyzes tick stream smooths trajectory follows momentum and rides UP and DOWN surges with zero filter blocks`() {
         val strategyEngine = ModularStrategyEngine()
         val sniperStrategy = HardLockedMandate.lockedStrategyConfig()
-        assertEquals("Sniper M", sniperStrategy.name)
+        assertEquals(HardLockedMandate.STRATEGY_NAME, sniperStrategy.name)
 
         val contextEnhancer = com.olympquant.terminal.engine.ContextEnhancer()
         val candleEngine = CandleEngine()
@@ -1205,28 +1213,28 @@ class QuantPipelineUnitTest {
             assertTrue("Second deal #9002 in same Event 21 array must be settled", wireLogs.contains("ORDER SETTLED #9002: WIN"))
         }
 
-        // 5. Verify Sniper M v8.0 rejects collapsing/dying surge tails (tick_convexity < 0.55)
-        val dyingSurgePrices = listOf(
+        // 5. Verify TIME-5 rejects opposing counter-impulses on latest observation
+        val counterSurgePrices = listOf(
             4500.00, 4500.06, 4499.96, 4500.04, 4499.98, 4500.05,
             4500.85, 4501.65, // Big early steps (+0.80, +0.80)
-            4501.79, 4501.91  // Dying tail steps (+0.14, +0.12 -> convexity = 0.26 / 1.60 = 0.16 < 0.55)
+            4501.90, 4501.20  // Counter impulse drop on latest tick (-0.70)
         )
-        val dyingTicks = dyingSurgePrices.mapIndexed { idx, p ->
+        val counterTicks = counterSurgePrices.mapIndexed { idx, p ->
             Tick(pair = "LATAM_X", price = p, timeMs = baseTimeMs + idx * 140L)
         }
-        val dyingEval = ModularStrategyEngine().evaluateStrategy(
+        val counterEval = ModularStrategyEngine().evaluateStrategy(
             strategy = HardLockedMandate.lockedStrategyConfig(),
             telemetry = MarketTelemetryState(
                 pair = "LATAM_X",
-                latestPrice = dyingTicks.last().price,
-                latestTimeMs = dyingTicks.last().timeMs,
-                tickCount = dyingTicks.size,
-                recentTicks = dyingTicks,
+                latestPrice = counterTicks.last().price,
+                latestTimeMs = counterTicks.last().timeMs,
+                tickCount = counterTicks.size,
+                recentTicks = counterTicks,
                 wsSynchronized = true
             ),
             wsLatencyMs = 25L
         )
-        assertFalse("Collapsing/dying surge tail (tick_convexity < 0.55) must not execute", dyingEval.readyToExecute)
+        assertFalse("Opposing counter-impulse on latest observation must not execute", counterEval.readyToExecute)
     }
 
     @Test
@@ -1966,10 +1974,352 @@ class QuantPipelineUnitTest {
         assertEquals(1, engine.learnedSampleCount())
         assertEquals(weightBeforeSwitch, engine.getFtrlWeight(0), 1e-12)
     }
+
+    @Test
+    fun `test Sniper M early surge entry, improved multi-scale SNR, FRTL responsiveness, and robust ride execution`() {
+        val engine = ModularStrategyEngine()
+        val indicatorEngine = IndicatorEngine()
+        val strategy = HardLockedMandate.lockedStrategyConfig()
+
+        // 1. Build a realistic 16-tick stream: 12 consolidation ticks + 4-tick explosive upward surge
+        val ticks = mutableListOf<Tick>()
+        val startTs = 1_700_000_000_000L
+        var p = 100.00
+        for (i in 0 until 12) {
+            val step = if (i % 2 == 0) +0.015 else -0.015
+            p += step
+            ticks.add(Tick("LATAM_X", p, startTs + i * 200L))
+        }
+        val preSurgePrice = p
+
+        // Burst begins: 4 explosive ticks with high speed (100ms dt), clear displacement above noise
+        val surgeSteps = listOf(+0.08, +0.09, +0.11, +0.12)
+        for (idx in surgeSteps.indices) {
+            p += surgeSteps[idx]
+            ticks.add(Tick("LATAM_X", p, startTs + (12 + idx) * 200L + idx * 100L))
+        }
+
+        // 2. Compute indicators and verify Fast Response Trend Line (FRTL) tracks the surge
+        val ind = indicatorEngine.computeIndicators(
+            ticks = ticks,
+            candles = listOf(Candle(startTs / 1000L, preSurgePrice, p, preSurgePrice - 0.02, p, 10)),
+            swings = emptyList(),
+            psychLevels = listOf(100.0, 100.5),
+            nearestSupport = null,
+            nearestResistance = null
+        )
+
+        val telemetry = MarketTelemetryState(
+            pair = "LATAM_X",
+            latestPrice = ticks.last().price,
+            latestTimeMs = ticks.last().timeMs,
+            tickCount = ticks.size,
+            recentTicks = ticks,
+            zFast = ind.zFast,
+            zSlow = ind.zSlow,
+            trend = ind.trend,
+            netDelta5 = ind.netDelta5,
+            volatility = ind.volatility,
+            velocity = ind.velocity,
+            slopeRatio = ind.slopeRatio,
+            microstructure = ind.microstructure,
+            hvWindow = ind.hvWindow,
+            highVoltageStatus = ind.highVoltageStatus,
+            wsSynchronized = true,
+            assetPayoutPercent = 88,
+            contextBlockReasons = emptyList()
+        )
+
+        // 3. Extract metrics and verify multi-scale SNR detects early impulse without artificial delay
+        val metrics = engine.extractRawTickRushMetrics(telemetry, mutateState = true)
+        assertEquals(SignalDirection.UP, metrics.rushDirection)
+        assertTrue("Multi-scale SNR must exceed 1.40x on surge onset: ${metrics.rushSnr}", metrics.rushSnr >= 1.40)
+        assertTrue("Surge must clear pre-surge noise mean", metrics.clearedNoiseMean)
+        assertTrue("Convexity must remain non-decelerating: ${metrics.tickConvexity}", metrics.tickConvexity in 0.65..3.20)
+        assertTrue("Tip must be aligned with surge momentum", metrics.tipAligned)
+        assertEquals(
+            "Early surge must qualify for Population B (structural Sniper M candidates)",
+            ModularStrategyEngine.CandidatePopulation.POPULATION_B_STRUCTURAL_SNIPER_CANDIDATE,
+            metrics.candidatePopulation
+        )
+
+        // 4. Verify evaluation passes all gates and enters early to ride the surge
+        val eval = engine.evaluateStrategy(
+            strategy = strategy,
+            telemetry = telemetry,
+            wsLatencyMs = 25L,
+            minPayoutPercent = 80
+        )
+        assertTrue(
+            "TIME-5 must enter early in the surge to ride continuation: ${eval.triggerReason}",
+            eval.readyToExecute
+        )
+        assertEquals(SignalDirection.UP, eval.finalSignal)
+        assertTrue("Confidence score must reflect strong surge execution: ${eval.confidenceScore}", eval.confidenceScore >= 60.0)
+    }
+
+    @Test
+    fun `test TIME-5 Balanced Momentum four mathematical components, execution rules, and lifecycle logging`() {
+        val engine = ModularStrategyEngine()
+        val strategy = HardLockedMandate.lockedStrategyConfig()
+        assertEquals("TIME-5", strategy.name)
+        assertEquals(5, strategy.durationSeconds)
+        assertEquals(600L, strategy.cooldownMs)
+
+        val baseTs = 1700000000000L
+
+        // A. Insufficient Observations (< 4 ticks) -> NO TRADE
+        val threeTicks = listOf(
+            Tick("LATAM_X", 100.0, baseTs),
+            Tick("LATAM_X", 100.1, baseTs + 200L),
+            Tick("LATAM_X", 100.2, baseTs + 400L)
+        )
+        val shortEval = engine.evaluateStrategy(
+            strategy = strategy,
+            telemetry = MarketTelemetryState(
+                pair = "LATAM_X",
+                latestPrice = 100.2,
+                latestTimeMs = baseTs + 400L,
+                tickCount = 3,
+                recentTicks = threeTicks,
+                assetPayoutPercent = 85
+            ),
+            wsLatencyMs = 35L
+        )
+        assertEquals(SignalDirection.NONE, shortEval.finalSignal)
+        assertFalse(shortEval.readyToExecute)
+        assertEquals("SIGNAL_REJECTED", engine.getLatestEvaluationRecord()?.lifecycleEvent)
+
+        // B. Component A & B: Positive Displacement (M > 0) & Velocity (V > 0) with DE >= 0.45 and S >= 1.0 -> UP Signal
+        val baselineTicks = (0 until 12).map { i ->
+            val p = 100.0 + if (i % 2 == 0) 0.05 else -0.05
+            Tick("LATAM_X", p, baseTs + i * 200L)
+        }
+        val lastTs = baselineTicks.last().timeMs
+        val lastP = baselineTicks.last().price
+        val upImpulseTicks = baselineTicks + listOf(
+            Tick("LATAM_X", lastP + 0.15, lastTs + 150L),
+            Tick("LATAM_X", lastP + 0.35, lastTs + 300L),
+            Tick("LATAM_X", lastP + 0.60, lastTs + 450L),
+            Tick("LATAM_X", lastP + 0.90, lastTs + 600L)
+        )
+        val upEval = engine.evaluateStrategy(
+            strategy = strategy,
+            telemetry = MarketTelemetryState(
+                pair = "LATAM_X",
+                latestPrice = upImpulseTicks.last().price,
+                latestTimeMs = upImpulseTicks.last().timeMs,
+                tickCount = upImpulseTicks.size,
+                recentTicks = upImpulseTicks,
+                assetPayoutPercent = 85
+            ),
+            wsLatencyMs = 35L
+        )
+        assertEquals(SignalDirection.UP, upEval.finalSignal)
+        assertTrue(upEval.readyToExecute)
+        val mUp = upEval.time5Metrics
+        assertTrue("Displacement M must be positive: ${mUp.momentum}", mUp.momentum > 0.0)
+        assertTrue("Velocity V must be positive: ${mUp.velocity}", mUp.velocity > 0.0)
+        assertTrue("Directional efficiency DE must be >= 0.45: ${mUp.directionalEfficiency}", mUp.directionalEfficiency >= 0.45)
+        assertTrue("Normalized momentum must be >= 1.0σ: ${mUp.normalizedMomentum}", mUp.normalizedMomentum >= 1.0)
+        assertFalse("No opposing impulse on up surge", mUp.isOpposingImpulse)
+        assertEquals("SIGNAL_UP", engine.getLatestEvaluationRecord()?.lifecycleEvent)
+
+        // C. Lifecycle Transitions: EXECUTION_ATTEMPT -> EXECUTION_CONFIRMED -> TRADE_RESULT
+        engine.recordExecutionAttempt(upImpulseTicks.last().timeMs, "LATAM_X", upImpulseTicks.last().price, SignalDirection.UP)
+        assertEquals("EXECUTION_ATTEMPT", engine.getLatestEvaluationRecord()?.lifecycleEvent)
+        assertTrue(engine.getLatestEvaluationRecord()?.executionAttempted == true)
+
+        engine.recordExecutionConfirmed(9999L, upImpulseTicks.last().price)
+        assertEquals("EXECUTION_CONFIRMED", engine.getLatestEvaluationRecord()?.lifecycleEvent)
+        assertTrue(engine.getLatestEvaluationRecord()?.platformConfirmed == true)
+
+        engine.recordTradeSettled(9999L, upImpulseTicks.last().price + 0.50, "WIN")
+        assertEquals("TRADE_RESULT", engine.getLatestEvaluationRecord()?.lifecycleEvent)
+        assertEquals("WIN", engine.getLatestEvaluationRecord()?.realizedOutcome)
+
+        // D. Component A & B: Negative Displacement (M < 0) & Velocity (V < 0) -> DOWN Signal
+        val downImpulseTicks = baselineTicks + listOf(
+            Tick("LATAM_X", lastP - 0.15, lastTs + 150L),
+            Tick("LATAM_X", lastP - 0.35, lastTs + 300L),
+            Tick("LATAM_X", lastP - 0.60, lastTs + 450L),
+            Tick("LATAM_X", lastP - 0.90, lastTs + 600L)
+        )
+        val downEval = engine.evaluateStrategy(
+            strategy = strategy,
+            telemetry = MarketTelemetryState(
+                pair = "LATAM_X",
+                latestPrice = downImpulseTicks.last().price,
+                latestTimeMs = downImpulseTicks.last().timeMs,
+                tickCount = downImpulseTicks.size,
+                recentTicks = downImpulseTicks,
+                assetPayoutPercent = 85
+            ),
+            wsLatencyMs = 35L
+        )
+        assertEquals(SignalDirection.DOWN, downEval.finalSignal)
+        assertTrue(downEval.readyToExecute)
+        val mDown = downEval.time5Metrics
+        assertTrue("Displacement M must be negative: ${mDown.momentum}", mDown.momentum < 0.0)
+        assertTrue("Velocity V must be negative: ${mDown.velocity}", mDown.velocity < 0.0)
+        assertEquals("SIGNAL_DOWN", engine.getLatestEvaluationRecord()?.lifecycleEvent)
+
+        // E. Rejection: Opposing Impulse on latest observation
+        val counterTipTicks = baselineTicks + listOf(
+            Tick("LATAM_X", lastP + 0.25, lastTs + 150L),
+            Tick("LATAM_X", lastP + 0.60, lastTs + 300L),
+            Tick("LATAM_X", lastP + 0.95, lastTs + 450L),
+            Tick("LATAM_X", lastP + 0.30, lastTs + 600L) // sharp drop on latest tick
+        )
+        val counterEval = engine.evaluateStrategy(
+            strategy = strategy,
+            telemetry = MarketTelemetryState(
+                pair = "LATAM_X",
+                latestPrice = counterTipTicks.last().price,
+                latestTimeMs = counterTipTicks.last().timeMs,
+                tickCount = counterTipTicks.size,
+                recentTicks = counterTipTicks,
+                assetPayoutPercent = 85
+            ),
+            wsLatencyMs = 35L
+        )
+        assertEquals(SignalDirection.NONE, counterEval.finalSignal)
+        assertFalse(counterEval.readyToExecute)
+
+        // F. Rejection: Weak Momentum relative to Volatility (S < 1.0σ)
+        val weakTicks = baselineTicks + listOf(
+            Tick("LATAM_X", lastP + 0.01, lastTs + 150L),
+            Tick("LATAM_X", lastP + 0.02, lastTs + 300L),
+            Tick("LATAM_X", lastP + 0.03, lastTs + 450L),
+            Tick("LATAM_X", lastP + 0.04, lastTs + 600L)
+        )
+        val weakEval = engine.evaluateStrategy(
+            strategy = strategy,
+            telemetry = MarketTelemetryState(
+                pair = "LATAM_X",
+                latestPrice = weakTicks.last().price,
+                latestTimeMs = weakTicks.last().timeMs,
+                tickCount = weakTicks.size,
+                recentTicks = weakTicks,
+                assetPayoutPercent = 85
+            ),
+            wsLatencyMs = 35L
+        )
+        assertEquals(SignalDirection.NONE, weakEval.finalSignal)
+        assertFalse(weakEval.readyToExecute)
+
+        // G. Rejection: Stale feed / High Latency
+        val staleEval = engine.evaluateStrategy(
+            strategy = strategy,
+            telemetry = MarketTelemetryState(
+                pair = "LATAM_X",
+                latestPrice = upImpulseTicks.last().price,
+                latestTimeMs = upImpulseTicks.last().timeMs,
+                tickCount = upImpulseTicks.size,
+                recentTicks = upImpulseTicks,
+                assetPayoutPercent = 85
+            ),
+            wsLatencyMs = 500L // exceeds 450ms
+        )
+        assertEquals(SignalDirection.NONE, staleEval.finalSignal)
+        assertFalse(staleEval.readyToExecute)
+    }
+
+    @Test
+    fun `test mathematical correctness across HMM stochasticity, complementary microstructure probabilities, out-of-order candle close, and idempotent TIME-5 acceleration`() {
+        // 1. Out-of-order historical tick preserves completed candle close while updating high/low/tickCount
+        val candleEngine = CandleEngine(candleSizeSec = 5L)
+        candleEngine.processTick(Tick("LATAM_X", 100.0, 10_000L)) // bucket 10s open=100, close=100
+        candleEngine.processTick(Tick("LATAM_X", 101.5, 14_000L)) // bucket 10s close=101.5
+        candleEngine.processTick(Tick("LATAM_X", 102.0, 16_000L)) // bucket 15s (completes bucket 10s)
+        // Late out-of-order tick from 12_000L with extreme low 99.2
+        val candlesAfterLateTick = candleEngine.processTick(Tick("LATAM_X", 99.2, 12_000L))
+        val bucket10s = candlesAfterLateTick.first { it.timeSec == 10L }
+        assertEquals("Completed candle close must not be overwritten by earlier out-of-order tick", 101.5, bucket10s.close, 1e-9)
+        assertEquals("Out-of-order tick must still update low", 99.2, bucket10s.low, 1e-9)
+        assertEquals("Out-of-order tick must increment tickCount", 3, bucket10s.tickCount)
+
+        // 2. Microstructure complementary probabilities (breakoutProb + meanReversionProb == 100.0) & bounded displacement10
+        val indicatorEngine = IndicatorEngine()
+        val baseTs = 1700000000000L
+        val ticks = (0 until 45).map { i ->
+            val p = when {
+                i < 30 -> 4500.0 + (if (i % 2 == 0) 0.08 else -0.08)
+                i < 42 -> 4500.0 + (i - 29) * 0.65
+                else -> 4500.0 + 12 * 0.65 + (i - 41) * 0.05 // deceleration after steep slope triggers exhaustion
+            }
+            Tick("LATAM_X", p, baseTs + i * 200L)
+        }
+        ticks.forEach { candleEngine.processTick(it) }
+        val ind = indicatorEngine.computeIndicators(ticks, candleEngine.getAllCandles())
+        assertEquals(
+            "Breakout and mean-reversion probabilities must be complementary (sum to 100%)",
+            100.0,
+            ind.microstructure.breakoutProb + ind.microstructure.meanReversionProb,
+            1e-6
+        )
+        assertTrue(
+            "displacement10 must be bounded within [0, 100]: ${ind.microstructure.displacement10}",
+            ind.microstructure.displacement10 in 0.0..100.0
+        )
+
+        // 3. HMM posterior state probabilities sum to 1.0
+        val regimeEngine = RegimeDetectionEngine()
+        val hmm = regimeEngine.processTicks(ticks)
+        assertNotNull(hmm)
+        assertEquals(
+            "HMM posterior state probabilities must sum to 1.0",
+            1.0,
+            hmm!!.stateProbabilities.sum(),
+            1e-6
+        )
+
+        // 4. TIME-5 acceleration is idempotent when evaluated multiple times on the exact same tick timestamp
+        val strategyEngine = ModularStrategyEngine()
+        val strategy = HardLockedMandate.lockedStrategyConfig()
+        val frame1Ticks = ticks.take(35)
+        val frame2Ticks = ticks.take(36)
+        strategyEngine.evaluateStrategy(
+            strategy = strategy,
+            telemetry = MarketTelemetryState(
+                pair = "LATAM_X",
+                latestPrice = frame1Ticks.last().price,
+                latestTimeMs = frame1Ticks.last().timeMs,
+                tickCount = frame1Ticks.size,
+                recentTicks = frame1Ticks,
+                assetPayoutPercent = 85
+            ),
+            wsLatencyMs = 30L
+        )
+        val eval2A = strategyEngine.evaluateStrategy(
+            strategy = strategy,
+            telemetry = MarketTelemetryState(
+                pair = "LATAM_X",
+                latestPrice = frame2Ticks.last().price,
+                latestTimeMs = frame2Ticks.last().timeMs,
+                tickCount = frame2Ticks.size,
+                recentTicks = frame2Ticks,
+                assetPayoutPercent = 85
+            ),
+            wsLatencyMs = 30L
+        )
+        val eval2B = strategyEngine.evaluateStrategy(
+            strategy = strategy,
+            telemetry = MarketTelemetryState(
+                pair = "LATAM_X",
+                latestPrice = frame2Ticks.last().price,
+                latestTimeMs = frame2Ticks.last().timeMs,
+                tickCount = frame2Ticks.size,
+                recentTicks = frame2Ticks,
+                assetPayoutPercent = 85
+            ),
+            wsLatencyMs = 30L
+        )
+        assertEquals(
+            "Repeated evaluation on identical tick timestamp must preserve acceleration without decaying to 0",
+            eval2A.time5Metrics.acceleration,
+            eval2B.time5Metrics.acceleration,
+            1e-9
+        )
+    }
 }
-
-
-
-
-
-

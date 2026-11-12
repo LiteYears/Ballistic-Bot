@@ -49,7 +49,7 @@ class CandleEngine(
                     high = max(active.high, normalized.high),
                     low = min(active.low, normalized.low),
                     close = normalized.close,
-                    tickCount = max(1, active.tickCount)
+                    tickCount = max(1, max(active.tickCount, normalized.tickCount))
                 )
             }
         } else if (bucketSec > active.timeSec) {
@@ -108,7 +108,7 @@ class CandleEngine(
                 completedCandles[idx] = old.copy(
                     high = max(old.high, tick.price),
                     low = min(old.low, tick.price),
-                    close = tick.price,
+                    close = old.close,
                     tickCount = old.tickCount + 1
                 )
             }

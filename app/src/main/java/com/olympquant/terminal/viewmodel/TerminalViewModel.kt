@@ -78,6 +78,10 @@ class TerminalViewModel(
     private var lastTradeExecutionTimeMs: Long = 0L
     private var lastForegroundNotificationUpdateMs: Long = 0L
 
+    @Volatile private var lastObservedTickTimeMs: Long = 0L
+    @Volatile private var lastObservedTickPrice: Double = 0.0
+    @Volatile private var lastOrderedTickTimeMs: Long = 0L
+
     @Volatile
     private var activeOrderExpiresAtMs: Long = 0L
 
@@ -215,6 +219,10 @@ class TerminalViewModel(
                         brokerConfirmedOpenPrice = accepted.openPrice,
                         acceptedAtMs = accepted.timestampMs
                     )
+                    modularStrategyEngine.recordExecutionConfirmed(
+                        brokerTradeId = accepted.brokerTradeId,
+                        openPrice = accepted.openPrice
+                    )
                     repository.updateAcceptedTrade(
                         pair = accepted.pair,
                         brokerTradeId = accepted.brokerTradeId,
@@ -233,6 +241,11 @@ class TerminalViewModel(
                 if (activeOpenTrades.isEmpty()) {
                     activeOrderExpiresAtMs = 0L
                 }
+                modularStrategyEngine.recordTradeSettled(
+                    brokerTradeId = settled.brokerTradeId,
+                    expiryPrice = settled.closePrice,
+                    outcome = settled.outcome
+                )
                 val freshJournal = repository.settleTradeAndGetJournal(
                     brokerTradeId = settled.brokerTradeId,
                     pair = settled.pair,
@@ -807,6 +820,13 @@ class TerminalViewModel(
         val snap = _telemetry.value
         val tradeId = now % 1_000_000L
 
+        modularStrategyEngine.recordExecutionAttempt(
+            timestampMs = now,
+            pair = prefs.selectedPair,
+            price = snap.latestPrice,
+            direction = direction
+        )
+
         val sent = wsClient.placeOrder(
             pair = prefs.selectedPair,
             amount = stake,
@@ -897,6 +917,9 @@ class TerminalViewModel(
         regimeEngine.reset()
         indicatorEngine.reset()
         modularStrategyEngine.resetTransientPairQueues()
+        lastObservedTickTimeMs = 0L
+        lastObservedTickPrice = 0.0
+        lastOrderedTickTimeMs = 0L
         val prefs = sessionPrefs.value
         _telemetry.value = MarketTelemetryState(
             pair = pair,
@@ -908,6 +931,13 @@ class TerminalViewModel(
     }
 
     private suspend fun processIncomingTick(tick: Tick) {
+        // Reject duplicate, invalid, or out-of-order price observations without corrupting rolling buffer
+        if (tick.price <= 0.0 || !tick.price.isFinite()) return
+        if (tick.timeMs < lastObservedTickTimeMs) return
+        if (tick.timeMs == lastObservedTickTimeMs && tick.price == lastObservedTickPrice) return
+        lastObservedTickTimeMs = tick.timeMs
+        lastObservedTickPrice = tick.price
+
         val nowMs = System.currentTimeMillis()
         activeOpenTrades.removeAll { nowMs >= it.expiresAtMs }
         if (nowMs >= activeOrderExpiresAtMs && activeOpenTrades.isEmpty()) {
@@ -1100,7 +1130,8 @@ class TerminalViewModel(
 
         val updatedState = preliminaryState.copy(
             activeEvaluations = listOf(evaluation),
-            temporalTelemetry = evaluation.temporalTelemetry
+            temporalTelemetry = evaluation.temporalTelemetry,
+            time5Metrics = evaluation.time5Metrics
         )
         _telemetry.value = updatedState
 
@@ -1118,6 +1149,8 @@ class TerminalViewModel(
         //    - Requires _botRunning.value == true (Autopilot Guard not in AVOID standby)
         //    - Enforces Single Active Trade Lock (only 1 trade at a time!)
         //    - Enforces Chrono Sniper (1/Hr) mode when active (max 1 trade per hour, every day)
+        //    - Enforces duplicate tick order protection (tick.timeMs != lastOrderedTickTimeMs)
+        //    - Enforces minimum cooldown (HardLockedMandate.LOCKED_COOLDOWN_MS = 600 ms)
         if (_botRunning.value && !hasActiveTradeInFlight(nowMs)) {
             if (stats.hardStopReason != null) {
                 _botRunning.value = false
@@ -1146,12 +1179,25 @@ class TerminalViewModel(
             }
 
             val now = System.currentTimeMillis()
-            if (evaluation.readyToExecute && now - lastTradeExecutionTimeMs >= activeStrategy.cooldownMs) {
+            // Prevent duplicate orders from repeated processing of the same tick
+            if (tick.timeMs == lastOrderedTickTimeMs) {
+                return
+            }
+
+            if (evaluation.readyToExecute && now - lastTradeExecutionTimeMs >= HardLockedMandate.LOCKED_COOLDOWN_MS) {
+                lastOrderedTickTimeMs = tick.timeMs
                 lastTradeExecutionTimeMs = now
                 val stake = stats.lockedStakeUsd
                 val durationSec = selectedTfSec
                 val accountId = if (prefs.accountGroup == "real") prefs.realAccountId else prefs.demoAccountId
                 val tradeId = now % 1_000_000L
+
+                modularStrategyEngine.recordExecutionAttempt(
+                    timestampMs = now,
+                    pair = tick.pair,
+                    price = tick.price,
+                    direction = evaluation.finalSignal
+                )
 
                 val dispatched = wsClient.placeOrder(
                     pair = tick.pair,
@@ -1228,6 +1274,9 @@ class TerminalViewModel(
                             "AUTO #${newTradeTotal}/${stats.maxDailyTrades} [${activeStrategy.name}] -> ${evaluation.finalSignal} $${"%.2f".format(stake)} (${durationSec}s) @ ${"%.4f".format(tick.price)} • 1-Trade Lock Active"
                     }
                     pushForegroundNotification(force = true)
+                } else {
+                    modularStrategyEngine.recordExecutionFailed("WebSocket order dispatch failed")
+                    _lastExecutionBanner.value = "Failed to dispatch ${evaluation.finalSignal} order to broker"
                 }
             }
         }

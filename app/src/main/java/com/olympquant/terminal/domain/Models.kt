@@ -161,16 +161,16 @@ data class HighVoltageFilterStatus(
  * Hard-Locked Execution Mandate for the sole native Sniper M 5-Second Strategy.
  */
 object HardLockedMandate {
-    const val STRATEGY_NAME = "Sniper M"
+    const val STRATEGY_NAME = "TIME-5"
     const val STRATEGY_DESCRIPTION =
-        "Sniper M (Sole Native Strategy): 5-second Hawkes-Laminar tick-burst continuation engine with 7-gate scientific false-positive rejection, non-decelerating convexity filtering, climax Z-score guard, and online FTRL-Proximal calibration."
+        "TIME-5 Balanced Momentum: 5-second momentum execution based on 4 core mathematical components (Price Displacement M, Short-Term Velocity V, Time-Aware Acceleration A, Directional Efficiency DE) with volatility normalization and platform-confirmed execution."
     const val MIN_STAKE_USD = 1.0
     const val BALANCE_STAKE_PERCENT = 5.0
     const val MAX_STAKE_USD = 4000.0
     const val MAX_TRADES_PER_DAY = 10
     const val MAX_CONSECUTIVE_LOSSES = 3
     const val LOCKED_DURATION_SEC = 5
-    const val LOCKED_COOLDOWN_MS = 4000L
+    const val LOCKED_COOLDOWN_MS = 600L
     const val MIN_PAYOUT_PERCENT = 75
     const val MIN_CONFIDENCE_REQUIRED = 60.0
 
@@ -195,16 +195,16 @@ object HardLockedMandate {
         cooldownMs = LOCKED_COOLDOWN_MS,
         minConfidence = MIN_CONFIDENCE_REQUIRED,
         triggerType = TriggerType.RAW_TICK_RUSH_5S,
-        triggerThreshold = 1.35,
+        triggerThreshold = 1.0,
         regimeAdaptiveMode = RegimeAdaptiveMode.OFF,
         filters = listOf(
-            StrategyFilterRule(FilterType.TICK_RUSH_SNR_GATE, true, 1.35),
-            StrategyFilterRule(FilterType.TICK_DIRECTIONAL_PURITY, true, 72.0),
-            StrategyFilterRule(FilterType.TICK_SPEED_AND_FRESHNESS, true, 1.20),
-            StrategyFilterRule(FilterType.ANTI_SPIKE_DOMINANCE_GATE, true, 58.0),
-            StrategyFilterRule(FilterType.FTRL_ML_META_LABEL_GATE, true, 54.0)
+            StrategyFilterRule(FilterType.TICK_RUSH_SNR_GATE, true, 1.0),
+            StrategyFilterRule(FilterType.TICK_DIRECTIONAL_PURITY, true, 45.0),
+            StrategyFilterRule(FilterType.TICK_SPEED_AND_FRESHNESS, true, 1.0),
+            StrategyFilterRule(FilterType.ANTI_SPIKE_DOMINANCE_GATE, true, 50.0),
+            StrategyFilterRule(FilterType.FTRL_ML_META_LABEL_GATE, true, 50.0)
         ),
-        scriptCode = "NATIVE_SNIPER_M_5S",
+        scriptCode = "TIME_5_BALANCED",
         stakeMode = "PERCENT_BALANCE",
         stakeValue = BALANCE_STAKE_PERCENT,
         minStakeUsd = MIN_STAKE_USD,
@@ -214,6 +214,58 @@ object HardLockedMandate {
         maxConsecutiveLosses = MAX_CONSECUTIVE_LOSSES
     )
 }
+
+@Immutable
+@Serializable
+data class Time5Metrics(
+    val momentum: Double = 0.0,
+    val velocity: Double = 0.0,
+    val acceleration: Double = 0.0,
+    val directionalEfficiency: Double = 0.0,
+    val rollingVolatility: Double = 0.0,
+    val normalizedMomentum: Double = 0.0,
+    val smoothedVelocity: Double = 0.0,
+    val decision: SignalDirection = SignalDirection.NONE,
+    val rejectionReason: String? = null,
+    val isFresh: Boolean = true,
+    val isOpposingImpulse: Boolean = false
+)
+
+@Immutable
+@Serializable
+data class Time5StrategyParams(
+    val displacementTicks: Int = 3,
+    val velocityTicks: Int = 2,
+    val directionalEfficiencyIntervals: Int = 3,
+    val smoothingTauMs: Double = 800.0,
+    val minDirectionalEfficiency: Double = 0.45,
+    val minNormalizedMomentum: Double = 1.0,
+    val cooldownMs: Long = 600L,
+    val maxTickAgeMs: Long = 3500L,
+    val maxLatencyMs: Long = 450L,
+    val durationSeconds: Int = 5
+)
+
+@Immutable
+@Serializable
+data class Time5EvaluationRecord(
+    val timestampMs: Long = 0L,
+    val assetIdentifier: String = "",
+    val currentPrice: Double = 0.0,
+    val momentum: Double = 0.0,
+    val velocity: Double = 0.0,
+    val acceleration: Double = 0.0,
+    val directionalEfficiency: Double = 0.0,
+    val normalizedSignalStrength: Double = 0.0,
+    val decision: String = "NO_TRADE",
+    val rejectionReason: String? = null,
+    val executionAttempted: Boolean = false,
+    val platformConfirmed: Boolean = false,
+    val actualExecutionPrice: Double? = null,
+    val expiryPrice: Double? = null,
+    val realizedOutcome: String? = null,
+    val lifecycleEvent: String = "SIGNAL_REJECTED"
+)
 
 @Immutable
 @Serializable
@@ -506,7 +558,8 @@ data class StrategyEvaluation(
     val contextBlockReasons: List<String>,
     val regimeAdjustmentNote: String,
     val readyToExecute: Boolean,
-    val temporalTelemetry: TemporalTelemetrySnapshot = TemporalTelemetrySnapshot()
+    val temporalTelemetry: TemporalTelemetrySnapshot = TemporalTelemetrySnapshot(),
+    val time5Metrics: Time5Metrics = Time5Metrics()
 )
 
 @Immutable
@@ -570,7 +623,8 @@ data class MarketTelemetryState(
     val hourlySniperMode: Boolean = false,
     val hourlyTradesThisHour: Int = 0,
     val nextHourlyResetMinutes: Int = 0,
-    val singleTradeLocked: Boolean = false
+    val singleTradeLocked: Boolean = false,
+    val time5Metrics: Time5Metrics = Time5Metrics()
 )
 
 

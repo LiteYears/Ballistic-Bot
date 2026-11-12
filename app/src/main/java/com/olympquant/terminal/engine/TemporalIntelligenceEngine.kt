@@ -224,8 +224,9 @@ class TemporalIntelligenceEngine {
         val count = recentRegimeDirectionCount[regimeIndex][directionIndex]
         if (count == 0) return null
         var wins = 0
-        for (value in recentRegimeDirectionOutcomes[regimeIndex][directionIndex]) {
-            wins += value
+        val outcomes = recentRegimeDirectionOutcomes[regimeIndex][directionIndex]
+        for (i in 0 until count) {
+            wins += outcomes[i]
         }
         return (wins.toDouble() / count.toDouble()).coerceIn(0.0, 1.0)
     }
@@ -445,8 +446,8 @@ class TemporalIntelligenceEngine {
 
         // Section 6 Validation Telemetry Metrics
         val gateStabilityPct = if (totalGateEvaluations > 30L) {
-            val flickerRatio = totalGateFlips.toDouble() / totalGateEvaluations.toDouble()
-            ((1.0 - flickerRatio * 0.65) * 100.0).coerceIn(0.0, 100.0)
+            val flickerRatio = (totalGateFlips.toDouble() / totalGateEvaluations.toDouble()).coerceIn(0.0, 1.0)
+            ((1.0 - flickerRatio) * 100.0).coerceIn(0.0, 100.0)
         } else {
             0.0
         }
@@ -462,7 +463,7 @@ class TemporalIntelligenceEngine {
             0.0
         }
         val calibrationAccuracyPct = if (rush.shadowSamplesLearned >= 30) {
-            ((1.0 - sqrt(brierErrorEma) * 0.45) * 100.0).coerceIn(0.0, 100.0)
+            ((1.0 - brierErrorEma.finiteOr(0.25).coerceIn(0.0, 1.0)) * 100.0).coerceIn(0.0, 100.0)
         } else {
             0.0
         }
@@ -671,8 +672,9 @@ class TemporalIntelligenceEngine {
             return TemporalRegimeType.TRANSITION_UNCERTAIN
         }
         return when {
-            rush.rushSnr >= 1.45 || rollingSnrMean >= 1.38 -> TemporalRegimeType.EXPANSION_IMPULSE
-            telemetry.consistency >= 0.65 || abs(telemetry.persistence) >= 4 || rush.purityPercent >= 74.0 ->
+            rush.rushSnr >= 1.30 || rollingSnrMean >= 1.28 || (rush.rushSnr >= 1.25 && rush.clearedNoiseMean && rush.purityPercent >= 68.0) ->
+                TemporalRegimeType.EXPANSION_IMPULSE
+            telemetry.consistency >= 0.65 || abs(telemetry.persistence) >= 4 || rush.purityPercent >= 72.0 ->
                 TemporalRegimeType.TREND
             else -> TemporalRegimeType.CONSOLIDATION
         }

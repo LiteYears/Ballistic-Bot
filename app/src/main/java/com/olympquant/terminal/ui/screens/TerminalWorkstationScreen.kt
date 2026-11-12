@@ -383,7 +383,7 @@ fun TerminalWorkstationScreen(
         val eval = primaryEvaluation
         if (eval != null) {
             item(key = "gatekeeper_pipeline", contentType = "pipeline") {
-                GatekeeperPipelineCard(evaluation = eval)
+                GatekeeperPipelineCard(evaluation = eval, telemetry = telemetry)
             }
         }
         }
@@ -1507,13 +1507,27 @@ private fun ActiveOpenTradesCard(
                 val remainingSec = remainingMs / 1000.0
                 val progress = (remainingMs.toFloat() / totalDurationMs.toFloat()).coerceIn(0f, 1f)
 
-                val isItm = if (pos.direction == SignalDirection.UP) {
+                val isTie = abs(currentPrice - pos.entryPrice) < 1e-8
+                val isItm = !isTie && if (pos.direction == SignalDirection.UP) {
                     currentPrice > pos.entryPrice
                 } else {
                     currentPrice < pos.entryPrice
                 }
-                val statusColor = if (isItm) BullishGreen else BearishCrimson
-                val estPnl = if (isItm) pos.stake * (pos.payoutPercent / 100.0) else -pos.stake
+                val statusColor = when {
+                    isTie -> WarningAmber
+                    isItm -> BullishGreen
+                    else -> BearishCrimson
+                }
+                val estPnl = when {
+                    isTie -> 0.0
+                    isItm -> pos.stake * (pos.payoutPercent / 100.0)
+                    else -> -pos.stake
+                }
+                val statusLabel = when {
+                    isTie -> "ATM"
+                    isItm -> "ITM"
+                    else -> "OTM"
+                }
 
                 Column(
                     modifier = Modifier
@@ -1554,7 +1568,7 @@ private fun ActiveOpenTradesCard(
                             color = statusColor.copy(alpha = 0.14f)
                         ) {
                             Text(
-                                text = "${if (isItm) "ITM" else "OTM"} ${"%+.2f".format(estPnl)} • ${"%.1f".format(remainingSec)}s",
+                                text = "$statusLabel ${"%+.2f".format(estPnl)} • ${"%.1f".format(remainingSec)}s",
                                 style = MaterialTheme.typography.labelMedium,
                                 color = statusColor,
                                 maxLines = 1,
@@ -2300,8 +2314,11 @@ private fun MetricTile(
 }
 
 @Composable
-private fun GatekeeperPipelineCard(evaluation: StrategyEvaluation) {
-    val t = evaluation.temporalTelemetry
+private fun GatekeeperPipelineCard(
+    evaluation: StrategyEvaluation,
+    telemetry: MarketTelemetryState
+) {
+    val m = evaluation.time5Metrics
     var expandedDiagnostics by rememberSaveable { mutableStateOf(true) }
     val passedGates = evaluation.filterDiagnostics.count { it.passed }
     val totalGates = evaluation.filterDiagnostics.size
@@ -2337,7 +2354,7 @@ private fun GatekeeperPipelineCard(evaluation: StrategyEvaluation) {
                         .padding(end = 8.dp)
                 ) {
                     Text(
-                        text = "SNIPER M 7-GATE FALSE-POSITIVE PIPELINE ($passedGates/$totalGates)",
+                        text = "TIME-5 BALANCED MOMENTUM ($passedGates/$totalGates)",
                         style = MaterialTheme.typography.labelLarge,
                         color = ElectricCyan,
                         fontWeight = FontWeight.Bold,
@@ -2353,14 +2370,24 @@ private fun GatekeeperPipelineCard(evaluation: StrategyEvaluation) {
                     )
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
+                    val decisionColor = when (evaluation.finalSignal) {
+                        SignalDirection.UP -> BullishGreen
+                        SignalDirection.DOWN -> BearishCrimson
+                        else -> TextSecondary
+                    }
+                    val decisionText = when (evaluation.finalSignal) {
+                        SignalDirection.UP -> "UP READY"
+                        SignalDirection.DOWN -> "DOWN READY"
+                        else -> if (evaluation.readyToExecute) "READY" else "HOLD"
+                    }
                     Surface(
                         shape = RoundedCornerShape(8.dp),
-                        color = if (evaluation.readyToExecute) BullishGreen.copy(alpha = 0.14f) else SlateSurfaceVariant
+                        color = decisionColor.copy(alpha = 0.16f)
                     ) {
                         Text(
-                            text = if (evaluation.readyToExecute) "READY" else "HOLD",
+                            text = decisionText,
                             style = MaterialTheme.typography.labelSmall,
-                            color = if (evaluation.readyToExecute) BullishGreen else TextSecondary,
+                            color = decisionColor,
                             fontWeight = FontWeight.Bold,
                             modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
                         )
@@ -2378,7 +2405,7 @@ private fun GatekeeperPipelineCard(evaluation: StrategyEvaluation) {
             if (expandedDiagnostics) {
                 HorizontalDivider(color = SlateBorder)
 
-                // X13 Walk-Forward Validation Metrics
+                // TIME-5 Core Mathematical Telemetry & Execution State
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -2398,7 +2425,7 @@ private fun GatekeeperPipelineCard(evaluation: StrategyEvaluation) {
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
-                                text = "X13 WALK-FORWARD TELEMETRY (${t.regimeType.displayName.uppercase()})",
+                                text = "TIME-5 BALANCED METRICS",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = ElectricCyan,
                                 maxLines = 1,
@@ -2408,9 +2435,9 @@ private fun GatekeeperPipelineCard(evaluation: StrategyEvaluation) {
                                     .padding(end = 6.dp)
                             )
                             Text(
-                                text = if (t.momentumHysteresisActive) "HYST: LATCHED" else "HYST: IDLE",
+                                text = if (telemetry.singleTradeLocked) "TRADE LOCK: ACTIVE" else "TRADE LOCK: IDLE",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = if (t.momentumHysteresisActive) BullishGreen else TextSecondary,
+                                color = if (telemetry.singleTradeLocked) ElectricCyan else TextSecondary,
                                 maxLines = 1
                             )
                         }
@@ -2419,21 +2446,21 @@ private fun GatekeeperPipelineCard(evaluation: StrategyEvaluation) {
                             horizontalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
                             X13MetricMiniCell(
-                                label = "GATE STABILITY",
-                                value = "${"%.1f".format(t.gateStabilityPercent)}%",
-                                good = t.gateStabilityPercent >= 75.0,
+                                label = "DECISION",
+                                value = if (m.decision != SignalDirection.NONE) m.decision.name else "NO TRADE",
+                                good = m.decision != SignalDirection.NONE,
                                 modifier = Modifier.weight(1f)
                             )
                             X13MetricMiniCell(
-                                label = "FALSE-POS RATE",
-                                value = "${"%.1f".format(t.falsePositiveRatePercent)}%",
-                                good = t.falsePositiveRatePercent <= 25.0,
+                                label = "DISPLACEMENT (M)",
+                                value = "${"%+.4f".format(m.momentum)}",
+                                good = abs(m.momentum) > 0.0,
                                 modifier = Modifier.weight(1f)
                             )
                             X13MetricMiniCell(
-                                label = "IMPULSE DETECT",
-                                value = "${"%.1f".format(t.impulseDetectionRatePercent)}%",
-                                good = t.impulseDetectionRatePercent >= 50.0,
+                                label = "VELOCITY (V)",
+                                value = "${"%+.3f".format(m.velocity)}/s",
+                                good = (m.decision == SignalDirection.UP && m.velocity > 0) || (m.decision == SignalDirection.DOWN && m.velocity < 0),
                                 modifier = Modifier.weight(1f)
                             )
                         }
@@ -2442,21 +2469,62 @@ private fun GatekeeperPipelineCard(evaluation: StrategyEvaluation) {
                             horizontalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
                             X13MetricMiniCell(
-                                label = "SIGNAL LATENCY",
-                                value = "${t.signalLatencyMs}ms",
-                                good = t.signalLatencyMs <= 600L,
+                                label = "ACCELERATION (A)",
+                                value = "${"%+.3f".format(m.acceleration)}",
+                                good = (m.decision == SignalDirection.UP && m.acceleration >= 0) || (m.decision == SignalDirection.DOWN && m.acceleration <= 0),
                                 modifier = Modifier.weight(1f)
                             )
                             X13MetricMiniCell(
-                                label = "PROB CALIB",
-                                value = "${"%.1f".format(t.calibrationAccuracyPercent)}%",
-                                good = t.calibrationAccuracyPercent >= 65.0,
+                                label = "EFFICIENCY (DE)",
+                                value = "${"%.2f".format(m.directionalEfficiency)}",
+                                good = m.directionalEfficiency >= 0.45,
                                 modifier = Modifier.weight(1f)
                             )
                             X13MetricMiniCell(
-                                label = "OOS EXPECTANCY",
-                                value = "${"%+.1f".format(t.oosExpectancyPercent)}%",
-                                good = t.oosExpectancyPercent >= 0.0,
+                                label = "STRENGTH (S)",
+                                value = "${"%.1f".format(m.normalizedMomentum)}σ",
+                                good = m.normalizedMomentum >= 1.0,
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            val activeTradeLabel = if (telemetry.activeOpenTrades.isNotEmpty()) {
+                                val trade = telemetry.activeOpenTrades.first()
+                                "${trade.direction.name} #${trade.brokerTradeId}"
+                            } else if (telemetry.singleTradeLocked) {
+                                "IN-FLIGHT"
+                            } else {
+                                "STANDBY"
+                            }
+                            X13MetricMiniCell(
+                                label = "ACTIVE STATUS",
+                                value = activeTradeLabel,
+                                good = telemetry.singleTradeLocked,
+                                modifier = Modifier.weight(1f)
+                            )
+                            val confirmLabel = if (telemetry.activeOpenTrades.isNotEmpty()) {
+                                "CONFIRMED"
+                            } else {
+                                "SYNCED"
+                            }
+                            X13MetricMiniCell(
+                                label = "CONFIRMATION",
+                                value = confirmLabel,
+                                good = true,
+                                modifier = Modifier.weight(1f)
+                            )
+                            val outcomeLabel = if (telemetry.dailyTradesCount > 0) {
+                                "${"%+.2f".format(telemetry.dailyNetPnl)} (${telemetry.dailyTradesCount})"
+                            } else {
+                                "NO TRADES"
+                            }
+                            X13MetricMiniCell(
+                                label = "5S OUTCOME",
+                                value = outcomeLabel,
+                                good = telemetry.dailyNetPnl >= 0.0,
                                 modifier = Modifier.weight(1f)
                             )
                         }

@@ -339,7 +339,9 @@ class IndicatorEngine {
 
         val dispWindow = min(10, n - 1)
         val rawDisp10 = abs(prices[n - 1] - prices[n - 1 - dispWindow])
-        val displacement10 = (if (volatility > 1e-9) (rawDisp10 / (volatility * dispWindow)) * 100.0 else 50.0).finiteOr(50.0)
+        val displacement10 = (if (volatility > 1e-9) (rawDisp10 / (volatility * dispWindow)) * 100.0 else 50.0)
+            .finiteOr(50.0)
+            .coerceIn(0.0, 100.0)
 
         val effWindow = min(10, n - 1)
         var pathSum = 0.0
@@ -347,11 +349,25 @@ class IndicatorEngine {
             pathSum += abs(prices[i] - prices[i - 1])
         }
         val netMoveEff = abs(prices[n - 1] - prices[n - 1 - effWindow])
-        val directionalEfficiency = if (pathSum > 1e-9) {
+        val directionalEfficiency10 = if (pathSum > 1e-9) {
             ((netMoveEff / pathSum) * 100.0).finiteOr(0.0).coerceIn(0.0, 100.0)
         } else {
             0.0
         }
+
+        // Fast 4-tick impulse efficiency for early surge detection
+        val effWindow4 = min(4, n - 1)
+        var pathSum4 = 0.0
+        for (i in (n - effWindow4) until n) {
+            pathSum4 += abs(prices[i] - prices[i - 1])
+        }
+        val netMoveEff4 = abs(prices[n - 1] - prices[n - 1 - effWindow4])
+        val directionalEfficiency4 = if (pathSum4 > 1e-9) {
+            ((netMoveEff4 / pathSum4) * 100.0).finiteOr(0.0).coerceIn(0.0, 100.0)
+        } else {
+            0.0
+        }
+        val directionalEfficiency = maxOf(directionalEfficiency10, directionalEfficiency4)
 
         var streakCount = 0
         var lastStepDir = 0
@@ -405,9 +421,9 @@ class IndicatorEngine {
 
         val microExhaustion = when {
             slopeRatio >= 3.0 && (lastStep < volatility * 0.45 || microAcceleration < -0.20) -> 86.0
-            slopeRatio >= 3.0 && stepExpansionRatio >= 1.45 -> 82.0
+            slopeRatio >= 3.0 && stepExpansionRatio >= 1.45 && (lastStep < volatility * 0.60 || microAcceleration < -0.15) -> 82.0
             (relPos >= 97.5 || relPos <= 2.5) && microAcceleration < -0.25 -> 80.0
-            slopeRatio >= 2.6 && microAcceleration < -0.10 -> 62.0
+            slopeRatio >= 2.6 && microAcceleration < -0.15 -> 62.0
             else -> 15.0
         }
 
@@ -454,10 +470,14 @@ class IndicatorEngine {
             else -> LandmarkType.NONE
         }
 
-        val breakoutProb = (directionalEfficiency * 0.45 + consistency * 40.0 + (if (microAcceleration > 0) 15.0 else 0.0))
+        val rawBreakoutProb = directionalEfficiency * 0.45 +
+            consistency * 40.0 +
+            (if (microAcceleration > 0) 15.0 else 0.0) -
+            (if (microExhaustion > 50.0) 15.0 else 0.0)
+        val breakoutProb = rawBreakoutProb
             .finiteOr(50.0)
             .coerceIn(5.0, 95.0)
-        val meanReversionProb = (100.0 - breakoutProb + (if (microExhaustion > 50.0) 15.0 else 0.0))
+        val meanReversionProb = (100.0 - breakoutProb)
             .finiteOr(50.0)
             .coerceIn(5.0, 95.0)
         val mci = (directionalEfficiency * 0.4 + consistency * 40.0 + (100.0 - microHesitation) * 0.2)
@@ -821,10 +841,10 @@ class IndicatorEngine {
         val tipAligned = (smoothedDir == SignalDirection.UP && d0 >= 0.0 && smoothedVelocity3 > 0.0) ||
             (smoothedDir == SignalDirection.DOWN && d0 <= 0.0 && smoothedVelocity3 < 0.0)
         val activeMomentumPassed = tipAligned &&
-            (consistency >= 0.60 || microstructure.directionalEfficiency >= 60.0) &&
+            (consistency >= 0.58 || microstructure.directionalEfficiency >= 58.0) &&
             when (smoothedDir) {
-                SignalDirection.UP -> netDelta5 > 0.0
-                SignalDirection.DOWN -> netDelta5 < 0.0
+                SignalDirection.UP -> (netDelta5 > 0.0 || (d0 > 0.0 && d1 > 0.0))
+                SignalDirection.DOWN -> (netDelta5 < 0.0 || (d0 < 0.0 && d1 < 0.0))
                 SignalDirection.NONE -> false
             }
 
@@ -834,9 +854,10 @@ class IndicatorEngine {
 
         // Step 3B: Tick Stream Surge Magnitude (clears baseline noise oscillation)
         val surgeFloor = max(1e-8, volatility * 1.15)
+        val delta3 = (d0 + d1 + d2).finiteOr(0.0)
         val positionBreakoutPassed = when (smoothedDir) {
-            SignalDirection.UP -> netDelta5 >= surgeFloor
-            SignalDirection.DOWN -> netDelta5 <= -surgeFloor
+            SignalDirection.UP -> netDelta5 >= surgeFloor || delta3 >= surgeFloor
+            SignalDirection.DOWN -> netDelta5 <= -surgeFloor || delta3 <= -surgeFloor
             SignalDirection.NONE -> false
         }
 
@@ -991,14 +1012,14 @@ class RegimeDetectionEngine {
     private var stateDuration: Int = 0
 
     private val transmat = arrayOf(
-        doubleArrayOf(0.461, 0.484, 0.000, 0.000, 0.000, 0.020, 0.010, 0.026), // S0 Expansion
-        doubleArrayOf(0.210, 0.433, 0.001, 0.000, 0.000, 0.205, 0.011, 0.139), // S1 Reversal
-        doubleArrayOf(0.005, 0.033, 0.939, 0.000, 0.000, 0.017, 0.007, 0.000), // S2 Reversal
-        doubleArrayOf(0.000, 0.000, 1.000, 0.000, 0.000, 0.000, 0.000, 0.000), // S3 Expansion
-        doubleArrayOf(0.000, 0.000, 0.276, 0.000, 0.724, 0.000, 0.000, 0.000), // S4 Calm
-        doubleArrayOf(0.018, 0.480, 0.000, 0.000, 0.001, 0.452, 0.008, 0.041), // S5 Trending
-        doubleArrayOf(0.027, 0.090, 0.001, 0.000, 0.000, 0.028, 0.063, 0.791), // S6 Calm
-        doubleArrayOf(0.038, 0.500, 0.000, 0.000, 0.000, 0.060, 0.401, 0.000)  // S7 Calm
+        doubleArrayOf(0.461, 0.483, 0.000, 0.000, 0.000, 0.020, 0.010, 0.026), // S0 Expansion (sum = 1.000)
+        doubleArrayOf(0.210, 0.434, 0.001, 0.000, 0.000, 0.205, 0.011, 0.139), // S1 Reversal  (sum = 1.000)
+        doubleArrayOf(0.005, 0.033, 0.938, 0.000, 0.000, 0.017, 0.007, 0.000), // S2 Reversal  (sum = 1.000)
+        doubleArrayOf(0.000, 0.000, 1.000, 0.000, 0.000, 0.000, 0.000, 0.000), // S3 Expansion (sum = 1.000)
+        doubleArrayOf(0.000, 0.000, 0.276, 0.000, 0.724, 0.000, 0.000, 0.000), // S4 Calm      (sum = 1.000)
+        doubleArrayOf(0.018, 0.480, 0.000, 0.000, 0.001, 0.452, 0.008, 0.041), // S5 Trending  (sum = 1.000)
+        doubleArrayOf(0.027, 0.090, 0.001, 0.000, 0.000, 0.028, 0.063, 0.791), // S6 Calm      (sum = 1.000)
+        doubleArrayOf(0.038, 0.501, 0.000, 0.000, 0.000, 0.060, 0.401, 0.000)  // S7 Calm      (sum = 1.000)
     )
 
     private val startProb = doubleArrayOf(0.05, 0.45, 0.10, 0.02, 0.08, 0.15, 0.08, 0.07)
@@ -1096,16 +1117,17 @@ class RegimeDetectionEngine {
 
         accelerationsBuf[1] = 0.0
         for (i in 2 until n) {
-            accelerationsBuf[i] = ((velocitiesBuf[i] - velocitiesBuf[i - 1]) / dtCleansBuf[i]).finiteOr(0.0)
+            val dtMid = (0.5 * (dtCleansBuf[i] + dtCleansBuf[i - 1])).coerceAtLeast(0.001)
+            accelerationsBuf[i] = ((velocitiesBuf[i] - velocitiesBuf[i - 1]) / dtMid).finiteOr(0.0)
         }
 
         val startIdx = min(50, max(10, n / 3))
         val hmmSteps = n - startIdx
         if (hmmSteps <= 0) return null
 
-        val retStd = computeStd(return1Buf, n).finiteOr(1e-5).coerceAtLeast(1e-7)
-        val velStd = computeStd(velocitiesBuf, n).finiteOr(1e-5).coerceAtLeast(1e-7)
-        val accStd = computeStd(accelerationsBuf, n).finiteOr(1e-5).coerceAtLeast(1e-7)
+        val retStd = computeStd(return1Buf, n, startIndex = 1).finiteOr(1e-5).coerceAtLeast(1e-7)
+        val velStd = computeStd(velocitiesBuf, n, startIndex = 1).finiteOr(1e-5).coerceAtLeast(1e-7)
+        val accStd = computeStd(accelerationsBuf, n, startIndex = 2).finiteOr(1e-5).coerceAtLeast(1e-7)
 
         val forwardProb = forwardProbBuf
         val nextForward = nextForwardBuf
@@ -1128,9 +1150,13 @@ class RegimeDetectionEngine {
             val driftAnchorIdx = max(0, idx - max(5, w20))
             val trendSign = if (pricesBuf[idx] >= pricesBuf[driftAnchorIdx]) 1.0 else -1.0
 
+            val lag5Idx = max(0, idx - 5)
+            val lag10Idx = max(0, idx - 10)
+            val sqrt5 = sqrt(max(1, idx - lag5Idx).toDouble())
+            val sqrt10 = sqrt(max(1, idx - lag10Idx).toDouble())
             val r1 = (return1Buf[idx] / retStd) * trendSign
-            val r5 = (ln(pricesBuf[idx] / pricesBuf[max(0, idx - 5)]) / (retStd * 2.2)) * trendSign
-            val r10 = (ln(pricesBuf[idx] / pricesBuf[max(0, idx - 10)]) / (retStd * 3.1)) * trendSign
+            val r5 = (ln(pricesBuf[idx] / pricesBuf[lag5Idx]) / (retStd * sqrt5)) * trendSign
+            val r10 = (ln(pricesBuf[idx] / pricesBuf[lag10Idx]) / (retStd * sqrt10)) * trendSign
 
             scaledVec[0] = r1.finiteOr(0.0).coerceIn(-10.0, 10.0)
             scaledVec[1] = r5.finiteOr(0.0).coerceIn(-10.0, 10.0)
@@ -1300,16 +1326,18 @@ class RegimeDetectionEngine {
         return sqrt((sumSq / (count - 1)).finiteOr(1e-12).coerceAtLeast(0.0)).coerceAtLeast(1e-7)
     }
 
-    private fun computeStd(arr: DoubleArray, n: Int): Double {
-        if (n < 2) return 1e-6
+    private fun computeStd(arr: DoubleArray, n: Int, startIndex: Int = 0): Double {
+        val start = startIndex.coerceIn(0, max(0, n - 1))
+        val count = n - start
+        if (count < 2) return 1e-6
         var mean = 0.0
-        for (i in 0 until n) mean += arr[i].finiteOr(0.0)
-        mean /= n
+        for (i in start until n) mean += arr[i].finiteOr(0.0)
+        mean /= count
         var sumSq = 0.0
-        for (i in 0 until n) {
+        for (i in start until n) {
             val d = (arr[i] - mean).finiteOr(0.0)
             sumSq += d * d
         }
-        return sqrt((sumSq / (n - 1)).finiteOr(1e-12).coerceAtLeast(0.0))
+        return sqrt((sumSq / (count - 1)).finiteOr(1e-12).coerceAtLeast(0.0))
     }
 }
