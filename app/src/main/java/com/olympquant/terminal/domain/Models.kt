@@ -560,7 +560,12 @@ data class StrategyEvaluation(
     val regimeAdjustmentNote: String,
     val readyToExecute: Boolean,
     val temporalTelemetry: TemporalTelemetrySnapshot = TemporalTelemetrySnapshot(),
-    val time5Metrics: Time5Metrics = Time5Metrics()
+    val time5Metrics: Time5Metrics = Time5Metrics(),
+    val mlWinProbabilityPercent: Double = 50.0,
+    val mlSamplesLearned: Int = 0,
+    val mlModelReady: Boolean = false,
+    val mlDriftDetections: Int = 0,
+    val mlGateApplied: Boolean = false
 )
 
 @Immutable
