@@ -207,60 +207,83 @@ class ModularStrategyEngine {
         evaluationRecords.lastOrNull()
     }
 
+    /**
+     * Update the evaluation that originated a broker order, not whichever market
+     * evaluation happened to be appended most recently while the order was pending.
+     */
+    private fun updateTradeEvaluation(
+        brokerTradeId: Long,
+        fallbackMatch: (Time5EvaluationRecord) -> Boolean,
+        transform: (Time5EvaluationRecord) -> Time5EvaluationRecord
+    ) {
+        val records = evaluationRecords.toMutableList()
+        val index = records.indexOfLast { record ->
+            if (brokerTradeId > 0L) record.brokerTradeId == brokerTradeId
+            else fallbackMatch(record)
+        }
+        if (index < 0) return
+        records[index] = transform(records[index])
+        evaluationRecords.clear()
+        evaluationRecords.addAll(records)
+    }
+
     @Synchronized
-    fun recordExecutionAttempt(timestampMs: Long, pair: String, price: Double, direction: SignalDirection) {
-        val last = evaluationRecords.lastOrNull()
-        if (last != null && (last.assetIdentifier == pair || last.assetIdentifier.isEmpty())) {
-            evaluationRecords.removeLast()
-            evaluationRecords.addLast(
-                last.copy(
-                    executionAttempted = true,
-                    lifecycleEvent = "EXECUTION_ATTEMPT"
-                )
+    fun recordExecutionAttempt(
+        timestampMs: Long,
+        pair: String,
+        price: Double,
+        direction: SignalDirection,
+        brokerTradeId: Long = 0L
+    ) {
+        updateTradeEvaluation(
+            brokerTradeId = 0L,
+            fallbackMatch = { it.assetIdentifier == pair && it.decision == direction.name && !it.executionAttempted }
+        ) { record ->
+            record.copy(
+                executionAttempted = true,
+                brokerTradeId = brokerTradeId,
+                lifecycleEvent = "EXECUTION_ATTEMPT"
             )
         }
     }
 
     @Synchronized
     fun recordExecutionConfirmed(brokerTradeId: Long, openPrice: Double) {
-        val last = evaluationRecords.lastOrNull()
-        if (last != null) {
-            evaluationRecords.removeLast()
-            evaluationRecords.addLast(
-                last.copy(
-                    platformConfirmed = true,
-                    actualExecutionPrice = if (openPrice > 0.0) openPrice else last.currentPrice,
-                    lifecycleEvent = "EXECUTION_CONFIRMED"
-                )
+        updateTradeEvaluation(
+            brokerTradeId = brokerTradeId,
+            fallbackMatch = { it.executionAttempted && !it.platformConfirmed }
+        ) { record ->
+            record.copy(
+                platformConfirmed = true,
+                actualExecutionPrice = if (openPrice > 0.0) openPrice else record.currentPrice,
+                lifecycleEvent = "EXECUTION_CONFIRMED"
             )
         }
     }
 
     @Synchronized
-    fun recordExecutionFailed(reason: String) {
-        val last = evaluationRecords.lastOrNull()
-        if (last != null) {
-            evaluationRecords.removeLast()
-            evaluationRecords.addLast(
-                last.copy(
-                    rejectionReason = reason,
-                    lifecycleEvent = "EXECUTION_FAILED"
-                )
+    fun recordExecutionFailed(reason: String, brokerTradeId: Long = 0L) {
+        updateTradeEvaluation(
+            brokerTradeId = brokerTradeId,
+            fallbackMatch = { it.executionAttempted && !it.platformConfirmed }
+        ) { record ->
+            record.copy(
+                rejectionReason = reason,
+                lifecycleEvent = "EXECUTION_FAILED"
             )
         }
     }
 
     @Synchronized
     fun recordTradeSettled(brokerTradeId: Long, expiryPrice: Double, outcome: String) {
-        val last = evaluationRecords.lastOrNull()
-        if (last != null) {
-            evaluationRecords.removeLast()
-            evaluationRecords.addLast(
-                last.copy(
-                    expiryPrice = expiryPrice,
-                    realizedOutcome = outcome,
-                    lifecycleEvent = if (outcome.isNotBlank()) "TRADE_RESULT" else "TRADE_EXPIRED"
-                )
+        updateTradeEvaluation(
+            brokerTradeId = brokerTradeId,
+            fallbackMatch = { it.platformConfirmed && it.expiryPrice == null }
+        ) { record ->
+            record.copy(
+                expiryPrice = expiryPrice,
+                realizedOutcome = outcome,
+                lifecycleEvent = if (outcome.isNotBlank()) "TRADE_RESULT" else "TRADE_EXPIRED"
             )
         }
     }
@@ -620,7 +643,8 @@ class ModularStrategyEngine {
             } else {
                 V
             }
-            A = if (hasVelocityHistory) (smoothedVelocity - lastSmoothedVelocity) else 0.0
+            // dV/dt: keep acceleration in price-units per second squared.
+            A = if (hasVelocityHistory) (smoothedVelocity - lastSmoothedVelocity) / stepDtSec else 0.0
             lastSmoothedVelocity = smoothedVelocity
             lastComputedAcceleration = A
             lastVelocityTimestampMs = currentTickTimeMs
