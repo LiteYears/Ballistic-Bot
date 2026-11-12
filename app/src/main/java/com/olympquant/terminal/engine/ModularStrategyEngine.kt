@@ -217,10 +217,13 @@ class ModularStrategyEngine {
         transform: (Time5EvaluationRecord) -> Time5EvaluationRecord
     ) {
         val records = evaluationRecords.toMutableList()
-        val index = records.indexOfLast { record ->
-            if (brokerTradeId > 0L) record.brokerTradeId == brokerTradeId
-            else fallbackMatch(record)
+        val exactIndex = if (brokerTradeId > 0L) {
+            records.indexOfLast { it.brokerTradeId == brokerTradeId }
+        } else {
+            -1
         }
+        // The broker may replace the client order ID with its own trade ID on acceptance.
+        val index = if (exactIndex >= 0) exactIndex else records.indexOfLast(fallbackMatch)
         if (index < 0) return
         records[index] = transform(records[index])
         evaluationRecords.clear()
@@ -255,6 +258,7 @@ class ModularStrategyEngine {
         ) { record ->
             record.copy(
                 platformConfirmed = true,
+                brokerTradeId = brokerTradeId,
                 actualExecutionPrice = if (openPrice > 0.0) openPrice else record.currentPrice,
                 lifecycleEvent = "EXECUTION_CONFIRMED"
             )
