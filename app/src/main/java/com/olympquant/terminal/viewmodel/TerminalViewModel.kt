@@ -824,7 +824,8 @@ class TerminalViewModel(
             timestampMs = now,
             pair = prefs.selectedPair,
             price = snap.latestPrice,
-            direction = direction
+            direction = direction,
+            brokerTradeId = tradeId
         )
 
         val sent = wsClient.placeOrder(
@@ -1196,7 +1197,8 @@ class TerminalViewModel(
                     timestampMs = now,
                     pair = tick.pair,
                     price = tick.price,
-                    direction = evaluation.finalSignal
+                    direction = evaluation.finalSignal,
+                    brokerTradeId = tradeId
                 )
 
                 val dispatched = wsClient.placeOrder(
@@ -1275,7 +1277,7 @@ class TerminalViewModel(
                     }
                     pushForegroundNotification(force = true)
                 } else {
-                    modularStrategyEngine.recordExecutionFailed("WebSocket order dispatch failed")
+                    modularStrategyEngine.recordExecutionFailed("WebSocket order dispatch failed", brokerTradeId = tradeId)
                     _lastExecutionBanner.value = "Failed to dispatch ${evaluation.finalSignal} order to broker"
                 }
             }
