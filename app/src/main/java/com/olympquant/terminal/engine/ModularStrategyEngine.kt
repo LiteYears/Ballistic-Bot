@@ -1703,8 +1703,6 @@ class ModularStrategyEngine {
                 val labelY = if (isContinuationWin) 1.0 else 0.0
                 if (onlineTrainingEnabled) {
                     updateFtrlWeightsOnline(oldest.features, labelY, oldest.predictedProb)
-                    rollingShadowWinRate = (0.85 * rollingShadowWinRate + 0.15 * labelY).coerceIn(0.0, 1.0)
-                    shadowSamplesCount++
                     temporalEngine.recordShadowOutcome(
                         direction = oldest.direction,
                         regime = oldest.regime,
@@ -1782,16 +1780,19 @@ class ModularStrategyEngine {
         predictedProbability: Double? = null
     ) {
         if (x.size != FEATURE_DIM || !labelY.isFinite()) return
+        val safeLabel = labelY.coerceIn(0.0, 1.0)
+        shadowSamplesCount++
+        rollingShadowWinRate = (0.85 * rollingShadowWinRate + 0.15 * safeLabel).coerceIn(0.0, 1.0)
         val currentProbability = predictFtrlWinProbability(x)
         val p = (predictedProbability ?: currentProbability).finiteOr(currentProbability).coerceIn(0.01, 0.99)
-        observeAdwinError(abs(p - labelY.coerceIn(0.0, 1.0)))
+        observeAdwinError(abs(p - safeLabel))
         val gamma = if (fastLearningUpdatesRemaining > 0) {
             fastLearningUpdatesRemaining--
             DRIFT_FORGETTING_GAMMA
         } else {
             FORGETTING_GAMMA
         }
-        val err = (p - labelY).finiteOr(0.0)
+        val err = (p - safeLabel).finiteOr(0.0)
         for (i in 0 until FEATURE_DIM) {
             val feature = x[i].finiteOr(0.0)
             val grad = (err * feature).finiteOr(0.0)
