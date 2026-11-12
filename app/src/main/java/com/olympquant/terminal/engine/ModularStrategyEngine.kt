@@ -15,6 +15,7 @@ import com.olympquant.terminal.domain.Time5StrategyParams
 import com.olympquant.terminal.domain.finiteOr
 import kotlin.math.abs
 import kotlin.math.exp
+import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
@@ -113,7 +114,11 @@ class ModularStrategyEngine {
         val rollingShadowWinRatePercent: Double,
         val postTriggerWinRatePercent: Double,
         val adaptiveModelReady: Boolean,
-        val meanBrokerSlippagePts: Double
+        val meanBrokerSlippagePts: Double,
+        val driftDetections: Int = 0,
+        val adwinWindowSize: Int = 0,
+        val adwinRecentErrorRatePercent: Double = 0.0,
+        val fastLearningUpdatesRemaining: Int = 0
     )
 
     internal data class RawTickRushMetrics(
@@ -142,11 +147,17 @@ class ModularStrategyEngine {
 
     companion object {
         internal const val FEATURE_DIM = 11
-        internal const val CURRENT_LEARNING_STATE_SCHEMA = "SNIPER_FTRL_V2"
+        internal const val CURRENT_LEARNING_STATE_SCHEMA = "SNIPER_FTRL_V3"
+        internal const val LEGACY_LEARNING_STATE_SCHEMA_V2 = "SNIPER_FTRL_V2"
         internal const val LEGACY_LEARNING_STATE_SCHEMA_V1 = "SNIPER_FTRL_V1"
         internal const val RETIRED_V1_TARGET_LEAK_FEATURE_INDEX = 7
         private const val MIN_ADAPTIVE_LABELS = 30
         private const val MIN_FTRL_WIN_PROBABILITY = 0.53
+        private const val ADWIN_DELTA = 0.01
+        private const val ADWIN_MIN_SUBWINDOW = 8
+        private const val ADWIN_MAX_WINDOW = 128
+        private const val DRIFT_FAST_LEARNING_UPDATES = 24
+        private const val DRIFT_FORGETTING_GAMMA = 0.90
         private const val MIN_REGIME_DIRECTION_LABELS = 16
         private const val MIN_REGIME_DIRECTION_WIN_RATE = 0.40
         private const val MIN_FINGERPRINT_LABELS = 16
@@ -163,6 +174,10 @@ class ModularStrategyEngine {
     private val ftrlZ = DoubleArray(FEATURE_DIM)
     private val ftrlN = DoubleArray(FEATURE_DIM)
     private val ftrlW = DoubleArray(FEATURE_DIM)
+    private val adwinModelErrors = ArrayDeque<Double>(ADWIN_MAX_WINDOW)
+    private var driftDetectionCount: Int = 0
+    private var fastLearningUpdatesRemaining: Int = 0
+    private var lastAdwinErrorRate: Double = 0.0
     private val pendingShadowRushes = ArrayDeque<PendingShadowRush>(64)
     private val pendingBroadImpulses = ArrayDeque<PendingShadowRush>(64)
     private val settledShadowRecords = ArrayDeque<ShadowSettlementRecord>(128)
@@ -332,6 +347,10 @@ class ModularStrategyEngine {
         broadImpulseWinCount = 0
         broadImpulseInvalidCount = 0
         onlineTrainingEnabled = true
+        adwinModelErrors.clear()
+        driftDetectionCount = 0
+        fastLearningUpdatesRemaining = 0
+        lastAdwinErrorRate = 0.0
         lastRestoredSchemaVersion = CURRENT_LEARNING_STATE_SCHEMA
         migratedFromLegacySchema = false
         lastSmoothedVelocity = 0.0
@@ -356,6 +375,16 @@ class ModularStrategyEngine {
             append(shadowSamplesCount)
             append('|')
             append(rollingShadowWinRate)
+            append('|')
+            append(driftDetectionCount)
+            append('|')
+            append(fastLearningUpdatesRemaining)
+            append('|')
+            append(adwinModelErrors.size)
+            for (error in adwinModelErrors) {
+                append('|')
+                append(error)
+            }
             for (value in ftrlZ) {
                 append('|')
                 append(value)
@@ -370,31 +399,58 @@ class ModularStrategyEngine {
     @Synchronized
     internal fun restoreLearningState(serialized: String): Boolean {
         val parts = serialized.split('|')
-        if (parts.size != 3 + FEATURE_DIM * 2) return false
-        val schema = parts[0]
-        if (schema != CURRENT_LEARNING_STATE_SCHEMA && schema != LEGACY_LEARNING_STATE_SCHEMA_V1) return false
-        val samples = parts[1].toIntOrNull()?.takeIf { it >= 0 } ?: return false
-        val rollingRate = parts[2].toDoubleOrNull()?.takeIf { it.isFinite() && it in 0.0..1.0 } ?: return false
-        val zValues = parts.subList(3, 3 + FEATURE_DIM).map { it.toDoubleOrNull() ?: return false }
-        val nValues = parts.subList(3 + FEATURE_DIM, parts.size).map { it.toDoubleOrNull() ?: return false }
+        val schema = parts.firstOrNull() ?: return false
+        val samples = parts.getOrNull(1)?.toIntOrNull()?.takeIf { it >= 0 } ?: return false
+        val rollingRate = parts.getOrNull(2)?.toDoubleOrNull()?.takeIf { it.isFinite() && it in 0.0..1.0 } ?: return false
+
+        val isV3 = schema == CURRENT_LEARNING_STATE_SCHEMA
+        val isV2 = schema == LEGACY_LEARNING_STATE_SCHEMA_V2
+        val isV1 = schema == LEGACY_LEARNING_STATE_SCHEMA_V1
+        if (!isV3 && !isV2 && !isV1) return false
+
+        val restoredErrors: List<Double>
+        val zStart: Int
+        if (isV3) {
+            val restoredDriftCount = parts.getOrNull(3)?.toIntOrNull()?.takeIf { it >= 0 } ?: return false
+            val restoredFastUpdates = parts.getOrNull(4)?.toIntOrNull()?.takeIf { it in 0..DRIFT_FAST_LEARNING_UPDATES } ?: return false
+            val errorCount = parts.getOrNull(5)?.toIntOrNull()?.takeIf { it in 0..ADWIN_MAX_WINDOW } ?: return false
+            zStart = 6 + errorCount
+            if (parts.size != zStart + FEATURE_DIM * 2) return false
+            restoredErrors = parts.subList(6, zStart).map { it.toDoubleOrNull() ?: return false }
+            if (restoredErrors.any { !it.isFinite() || it !in 0.0..1.0 }) return false
+            driftDetectionCount = restoredDriftCount
+            fastLearningUpdatesRemaining = restoredFastUpdates
+        } else {
+            if (parts.size != 3 + FEATURE_DIM * 2) return false
+            zStart = 3
+            restoredErrors = emptyList()
+            driftDetectionCount = 0
+            fastLearningUpdatesRemaining = 0
+        }
+
+        val zValues = parts.subList(zStart, zStart + FEATURE_DIM).map { it.toDoubleOrNull() ?: return false }
+        val nValues = parts.subList(zStart + FEATURE_DIM, parts.size).map { it.toDoubleOrNull() ?: return false }
         if (zValues.any { !it.isFinite() || abs(it) > 1.0e12 }) return false
         if (nValues.any { !it.isFinite() || it < 0.0 || it > 1.0e12 }) return false
 
         shadowSamplesCount = samples
         rollingShadowWinRate = rollingRate
+        adwinModelErrors.clear()
+        restoredErrors.forEach { adwinModelErrors.addLast(it) }
+        lastAdwinErrorRate = if (restoredErrors.isNotEmpty()) restoredErrors.average() else 0.0
         for (i in 0 until FEATURE_DIM) {
             ftrlZ[i] = zValues[i]
             ftrlN[i] = nValues[i]
         }
-        if (schema == LEGACY_LEARNING_STATE_SCHEMA_V1) {
-            // Explicit V1 -> V2 schema migration:
-            // Coordinate 7 in SNIPER_FTRL_V1 encoded the endogenous rollingShadowWinRate target EMA.
-            // In SNIPER_FTRL_V2, coordinate 7 encodes exogenous prediction-time 4-tick purityPercent.
-            // Never silently reinterpret the legacy target-leak accumulator on the new feature.
+        if (isV1) {
+            // V1 coordinate 7 encoded an endogenous win-rate value, not a prediction-time feature.
             ftrlZ[RETIRED_V1_TARGET_LEAK_FEATURE_INDEX] = 0.0
             ftrlN[RETIRED_V1_TARGET_LEAK_FEATURE_INDEX] = 0.0
             ftrlW[RETIRED_V1_TARGET_LEAK_FEATURE_INDEX] = 0.0
             lastRestoredSchemaVersion = "$LEGACY_LEARNING_STATE_SCHEMA_V1->$CURRENT_LEARNING_STATE_SCHEMA"
+            migratedFromLegacySchema = true
+        } else if (isV2) {
+            lastRestoredSchemaVersion = "$LEGACY_LEARNING_STATE_SCHEMA_V2->$CURRENT_LEARNING_STATE_SCHEMA"
             migratedFromLegacySchema = true
         } else {
             lastRestoredSchemaVersion = CURRENT_LEARNING_STATE_SCHEMA
@@ -491,7 +547,11 @@ class ModularStrategyEngine {
             rollingShadowWinRatePercent = (rollingShadowWinRate * 100.0).finiteOr(50.0),
             postTriggerWinRatePercent = postTriggerWinRate.finiteOr(50.0),
             adaptiveModelReady = shadowSamplesCount >= MIN_ADAPTIVE_LABELS,
-            meanBrokerSlippagePts = meanSlippage
+            meanBrokerSlippagePts = meanSlippage,
+            driftDetections = driftDetectionCount,
+            adwinWindowSize = adwinModelErrors.size,
+            adwinRecentErrorRatePercent = (lastAdwinErrorRate * 100.0).finiteOr(0.0),
+            fastLearningUpdatesRemaining = fastLearningUpdatesRemaining
         )
     }
 
@@ -529,6 +589,10 @@ class ModularStrategyEngine {
             "pullback_recovery" to rush.microPullbackRecovery.finiteOr(0.75),
             "local_z15" to rush.localZScore15.finiteOr(1.5),
             "ftrl_prob" to rush.ftrlWinProbPercent.finiteOr(50.0),
+            "ftrl_samples" to shadowSamplesCount.toDouble(),
+            "ftrl_model_ready" to if (shadowSamplesCount >= MIN_ADAPTIVE_LABELS) 1.0 else 0.0,
+            "ftrl_drift_count" to driftDetectionCount.toDouble(),
+            "ftrl_adwin_error" to lastAdwinErrorRate.finiteOr(0.0),
             "ofi_imbalance" to telemetry.orderFlowImbalance.finiteOr(0.0),
             "rolling_ofi_median" to temporalSnapshot.rollingOfiMedian.finiteOr(0.0),
             "velocity" to effectiveTps,
@@ -725,6 +789,7 @@ class ModularStrategyEngine {
             M < 0.0 && V >= 0.0 -> "Velocity opposes displacement (M<0, V>=0)"
             M == 0.0 -> "Zero price displacement (flat market)"
             trendContradicts -> "Recent smoothed movement contradicts proposed direction"
+            mlGateApplied && !mlGatePassed -> "Online ML rejected candidate: P(Win 5s) ${"%.1f".format(mlProbability * 100.0)}% < ${"%.1f".format(mlRequiredProbability * 100.0)}% required"
             else -> null
         }
 
@@ -740,7 +805,23 @@ class ModularStrategyEngine {
             0.0
         }
 
-        val readyToExecute = (decision != SignalDirection.NONE) && !trendContradicts && (effectiveConfidence >= HardLockedMandate.MIN_CONFIDENCE_REQUIRED)
+        // Online FTRL is a meta-labeler, never a replacement for Sniper M / TIME-5 detection.
+        // Apply it only to an aligned structural Sniper M candidate and only after warm-up.
+        val mlModelReady = shadowSamplesCount >= MIN_ADAPTIVE_LABELS
+        val mlDirectionAligned = decision != SignalDirection.NONE &&
+            rush.rushDirection == decision &&
+            rush.candidatePopulation == CandidatePopulation.POPULATION_B_STRUCTURAL_SNIPER_CANDIDATE
+        val mlGateApplied = mlModelReady && mlDirectionAligned
+        val payoutRatio = (telemetry.assetPayoutPercent.coerceAtLeast(minPayoutPercent) / 100.0).coerceAtLeast(0.01)
+        val breakEvenProbability = 1.0 / (1.0 + payoutRatio)
+        val mlRequiredProbability = max(MIN_FTRL_WIN_PROBABILITY, breakEvenProbability + 0.01)
+        val mlProbability = (rush.ftrlWinProbPercent / 100.0).finiteOr(0.5).coerceIn(0.01, 0.99)
+        val mlGatePassed = !mlGateApplied || mlProbability >= mlRequiredProbability
+
+        val readyToExecute = (decision != SignalDirection.NONE) &&
+            !trendContradicts &&
+            (effectiveConfidence >= HardLockedMandate.MIN_CONFIDENCE_REQUIRED) &&
+            mlGatePassed
 
         // 11. TIME-5 Filter Diagnostics for Telemetry & Dashboard
         val diag1 = FilterDiagnostic(
@@ -808,7 +889,24 @@ class ModularStrategyEngine {
             gateTitle = "Context & Structural Guard"
         )
 
-        val baseDiagnostics = listOf(diag1, diag2, diag3, diag4, diag5, diag6)
+        val mlDiag = FilterDiagnostic(
+            filterType = FilterType.FTRL_ML_META_LABEL_GATE,
+            passed = mlGatePassed,
+            actualValueFormatted = when {
+                !mlModelReady -> "WARM-UP • ${shadowSamplesCount}/$MIN_ADAPTIVE_LABELS"
+                !mlDirectionAligned -> "NOT APPLICABLE"
+                else -> "${"%.1f".format(mlProbability * 100.0)}%"
+            },
+            thresholdFormatted = if (mlGateApplied) "≥ ${"%.1f".format(mlRequiredProbability * 100.0)}%" else "Warm-up / aligned Sniper M candidate",
+            reason = when {
+                !mlModelReady -> "Neutral model during warm-up; existing TIME-5 decision remains unchanged"
+                !mlDirectionAligned -> "Model applies only when the Sniper M candidate direction matches the TIME-5 direction"
+                mlGatePassed -> "Online FTRL probability clears the payout-adjusted break-even threshold plus 1% margin"
+                else -> "Candidate rejected by the learned five-second continuation probability"
+            },
+            gateTitle = "Online ML Meta-Label"
+        )
+        val baseDiagnostics = listOf(diag1, diag2, diag3, diag4, diag5, diag6, mlDiag)
         val diagnostics = if (!contextPassed || trendContradicts) {
             baseDiagnostics + contextDiag
         } else {
@@ -889,7 +987,12 @@ class ModularStrategyEngine {
             regimeAdjustmentNote = "TIME-5 Balanced Execution • 4 Core Math Components (M, V, A, DE) • 600ms Cooldown • 5s Expiry",
             readyToExecute = readyToExecute,
             temporalTelemetry = temporalSnapshot,
-            time5Metrics = metrics
+            time5Metrics = metrics,
+            mlWinProbabilityPercent = rush.ftrlWinProbPercent.finiteOr(50.0),
+            mlSamplesLearned = shadowSamplesCount,
+            mlModelReady = mlModelReady,
+            mlDriftDetections = driftDetectionCount,
+            mlGateApplied = mlGateApplied
         )
     }
 
@@ -1588,7 +1691,7 @@ class ModularStrategyEngine {
             if (settledPrice.isFinite()) {
                 val labelY = if (isContinuationWin) 1.0 else 0.0
                 if (onlineTrainingEnabled) {
-                    updateFtrlWeightsOnline(oldest.features, labelY)
+                    updateFtrlWeightsOnline(oldest.features, labelY, oldest.predictedProb)
                     rollingShadowWinRate = (0.85 * rollingShadowWinRate + 0.15 * labelY).coerceIn(0.0, 1.0)
                     shadowSamplesCount++
                     temporalEngine.recordShadowOutcome(
@@ -1605,6 +1708,7 @@ class ModularStrategyEngine {
     }
 
     internal fun predictFtrlWinProbability(x: DoubleArray): Double {
+        if (x.size != FEATURE_DIM) return 0.5
         var logit = 0.0
         for (i in 0 until FEATURE_DIM) {
             val zi = ftrlZ[i]
@@ -1616,22 +1720,75 @@ class ModularStrategyEngine {
                 -(zi - signZi * FTRL_L1) / (((FTRL_BETA + sqrt(ni)) / FTRL_ALPHA) + FTRL_L2)
             }
             ftrlW[i] = wi
-            logit += wi * x[i]
+            logit += wi * x[i].finiteOr(0.0)
         }
         val clampedLogit = logit.finiteOr(0.0).coerceIn(-8.0, 8.0)
         return (1.0 / (1.0 + exp(-clampedLogit))).coerceIn(0.01, 0.99)
     }
 
-    internal fun updateFtrlWeightsOnline(x: DoubleArray, labelY: Double) {
-        val p = predictFtrlWinProbability(x)
+    /**
+     * ADWIN-style adaptive window over prequential absolute prediction errors.
+     * A detected increase in error discards the stale prefix and temporarily
+     * accelerates FTRL forgetting so the model can follow a new market regime.
+     */
+    internal fun observeAdwinError(error: Double): Boolean {
+        if (!error.isFinite()) return false
+        if (adwinModelErrors.size >= ADWIN_MAX_WINDOW) adwinModelErrors.removeFirst()
+        adwinModelErrors.addLast(error.coerceIn(0.0, 1.0))
+        lastAdwinErrorRate = adwinModelErrors.average()
+        val values = adwinModelErrors.toList()
+        if (values.size < ADWIN_MIN_SUBWINDOW * 2) return false
+
+        var detectedCut = -1
+        var largestDifference = 0.0
+        for (cut in ADWIN_MIN_SUBWINDOW..(values.size - ADWIN_MIN_SUBWINDOW)) {
+            val oldMean = values.subList(0, cut).average()
+            val newMean = values.subList(cut, values.size).average()
+            val epsilon = sqrt(
+                0.5 * ln(4.0 / ADWIN_DELTA) *
+                    (1.0 / cut.toDouble() + 1.0 / (values.size - cut).toDouble())
+            )
+            val difference = abs(oldMean - newMean)
+            if (difference > epsilon && difference > largestDifference) {
+                detectedCut = cut
+                largestDifference = difference
+            }
+        }
+        if (detectedCut < 0) return false
+
+        repeat(detectedCut) {
+            if (adwinModelErrors.isNotEmpty()) adwinModelErrors.removeFirst()
+        }
+        driftDetectionCount++
+        fastLearningUpdatesRemaining = DRIFT_FAST_LEARNING_UPDATES
+        lastAdwinErrorRate = adwinModelErrors.average()
+        return true
+    }
+
+    internal fun updateFtrlWeightsOnline(
+        x: DoubleArray,
+        labelY: Double,
+        predictedProbability: Double? = null
+    ) {
+        if (x.size != FEATURE_DIM || !labelY.isFinite()) return
+        val currentProbability = predictFtrlWinProbability(x)
+        val p = (predictedProbability ?: currentProbability).finiteOr(currentProbability).coerceIn(0.01, 0.99)
+        observeAdwinError(abs(p - labelY.coerceIn(0.0, 1.0)))
+        val gamma = if (fastLearningUpdatesRemaining > 0) {
+            fastLearningUpdatesRemaining--
+            DRIFT_FORGETTING_GAMMA
+        } else {
+            FORGETTING_GAMMA
+        }
         val err = (p - labelY).finiteOr(0.0)
         for (i in 0 until FEATURE_DIM) {
-            val grad = (err * x[i]).finiteOr(0.0)
-            val nOld = (ftrlN[i] * FORGETTING_GAMMA).finiteOr(0.0).coerceAtLeast(0.0)
+            val feature = x[i].finiteOr(0.0)
+            val grad = (err * feature).finiteOr(0.0)
+            val nOld = (ftrlN[i] * gamma).finiteOr(0.0).coerceAtLeast(0.0)
             val nNewRaw = (nOld + grad * grad).finiteOr(0.0).coerceAtLeast(0.0)
             val nNew = if (nNewRaw < 1e-18) 0.0 else nNewRaw
             val sigma = (sqrt(nNew) - sqrt(nOld)) / FTRL_ALPHA
-            val zDiscounted = (ftrlZ[i] * FORGETTING_GAMMA).finiteOr(0.0)
+            val zDiscounted = (ftrlZ[i] * gamma).finiteOr(0.0)
             val zNewRaw = (zDiscounted + grad - sigma * ftrlW[i]).finiteOr(0.0)
             ftrlZ[i] = if (abs(zNewRaw) < 1e-18) 0.0 else zNewRaw
             ftrlN[i] = nNew
