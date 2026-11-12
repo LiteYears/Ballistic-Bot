@@ -2150,13 +2150,14 @@ class QuantPipelineUnitTest {
             wsLatencyMs = 35L
         )
 
-        engine.recordExecutionConfirmed(9999L, upImpulseTicks.last().price)
-        val confirmedRecord = engine.getEvaluationRecords().last { it.brokerTradeId == 9999L }
+        // Broker acceptance can return a broker-assigned ID different from the client order ID.
+        engine.recordExecutionConfirmed(456789L, upImpulseTicks.last().price)
+        val confirmedRecord = engine.getEvaluationRecords().last { it.brokerTradeId == 456789L }
         assertEquals("EXECUTION_CONFIRMED", confirmedRecord.lifecycleEvent)
         assertTrue(confirmedRecord.platformConfirmed)
 
-        engine.recordTradeSettled(9999L, upImpulseTicks.last().price + 0.50, "WIN")
-        val settledRecord = engine.getEvaluationRecords().last { it.brokerTradeId == 9999L }
+        engine.recordTradeSettled(456789L, upImpulseTicks.last().price + 0.50, "WIN")
+        val settledRecord = engine.getEvaluationRecords().last { it.brokerTradeId == 456789L }
         assertEquals("TRADE_RESULT", settledRecord.lifecycleEvent)
         assertEquals("WIN", settledRecord.realizedOutcome)
 
