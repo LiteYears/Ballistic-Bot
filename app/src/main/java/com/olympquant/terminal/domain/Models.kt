@@ -264,7 +264,8 @@ data class Time5EvaluationRecord(
     val actualExecutionPrice: Double? = null,
     val expiryPrice: Double? = null,
     val realizedOutcome: String? = null,
-    val lifecycleEvent: String = "SIGNAL_REJECTED"
+    val lifecycleEvent: String = "SIGNAL_REJECTED",
+    val brokerTradeId: Long = 0L
 )
 
 @Immutable
