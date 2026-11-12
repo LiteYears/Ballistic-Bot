@@ -2126,17 +2126,39 @@ class QuantPipelineUnitTest {
         assertEquals("SIGNAL_UP", engine.getLatestEvaluationRecord()?.lifecycleEvent)
 
         // C. Lifecycle Transitions: EXECUTION_ATTEMPT -> EXECUTION_CONFIRMED -> TRADE_RESULT
-        engine.recordExecutionAttempt(upImpulseTicks.last().timeMs, "LATAM_X", upImpulseTicks.last().price, SignalDirection.UP)
+        engine.recordExecutionAttempt(
+            upImpulseTicks.last().timeMs,
+            "LATAM_X",
+            upImpulseTicks.last().price,
+            SignalDirection.UP,
+            brokerTradeId = 9999L
+        )
         assertEquals("EXECUTION_ATTEMPT", engine.getLatestEvaluationRecord()?.lifecycleEvent)
         assertTrue(engine.getLatestEvaluationRecord()?.executionAttempted == true)
 
+        // A later market evaluation must not steal the lifecycle update from this order.
+        engine.evaluateStrategy(
+            strategy = strategy,
+            telemetry = MarketTelemetryState(
+                pair = "LATAM_X",
+                latestPrice = 100.2,
+                latestTimeMs = baseTs + 400L,
+                tickCount = 3,
+                recentTicks = threeTicks,
+                assetPayoutPercent = 85
+            ),
+            wsLatencyMs = 35L
+        )
+
         engine.recordExecutionConfirmed(9999L, upImpulseTicks.last().price)
-        assertEquals("EXECUTION_CONFIRMED", engine.getLatestEvaluationRecord()?.lifecycleEvent)
-        assertTrue(engine.getLatestEvaluationRecord()?.platformConfirmed == true)
+        val confirmedRecord = engine.getEvaluationRecords().last { it.brokerTradeId == 9999L }
+        assertEquals("EXECUTION_CONFIRMED", confirmedRecord.lifecycleEvent)
+        assertTrue(confirmedRecord.platformConfirmed)
 
         engine.recordTradeSettled(9999L, upImpulseTicks.last().price + 0.50, "WIN")
-        assertEquals("TRADE_RESULT", engine.getLatestEvaluationRecord()?.lifecycleEvent)
-        assertEquals("WIN", engine.getLatestEvaluationRecord()?.realizedOutcome)
+        val settledRecord = engine.getEvaluationRecords().last { it.brokerTradeId == 9999L }
+        assertEquals("TRADE_RESULT", settledRecord.lifecycleEvent)
+        assertEquals("WIN", settledRecord.realizedOutcome)
 
         // D. Component A & B: Negative Displacement (M < 0) & Velocity (V < 0) -> DOWN Signal
         val downImpulseTicks = baselineTicks + listOf(
